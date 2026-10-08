@@ -64,6 +64,9 @@ description, and icon aligned with its package manifest.
 - [`bb-plugin-smart-queue`](packages/bb-plugin-smart-queue/) — decide whether a
   message sent to a busy thread steers the running turn or waits as a
   follow-up, using Jev with a provider-model fallback.
+- [`bb-plugin-live-share`](packages/bb-plugin-live-share/) — share a thread
+  through a password-protected, end-to-end encrypted link that opens in any
+  browser, with access levels and live cursors.
 - [`bb-plugin-gtd-sidebar`](packages/bb-plugin-gtd-sidebar/) — replace the thread
   list with a GTD-style inbox organized by workflow state.
 - [`bb-plugin-plannotator`](packages/bb-plugin-plannotator/) — embed the upstream

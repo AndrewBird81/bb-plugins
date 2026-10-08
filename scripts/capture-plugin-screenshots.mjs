@@ -1094,7 +1094,182 @@ const captures = [
       await client.waitForText("chrome");
     },
   },
+  {
+    id: "live-share",
+    packageDir: "bb-plugin-live-share",
+    privateSidebar: true,
+    setup: async (client) => {
+      const stage = await stageLiveShare();
+      try {
+        await client.navigate(`/threads/${stage.threadId}`);
+        // The guest's socket is open once the host's header counts Sam.
+        await client.waitForSelector('button[aria-label="Live Share: 1 joined"]');
+        await client.waitForText("Run the tests locally");
+        // Sam points at the agent's checklist from the guest page.
+        stage.guest.cursor(stage.answerRowId, 0.42, 0.35);
+        await waitForCursorLabel(client, "Sam");
+        await client.evaluate(`(() => {
+          const button = document.querySelector('button[aria-label="Live Share: 1 joined"]');
+          button.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerType: "mouse" }));
+          button.click();
+          return true;
+        })()`);
+        await client.waitForText("Stop sharing");
+        await client.waitForText("Send messages");
+        await waitForCursorLabel(client, "Sam");
+      } catch (error) {
+        await stage.cleanup();
+        throw error;
+      }
+      return stage.cleanup;
+    },
+  },
+  {
+    id: "live-share-guest",
+    packageDir: "bb-plugin-live-share",
+    fileName: "guest-preview.png",
+    setup: async (client) => {
+      const stage = await stageLiveShare();
+      try {
+        // The guest page is a plain web page served by the share gateway.
+        await client.command("Page.navigate", { url: stage.link });
+        await client.waitForText("Join a shared BB thread");
+        await client.evaluate(`(async () => {
+          const response = await fetch("/api/login", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ shareId: ${JSON.stringify(stage.shareId)}, password: "staged-preview", name: "Ana" }),
+          });
+          if (!response.ok) throw new Error("Guest login failed: " + response.status);
+          sessionStorage.setItem(${JSON.stringify(`bb-live-share:${stage.shareId}`)}, JSON.stringify(await response.json()));
+          location.reload();
+          return true;
+        })()`, true);
+        await sleep(1500);
+        await client.waitForText("Run the tests locally");
+        await client.waitForSelector(`[data-timeline-row-id=${JSON.stringify(stage.answerRowId)}]`);
+        // The host points at the same checklist from BB's own thread view.
+        await pluginRpc("live-share", "owner_cursor", {
+          threadId: stage.threadId,
+          region: "transcript",
+          cursor: { region: "transcript", anchor: stage.answerRowId, parent: null, fx: 0.3, fy: 0.62 },
+        });
+        await waitForCursorLabel(client, "Patrick");
+        await waitForCursorLabel(client, "Sam", false);
+      } catch (error) {
+        await stage.cleanup();
+        throw error;
+      }
+      return stage.cleanup;
+    },
+  },
 ];
+
+/** Waits until a Live Share cursor with this name is (or is not) painted. */
+async function waitForCursorLabel(client, name, visible = true) {
+  const started = Date.now();
+  while (Date.now() - started < 15000) {
+    const painted = await client.evaluate(`[...document.querySelectorAll('[aria-hidden] span')]
+      .some((el) => el.textContent === ${JSON.stringify(name)} && el.getBoundingClientRect().width > 0)`);
+    if (painted === visible) return;
+    await sleep(250);
+  }
+  throw new Error(`${name}'s Live Share cursor ${visible ? "never appeared" : "is still painted"}`);
+}
+
+/** A scripted guest "Sam" who joins through the gateway like a browser would. */
+async function joinAsGuest(link, shareId) {
+  const base = new URL(link).origin;
+  const response = await fetch(`${base}/api/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ shareId, password: "staged-preview", name: "Sam" }),
+  });
+  if (!response.ok) throw new Error(`Guest login failed: ${response.status} ${await response.text()}`);
+  const { sessionToken } = await response.json();
+  const snapshot = await (
+    await fetch(`${base}/api/snapshot`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-live-share-session": sessionToken },
+      body: "{}",
+    })
+  ).json();
+  const socket = new WebSocket(`${base.replace(/^http/u, "ws")}/api/socket?session=${encodeURIComponent(sessionToken)}`);
+  await new Promise((resolvePromise, reject) => {
+    socket.addEventListener("open", resolvePromise, { once: true });
+    socket.addEventListener("error", reject, { once: true });
+  });
+  return {
+    snapshot,
+    cursor(anchor, fx, fy) {
+      socket.send(JSON.stringify({ type: "cursor", region: "transcript", cursor: { region: "transcript", anchor, parent: null, fx, fy } }));
+    },
+    close() {
+      socket.close(1000);
+    },
+  };
+}
+
+/**
+ * Seeds a real Live Share session: a demo thread with one agent reply, a
+ * password-protected share of it, and a scripted guest "Sam" connected
+ * through the share gateway. Local exposure keeps the staged link on loopback.
+ */
+async function stageLiveShare() {
+  // The cheap demo model occasionally ignores the prompt; stage a fresh thread.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await stageLiveShareOnce();
+    } catch (error) {
+      if (attempt >= 3 || !String(error).includes("no checklist reply")) throw error;
+    }
+  }
+}
+
+async function stageLiveShareOnce() {
+  const config = await bbCli(["plugin", "config", "live-share"]);
+  const previous = {
+    exposure: /exposure = "([^"]+)"/u.exec(config)?.[1] ?? "opentunnel",
+    displayName: /displayName = "([^"]*)"/u.exec(config)?.[1] ?? "",
+  };
+  await bbCli(["plugin", "config", "live-share", "set", "exposure", "local"]);
+  await bbCli(["plugin", "config", "live-share", "set", "displayName", "Patrick"]);
+  const spawned = JSON.parse(await bbCli([
+    "thread", "spawn", "--json",
+    "--project", "proj_personal",
+    "--new-environment", "personal",
+    "--provider", "pi",
+    "--model", "opencode-go/qwen3.8-flash",
+    "--title", "Live Share demo",
+    "--prompt",
+    "Use no tools. Reply with exactly this checklist and nothing else:\n\n" +
+      "- [ ] Read the diff end to end\n- [ ] Run the tests locally\n- [ ] Check error handling\n" +
+      "- [ ] Look for secrets in logs\n- [ ] Confirm the docs match",
+  ]));
+  const threadId = spawned.id;
+  let guest = null;
+  const cleanup = async () => {
+    guest?.close();
+    await pluginRpc("live-share", "share_stop", { threadId }).catch(() => {});
+    await bbCli(["thread", "delete", threadId, "--yes"]).catch(() => {});
+    await bbCli(["plugin", "config", "live-share", "set", "exposure", previous.exposure]).catch(() => {});
+    await bbCli(["plugin", "config", "live-share", "set", "displayName", previous.displayName]).catch(() => {});
+  };
+  try {
+    await bbCli(["thread", "wait", threadId, "--status", "idle", "--timeout", "120"]);
+    const state = await pluginRpc("live-share", "share_start", { threadId, access: "message", password: "staged-preview" });
+    const link = state.share?.link;
+    if (!link) throw new Error(`Share has no link: ${JSON.stringify(state)}`);
+    const shareId = link.split("/s/")[1];
+    guest = await joinAsGuest(link, shareId);
+    const answer = guest.snapshot.rows?.find((row) => row.kind === "message" && row.role === "assistant" && row.text.includes("Run the tests"));
+    if (!answer) throw new Error(`The demo thread has no checklist reply: ${JSON.stringify(guest.snapshot.rows)}`);
+    return { threadId, link, shareId, guest, answerRowId: answer.id, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
 
 const { webSocketUrl, process: chromeProcess, profileDir } = await ensureChrome();
 const client = new CdpClient(webSocketUrl);

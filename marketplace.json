@@ -201,6 +201,29 @@
       }
     },
     {
+      "id": "live-share",
+      "displayName": "Live Share",
+      "description": "Share a thread through a password-protected, end-to-end encrypted link that opens in any browser, with access levels and live cursors.",
+      "icon": {
+        "url": "./packages/bb-plugin-live-share/assets/icon.svg"
+      },
+      "tags": [
+        "collaboration",
+        "threads"
+      ],
+      "author": {
+        "name": "Patrick Lee",
+        "github": "patleeman"
+      },
+      "source": {
+        "git": {
+          "url": "https://github.com/patleeman/bb-plugins.git",
+          "subdir": "packages/bb-plugin-live-share",
+          "ref": "main"
+        }
+      }
+    },
+    {
       "id": "omp",
       "displayName": "OhMyPi (Pi-style)",
       "description": "Pi-style OhMyPi provider with provider/model grouping (openai-codex/gpt-5, openrouter/\u2026) \u2014 replace the bundled ACP omp.",

@@ -524,6 +524,9 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       bb.log.warn(`Could not stop Plannotator review ${active.sessionId}: ${String(error)}`);
     }
+    // The review is over once the upstream process ends. Free the thread now
+    // so a slow or retried decision delivery does not block the next review.
+    if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
     if (disposing || active.deleted) return;
     const record: StoredReview = {
       id: active.sessionId,
@@ -538,7 +541,6 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`Could not save Plannotator decision ${record.id}: ${String(error)}`);
     }
     await deliverReview(record);
-    if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
   }
 
   registerPlannotatorRelayRoutes(bb, relaySessions);

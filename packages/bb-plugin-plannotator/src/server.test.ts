@@ -357,6 +357,55 @@ describe("BB upstream Plannotator bridge", () => {
     });
   });
 
+  it("frees the thread for a new review while a decision is still being delivered", async () => {
+    const binary = await fakePlannotatorBinary({ approveAfterMs: null });
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      settings: { binaryPath: binary },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireInteractionSdk(host);
+    let releaseSend!: () => void;
+    const sendBlocked = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    host.harness.sdk.stub("threads.send", async () => {
+      await sendBlocked;
+      return { ok: true, delivery: "queued" };
+    });
+
+    const first = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan\n\n- First" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+    await host.harness.callRpc("cancelReview", {
+      threadId: "thread-1",
+      sessionId: first.reviewId,
+    });
+    // The decision send is now in flight and has not returned.
+    await sentReview(host);
+
+    const second = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan\n\n- Second" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { status: string; reviewId: string };
+    expect(second.status).toBe("pending");
+    expect(second.reviewId).not.toBe(first.reviewId);
+
+    releaseSend();
+    const active = (await host.harness.callRpc("getActiveReview", {
+      threadId: "thread-1",
+    })) as { sessionId: string };
+    expect(active.sessionId).toBe(second.reviewId);
+    await host.harness.callRpc("cancelReview", {
+      threadId: "thread-1",
+      sessionId: second.reviewId,
+    });
+  });
+
   it("rejects cancellation from another thread or session", async () => {
     const binary = await fakePlannotatorBinary();
     const host = createFakePluginHost({

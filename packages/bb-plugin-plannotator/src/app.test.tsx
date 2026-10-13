@@ -144,6 +144,63 @@ describe("Plannotator BB shell", () => {
     );
   });
 
+  it("recovers the pending review when the panel action opens without params", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: {} },
+      {
+        rpc: {
+          getActiveReview: () => payload,
+          cancelReview: () => ({ cancelled: true }),
+        },
+      },
+    );
+
+    const iframe = await slot.findByTitle("Plannotator review");
+    expect(iframe.getAttribute("src")).toContain("sessionId=session-1");
+    expect(slot.rpcCalls).toContainEqual({
+      method: "getActiveReview",
+      input: { threadId: "thread-1" },
+    });
+    expect(slot.queryByText(/Start a plan review from the agent/)).toBeNull();
+
+    fireEvent.click(slot.getByRole("button", { name: "Cancel review" }));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "cancelReview",
+        input: { threadId: "thread-1", sessionId: "session-1" },
+      }),
+    );
+  });
+
+  it("follows review open and close signals in a param-less panel", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: {} },
+      { rpc: { getActiveReview: () => null } },
+    );
+
+    await slot.findByText(/Start a plan review from the agent/);
+    await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, {
+      kind: "review-opened",
+      payload: { ...payload, threadId: "thread-2" },
+    });
+    expect(slot.queryByTitle("Plannotator review")).toBeNull();
+
+    await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, {
+      kind: "review-opened",
+      payload,
+    });
+    await slot.findByTitle("Plannotator review");
+
+    await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, {
+      kind: "review-closed",
+      threadId: "thread-1",
+      sessionId: "session-1",
+    });
+    await slot.findByText(/Start a plan review from the agent/);
+  });
+
   it("exposes explicit cancellation without a host interaction deadline", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,

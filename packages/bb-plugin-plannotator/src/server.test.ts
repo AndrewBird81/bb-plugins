@@ -304,6 +304,59 @@ describe("BB upstream Plannotator bridge", () => {
     });
   });
 
+  it("refuses a second review with a distinct status instead of cancelled", async () => {
+    const binary = await fakePlannotatorBinary({ approveAfterMs: null });
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      settings: { binaryPath: binary },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireInteractionSdk(host);
+
+    const first = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan\n\n- First" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { status: string; reviewId: string };
+    expect(first.status).toBe("pending");
+
+    const refusal = (await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan\n\n- Second" },
+      { threadId: "thread-1", projectId: "project-1" },
+    )) as { isError: boolean; content: Array<{ text: string }> };
+    expect(refusal.isError).toBe(true);
+    const second = JSON.parse(refusal.content[0]!.text) as Record<string, unknown>;
+    expect(second).toMatchObject({
+      status: "already_active",
+      source: "plannotator",
+      reviewId: first.reviewId,
+    });
+    expect(second).not.toHaveProperty("decision");
+
+    // The pending review is still recoverable and cancellable from the panel.
+    const active = (await host.harness.callRpc("getActiveReview", {
+      threadId: "thread-1",
+    })) as { sessionId: string };
+    expect(active.sessionId).toBe(first.reviewId);
+    await expect(
+      host.harness.callRpc("cancelReview", {
+        threadId: "thread-1",
+        sessionId: active.sessionId,
+      }),
+    ).resolves.toEqual({ cancelled: true });
+    await sentReview(host);
+    await expect.poll(() => host.harness.realtimeSignals).toContainEqual({
+      channel: PLANNOTATOR_REALTIME_CHANNEL,
+      payload: {
+        kind: "review-closed",
+        threadId: "thread-1",
+        sessionId: first.reviewId,
+      },
+    });
+  });
+
   it("rejects cancellation from another thread or session", async () => {
     const binary = await fakePlannotatorBinary();
     const host = createFakePluginHost({

@@ -336,6 +336,24 @@ function errorResponse(message: string) {
   };
 }
 
+// A refusal is not a review outcome. Report it with a distinct status so an
+// agent cannot mistake it for the user cancelling the pending review.
+function alreadyActiveResponse(reviewId: string | undefined) {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({
+        status: "already_active",
+        source: "plannotator",
+        ...(reviewId ? { reviewId } : {}),
+        error: "A Plannotator review is already pending in this thread. No new review was started.",
+        message: "Ask the user to finish or cancel the pending review. They can reopen it from the Plannotator thread panel action. Its decision will arrive as a new message in this thread.",
+      }),
+    }],
+    isError: true,
+  };
+}
+
 async function getConfiguredPath(settings: { get(): Promise<{ binaryPath: string }> }): Promise<string> {
   const configured = await settings.get();
   return configured.binaryPath.trim() || BUNDLED_BINARY;
@@ -494,11 +512,21 @@ export default async function plugin(bb: BbPluginApi) {
     }
     relaySessions.delete(active.sessionId);
     await closeReviewPanel(bb, threadId, active.sessionId);
+    // Panels opened manually from the thread action carry no session params,
+    // so closeReviewPanel cannot find them. Tell them the review ended.
+    bb.realtime.publish(PLANNOTATOR_REALTIME_CHANNEL, {
+      kind: "review-closed",
+      threadId,
+      sessionId: active.sessionId,
+    });
     try {
       await active.review.stop();
     } catch (error) {
       bb.log.warn(`Could not stop Plannotator review ${active.sessionId}: ${String(error)}`);
     }
+    // The review is over once the upstream process ends. Free the thread now
+    // so a slow or retried decision delivery does not block the next review.
+    if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
     if (disposing || active.deleted) return;
     const record: StoredReview = {
       id: active.sessionId,
@@ -513,7 +541,6 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`Could not save Plannotator decision ${record.id}: ${String(error)}`);
     }
     await deliverReview(record);
-    if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
   }
 
   registerPlannotatorRelayRoutes(bb, relaySessions);
@@ -558,7 +585,7 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: reviewToolParametersSchema,
     async execute(params, context) {
       if (activeReviews.has(context.threadId) || startingReviews.has(context.threadId)) {
-        return errorResponse("A Plannotator review is already active in this thread.");
+        return alreadyActiveResponse(activeReviews.get(context.threadId)?.sessionId);
       }
       startingReviews.add(context.threadId);
 

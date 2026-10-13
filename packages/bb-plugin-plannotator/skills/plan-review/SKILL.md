@@ -31,6 +31,10 @@ The decision message has one of these results:
 - `decision=cancelled`: report the cancellation, then continue normally unless
   the user specifically asked to stop.
 
+If the tool returns `status=already_active`, no new review started and nothing
+was cancelled. Tell the user a review is still pending (give its `reviewId`)
+and that they can reopen it from the Plannotator thread panel action.
+
 Do not claim a review decision from the presence of a panel or the pending
 tool result alone. Only the later decision message describes what happened in
 Plannotator; it does not authorize or prohibit file changes.

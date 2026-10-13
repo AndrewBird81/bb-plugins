@@ -72,6 +72,67 @@ function parseReviewOpened(value: unknown): PlannotatorPayload | null {
   return parsePayload(value.payload);
 }
 
+function parseReviewClosed(
+  value: unknown,
+): { threadId: string; sessionId: string } | null {
+  if (
+    !isRecord(value) ||
+    value.kind !== "review-closed" ||
+    typeof value.threadId !== "string" ||
+    typeof value.sessionId !== "string"
+  ) {
+    return null;
+  }
+  return { threadId: value.threadId, sessionId: value.sessionId };
+}
+
+/**
+ * A panel opened from the thread action carries no params. Recover the
+ * thread's pending review from the server so a review whose tab was closed
+ * can still be approved, annotated, or cancelled.
+ */
+function useActiveReviewFallback(
+  threadId: string,
+  enabled: boolean,
+): PlannotatorPayload | null {
+  const rpc = useRpc<typeof rpcContract>();
+  const realtimeConnectionState = useRealtimeConnectionState();
+  const [active, setActive] = useState<PlannotatorPayload | null>(null);
+
+  useRealtime(PLANNOTATOR_REALTIME_CHANNEL, (value) => {
+    if (!enabled) return;
+    const opened = parseReviewOpened(value);
+    if (opened && opened.threadId === threadId) {
+      setActive(opened);
+      return;
+    }
+    const closed = parseReviewClosed(value);
+    if (closed && closed.threadId === threadId) {
+      setActive((current) =>
+        current?.sessionId === closed.sessionId ? null : current,
+      );
+    }
+  });
+
+  useEffect(() => {
+    if (!enabled || realtimeConnectionState !== "connected") return;
+    let cancelled = false;
+    void rpc
+      .call("getActiveReview", { threadId })
+      .then((value) => {
+        if (cancelled) return;
+        const payload = parsePayload(value);
+        setActive(payload && payload.threadId === threadId ? payload : null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, realtimeConnectionState, rpc, threadId]);
+
+  return enabled ? active : null;
+}
+
 /**
  * Server-side tool calls can persist a tab, but only the app navigation API
  * can focus/open the side panel. This deliberately renders no control: it is
@@ -139,7 +200,9 @@ function EmptyPanel() {
 }
 
 function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
-  const payload = parsePayload(params);
+  const paramsPayload = parsePayload(params);
+  const fallbackPayload = useActiveReviewFallback(threadId, !paramsPayload);
+  const payload = paramsPayload ?? fallbackPayload;
   const rpc = useRpc<typeof rpcContract>();
   const [reloadKey, setReloadKey] = useState(0);
   const [loaded, setLoaded] = useState(false);
@@ -165,6 +228,7 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
   // browser-facing hostname. This keeps the real upstream UI while removing
   // standalone-browser onboarding from the embedded workflow.
   useLayoutEffect(() => {
+    setCanceling(false);
     if (!payload) {
       setEmbeddedUrl(null);
       return;
@@ -224,6 +288,9 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
               setCanceling(true);
               void rpc
                 .call("cancelReview", { threadId, sessionId: payload.sessionId })
+                .then((result) => {
+                  if (!result.cancelled) setCanceling(false);
+                })
                 .catch(() => setCanceling(false));
             }}
           >

@@ -108,6 +108,8 @@ export const hostContract = defineRpcContract({
         cwd: z.string().min(1),
         origin: upstreamOriginSchema,
         session: sessionRequestSchema,
+        /** The bb page's origin, the only other page allowed to frame the review. */
+        frameAncestor: z.string().url().max(2048).optional(),
       })
       .strict(),
     output: z

@@ -2,9 +2,14 @@ import { createServer, request, type IncomingMessage, type Server } from "node:h
 import { connect } from "node:net";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { startReviewProxy, stripDecisionBody, type RunningReviewProxy } from "./review-proxy";
+import {
+  frameAncestorsPolicy,
+  startReviewProxy,
+  stripDecisionBody,
+  type RunningReviewProxy,
+} from "./review-proxy";
 
 const DNS_NAME = "mac.tail1b968e.ts.net";
 
@@ -15,7 +20,7 @@ afterEach(async () => {
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
-async function setup() {
+async function setup(extra: { frameAncestor?: string; upstreamCsp?: string } = {}) {
   const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-proxy-worktree-"));
   const uploads = await mkdtemp(join(tmpdir(), "bb-plannotator-proxy-uploads-"));
   cleanups.push(() => rm(worktree, { recursive: true, force: true }));
@@ -40,6 +45,7 @@ async function setup() {
         "content-type": "application/json",
         "access-control-allow-origin": "*",
         "access-control-allow-credentials": "true",
+        ...(extra.upstreamCsp ? { "content-security-policy": extra.upstreamCsp } : {}),
       });
       res.end(JSON.stringify({ ok: true }));
     });
@@ -53,6 +59,7 @@ async function setup() {
     upstreamPort,
     cwd: worktree,
     allowedRoots: [worktree, uploads],
+    ...(extra.frameAncestor ? { frameAncestor: extra.frameAncestor } : {}),
   });
   cleanups.push(() => proxy.close());
   const host = `${DNS_NAME}:${proxy.port}`;
@@ -184,9 +191,17 @@ describe("review proxy", () => {
     expect(await ok(`/api/reference/files?dirPath=${q(worktree)}`)).toBe(200);
     expect(await ok(`/api/reference/files?dirPath=${q("docs")}`)).toBe(200);
     expect(await ok(`/api/reference/files?dirPath=${q("~")}`)).toBe(403);
+    // Upstream expands `~\` on every platform.
+    expect(await ok("/api/reference/files?dirPath=~%5C")).toBe(403);
+    expect(await ok("/api/reference/files?dirPath=~%5CDocuments")).toBe(403);
+    expect(await ok("/api/reference/files/stream?dirPath=~%5C")).toBe(403);
+    expect(await ok("/api/reference/files/stream?dirPath=~%5CDocuments")).toBe(403);
+    expect(await ok(`/api/reference/files/stream?filePath=${q(join(homedir(), ".ssh", "id_ed25519"))}`)).toBe(403);
+    expect(await ok("/api/reference/files/stream?filePath=~%5C.ssh%2Fid_ed25519")).toBe(403);
+    expect(await ok(`/api/reference/files/stream?filePath=${q("docs/a.png")}`)).toBe(200);
     expect(await ok(`/api/reference/files?dirPath=${q(`"/etc"`)}`)).toBe(403);
     expect(await ok(`/api/reference/files/stream?dirPath=${q(worktree)}&dirPath=${q("/")}`)).toBe(403);
-    expect(seen).toHaveLength(4);
+    expect(seen).toHaveLength(5);
     // Relative image paths reach upstream as absolute worktree paths.
     expect(seen.find(({ url }) => url.startsWith("/api/image?") && url.includes("a.png"))?.url).toBe(
       `/api/image?path=${q(join(worktree, "docs", "a.png"))}`,
@@ -208,6 +223,36 @@ describe("review proxy", () => {
     expect(response.status).toBe(200);
     expect(new URL(seen[0]!.url, "http://x").searchParams.get("path")).toBe(join(worktree, "img", "b.png"));
     expect(new URL(seen[0]!.url, "http://x").searchParams.has("base")).toBe(false);
+  });
+
+  it("lets only the bb page and the review itself frame it", async () => {
+    const { send } = await setup({
+      frameAncestor: "https://bb-server.tail1b968e.ts.net/some/path",
+      upstreamCsp: "default-src 'self'",
+    });
+
+    const response = await send("GET", "/api/plan");
+
+    expect(response.headers["content-security-policy"]).toBe(
+      "default-src 'self', frame-ancestors 'self' https://bb-server.tail1b968e.ts.net",
+    );
+  });
+
+  it("adds no frame policy without a bb origin", async () => {
+    const { send } = await setup();
+    expect((await send("GET", "/api/plan")).headers["content-security-policy"]).toBeUndefined();
+    expect(frameAncestorsPolicy("javascript:alert(1)")).toBeNull();
+    expect(frameAncestorsPolicy("https://a.example; script-src *")).toBeNull();
+  });
+
+  it("refuses decision bodies over 1 MiB", async () => {
+    const { send, seen, origin } = await setup();
+    const body = JSON.stringify({ feedback: "x".repeat(1024 * 1024) });
+
+    const response = await send("POST", "/api/deny", { headers: { origin }, body }).catch(() => ({ status: 413 }));
+
+    expect(response.status).toBe(413);
+    expect(seen).toHaveLength(0);
   });
 
   it("strips file-writing and app-opening fields from decision bodies", async () => {
@@ -272,5 +317,22 @@ describe("review proxy", () => {
 
     expect(response.startsWith("HTTP/1.1 403")).toBe(true);
     expect(seen).toHaveLength(0);
+  });
+
+  it("survives a client that resets during a refused upgrade", async () => {
+    const { proxy, host, send } = await setup();
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise<void>((resolve) => {
+        const socket = connect(proxy.port, "127.0.0.1", () => {
+          socket.write(`GET /x HTTP/1.1\r\nHost: ${host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`);
+          socket.resetAndDestroy();
+          resolve();
+        });
+        socket.on("error", () => resolve());
+      });
+    }
+
+    expect((await send("GET", "/api/plan")).status).toBe(200);
   });
 });

@@ -39,6 +39,7 @@ export async function startHostSession(options: {
   hostId: string;
   sessionId: string;
   session: SessionRequest;
+  frameAncestor?: string;
   cwd: string;
   origin: UpstreamOrigin;
   signal: AbortSignal;
@@ -62,6 +63,7 @@ export async function startHostSession(options: {
       cwd: options.cwd,
       origin: options.origin,
       session: options.session,
+      ...(options.frameAncestor ? { frameAncestor: options.frameAncestor } : {}),
     },
     { hostId, signal: options.signal, timeoutMs: HOST_START_TIMEOUT_MS },
   );

@@ -312,6 +312,23 @@ async function resolveUpstreamRuntimeConfig(
   }
 }
 
+/** The origin browsers load bb from, which host reviews allow as their frame parent. */
+export function bbPageOrigin(appUrl: string | null, serverUrl: string | undefined): string | undefined {
+  for (const candidate of [appUrl, serverUrl]) {
+    if (!candidate?.trim()) continue;
+    try {
+      const url = new URL(candidate.trim());
+      // A loopback URL is not where other devices load bb from.
+      if ((url.protocol === "https:" || url.protocol === "http:") && !isLocalBindHostname(url.hostname)) {
+        return url.origin;
+      }
+    } catch {
+      // Try the next source.
+    }
+  }
+  return undefined;
+}
+
 function resolveEmbedHost(bb: BbPluginApi): string | undefined {
   try {
     return new URL(bb.server.loopbackBaseUrl).hostname;
@@ -919,6 +936,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (session.mode === "annotate") annotatedPath = session.path;
       if (target.kind === "host") {
         hostId = target.hostId;
+        const systemConfig = await bb.sdk.system.config({ signal: controller.signal });
+        const frameAncestor = bbPageOrigin(bb.server.experimental_appUrl, systemConfig.serverUrl);
         upstream = await startHostSession({
           client: hostClient,
           hostId: target.hostId,
@@ -926,6 +945,7 @@ export default async function plugin(bb: BbPluginApi) {
           session,
           cwd: target.cwd,
           origin,
+          ...(frameAncestor ? { frameAncestor } : {}),
           signal: controller.signal,
           onCleanupNeeded: () => queueHostCleanup(target.hostId, sessionId),
         });

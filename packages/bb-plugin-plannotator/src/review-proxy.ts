@@ -36,7 +36,7 @@ const DENIED_PATHS: ReadonlyArray<{ path: string; prefix: boolean }> = [
 /** Decision-body fields that write files or open apps on the host. */
 const STRIPPED_DECISION_FIELDS = ["obsidian", "bear", "octarine"] as const;
 const DECISION_PATHS = new Set(["/api/approve", "/api/deny"]);
-const MAX_DECISION_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_DECISION_BODY_BYTES = 1024 * 1024;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -57,7 +57,25 @@ export type ReviewProxyOptions = {
   cwd: string;
   /** Directories `/api/image` and the file browser may read. */
   allowedRoots: readonly string[];
+  /**
+   * The bb page's origin. Only it and the review itself may frame the
+   * review, which stops other sites from framing it to steal clicks.
+   */
+  frameAncestor?: string;
 };
+
+/** `frame-ancestors` for a review that bb iframes; null without a bb origin. */
+export function frameAncestorsPolicy(frameAncestor: string | undefined): string | null {
+  if (!frameAncestor) return null;
+  try {
+    const { origin, protocol } = new URL(frameAncestor);
+    if (protocol !== "https:" && protocol !== "http:") return null;
+    // 'self' keeps nested frames working, such as an annotated HTML document.
+    return `frame-ancestors 'self' ${origin}`;
+  } catch {
+    return null;
+  }
+}
 
 export type RunningReviewProxy = {
   port: number;
@@ -75,8 +93,9 @@ function resolveUserPath(input: string, cwd: string): string {
   if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]) {
     value = value.slice(1, -1);
   }
+  // Upstream expands `~\` on every platform, not only on Windows.
   if (value === "~") value = homedir();
-  else if (value.startsWith("~/")) value = join(homedir(), value.slice(2));
+  else if (value.startsWith("~/") || value.startsWith("~\\")) value = join(homedir(), value.slice(2));
   return resolve(cwd, value);
 }
 
@@ -137,6 +156,12 @@ export async function refusalFor(
     for (const raw of url.searchParams.getAll("dirPath")) {
       if (!(await isAllowedPath(resolveUserPath(raw, options.cwd)))) {
         return "Directories outside the worktree are not available.";
+      }
+    }
+    // The stream also watches single files (and so their directory).
+    for (const raw of url.searchParams.getAll("filePath")) {
+      if (!(await isAllowedPath(resolveUserPath(raw, options.cwd)))) {
+        return "Files outside the worktree are not available.";
       }
     }
   }
@@ -206,6 +231,7 @@ export async function startReviewProxy(
   options: ReviewProxyOptions,
 ): Promise<RunningReviewProxy> {
   const isAllowedPath = await createPathGuard(options.allowedRoots);
+  const framePolicy = frameAncestorsPolicy(options.frameAncestor);
   let publicHost = "";
   let publicOrigin = "";
 
@@ -273,7 +299,15 @@ export async function startReviewProxy(
       headers,
     });
     upstream.on("response", (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode ?? 502, forwardedResponseHeaders(upstreamRes));
+      const headers = forwardedResponseHeaders(upstreamRes);
+      if (framePolicy) {
+        const existing = headers["content-security-policy"];
+        headers["content-security-policy"] = [
+          ...(existing === undefined ? [] : Array.isArray(existing) ? existing : [existing]),
+          framePolicy,
+        ];
+      }
+      res.writeHead(upstreamRes.statusCode ?? 502, headers);
       // Event streams must reach the browser as they arrive.
       res.flushHeaders();
       pipeline(upstreamRes, res, () => undefined);
@@ -298,6 +332,9 @@ export async function startReviewProxy(
   });
   // The plan review has no agent terminal or other WebSocket endpoint.
   server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
+    // Node drops its own socket error handler before `upgrade`; a reset peer
+    // must not crash the worker.
+    socket.on("error", () => undefined);
     socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
   });
 

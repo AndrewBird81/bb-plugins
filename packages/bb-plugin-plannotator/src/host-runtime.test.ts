@@ -417,8 +417,11 @@ describe("Plannotator host entry", () => {
         cwd,
         origin: "codex",
         session: { mode: "review", diffType: "staged" },
+        frameAncestor: "https://bb-server.tail1b968e.ts.net",
       }),
     ).resolves.toMatchObject({ port: 19501 });
+    expect(fake.proxies.get(19500)!.frameAncestor).toBeUndefined();
+    expect(fake.proxies.get(19501)!.frameAncestor).toBe("https://bb-server.tail1b968e.ts.net");
 
     expect(fake.started.map(({ session, sessionId }) => ({ session, sessionId }))).toEqual([
       { session: { mode: "annotate", path: join(realCwd, "docs", "a.md") }, sessionId: SESSION_ID },

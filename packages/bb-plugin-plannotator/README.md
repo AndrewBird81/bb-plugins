@@ -98,10 +98,12 @@ The tailnet is the trust boundary, as for BB itself: anyone who can reach the
 host's tailnet name can use the review while it is open. The proxy answers
 only requests addressed to `<MagicDNS name>:<port>` (blocking DNS rebinding)
 and accepts writes only from that origin (blocking cross-site requests from
-other web pages). It also denies upstream endpoints a review never needs from
-another device (host control, editor and note-app integrations, open-in-app,
-PR actions, the call-flow runtime installer, file reads outside the worktree,
-custom save paths).
+other web pages), and lets only the bb page frame the review. It also denies
+upstream endpoints a review never needs from another device (host control,
+editor and note-app integrations, open-in-app, PR actions, the call-flow
+runtime installer, file reads outside the worktree, custom save paths).
+Plannotator's own random loopback port is not published, but, as with stock
+local Plannotator, a web page in a browser on that host could still reach it.
 
 ## Boundary
 

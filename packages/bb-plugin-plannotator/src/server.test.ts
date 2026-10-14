@@ -14,6 +14,7 @@ import {
 } from "./constants";
 import type { HostReviewState } from "./host-contract";
 import plugin, {
+  bbPageOrigin,
   feedbackForBbAgent,
   reviewTargetFor,
   shouldUseRemotePlannotatorMode,
@@ -680,6 +681,26 @@ describe("BB upstream Plannotator bridge", () => {
       };
       expect(JSON.parse(refusal.content[0]!.text)).toMatchObject({ status: "already_active", reviewId: review.reviewId });
     }
+  });
+
+  it("tells the host which bb origin may frame the review", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      appUrl: "https://bb-server.tail1b968e.ts.net/",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+    await host.harness.behavior.callAgentTool("plannotator_review_changes", {}, threadContext);
+
+    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+      input: { frameAncestor: "https://bb-server.tail1b968e.ts.net" },
+    });
+    expect(bbPageOrigin(null, "http://127.0.0.1:38886")).toBeUndefined();
+    expect(bbPageOrigin(null, "https://bb.example.ts.net:8443/x")).toBe("https://bb.example.ts.net:8443");
   });
 
   it("resolves an annotated file against the worktree and the last reply from the thread", async () => {

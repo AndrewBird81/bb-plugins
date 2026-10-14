@@ -413,6 +413,7 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       cwd: string;
       origin: SessionOptions["origin"];
       session: SessionOptions["session"];
+      frameAncestor?: string;
     },
     context: HostContext,
     claim: StartClaim,
@@ -477,6 +478,7 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
         upstreamPort: review.port,
         cwd: input.cwd,
         allowedRoots: [input.cwd, deps.uploadDir],
+        ...(input.frameAncestor ? { frameAncestor: input.frameAncestor } : {}),
       });
       const port = proxy.port;
       // Record before publishing, so a crash in between still gets cleaned up.

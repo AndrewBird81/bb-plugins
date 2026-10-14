@@ -26,6 +26,7 @@ import {
   sharedCookieDomain,
   upstreamOnboardingCookies,
 } from "./src/embedded";
+import { SessionLauncher, launchParams } from "./src/launcher";
 
 type PlannotatorPayload = {
   kind: "plannotator";
@@ -34,6 +35,7 @@ type PlannotatorPayload = {
   sessionUrl: string;
   relayPath: typeof PLANNOTATOR_RELAY_PATH;
   title: string;
+  sessionKind?: string;
   dismissUpdateVersion?: string;
 };
 
@@ -67,6 +69,7 @@ function parsePayload(value: unknown): PlannotatorPayload | null {
     sessionUrl: value.sessionUrl,
     relayPath: PLANNOTATOR_RELAY_PATH,
     title: value.title,
+    ...(typeof value.sessionKind === "string" ? { sessionKind: value.sessionKind } : {}),
     ...(value.dismissUpdateVersion ? { dismissUpdateVersion: value.dismissUpdateVersion } : {}),
   };
 }
@@ -194,15 +197,6 @@ function PlannotatorFocusBridge({
   return null;
 }
 
-function EmptyPanel() {
-  return (
-    <div className="flex h-full min-h-0 items-center justify-center bg-background p-6 text-sm text-muted-foreground">
-      Start a plan review from the agent. The upstream Plannotator app will open
-      here when the review is ready.
-    </div>
-  );
-}
-
 function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
   const paramsPayload = parsePayload(params);
   const fallbackPayload = useActiveReviewFallback(threadId, !paramsPayload);
@@ -253,7 +247,7 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
     );
   }, [payload?.sessionId, payload?.sessionUrl, payload?.dismissUpdateVersion]);
 
-  if (!payload) return <EmptyPanel />;
+  if (!payload) return <SessionLauncher threadId={threadId} params={params} />;
 
   if (!embeddedUrl) {
     return (
@@ -303,7 +297,7 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
                 .catch(() => setCanceling(false));
             }}
           >
-            {canceling ? "Cancelling…" : "Cancel review"}
+            {canceling ? "Cancelling…" : payload.sessionKind && payload.sessionKind !== "plan" ? "Cancel session" : "Cancel review"}
           </button>
         </div>
       </div>
@@ -354,5 +348,47 @@ export default definePluginApp((app) => {
     id: "plannotator-focus-bridge",
     title: "Plannotator focus bridge",
     component: PlannotatorFocusBridge,
+  });
+  app.slots.messageAction({
+    id: "plannotator-annotate-message",
+    title: "Annotate in Plannotator",
+    icon: "ClipboardCheck",
+    run(context) {
+      const markdown = context.selectedText?.trim() ? context.selectedText : context.message.text;
+      context.openPanel({
+        actionId: PANEL_ACTION_ID,
+        title: "Annotate reply",
+        params: launchParams({ mode: "annotate-last", markdown }),
+      });
+    },
+  });
+  const inThread = (context: { threadId: string | null }) => context.threadId !== null;
+  app.commands.register({
+    id: "plannotator-review-changes",
+    title: "Plannotator: Review changes",
+    isAvailable: inThread,
+    run(context) {
+      context.openPanel({ actionId: PANEL_ACTION_ID, title: "Code review", params: launchParams({ mode: "review" }) });
+    },
+  });
+  app.commands.register({
+    id: "plannotator-annotate-last-reply",
+    title: "Plannotator: Annotate last reply",
+    isAvailable: inThread,
+    run(context) {
+      context.openPanel({
+        actionId: PANEL_ACTION_ID,
+        title: "Annotate reply",
+        params: launchParams({ mode: "annotate-last" }),
+      });
+    },
+  });
+  app.commands.register({
+    id: "plannotator-annotate-file",
+    title: "Plannotator: Annotate file…",
+    isAvailable: inThread,
+    run(context) {
+      context.openPanel({ actionId: PANEL_ACTION_ID, title: "Plannotator", params: { view: "annotate-file" } });
+    },
   });
 });

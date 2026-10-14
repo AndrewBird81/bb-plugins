@@ -4,7 +4,7 @@
 // embeds the upstream session, and delivers decisions in a later thread message.
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import {
   defineRpcContract,
   type BbPluginApi,
@@ -15,9 +15,10 @@ import {
   DEFAULT_BINARY,
   ensureBundledPlannotatorBinary,
   fetchLatestUpstreamVersion,
+  isSessionResult,
   missingBinaryMessage,
   resolvePlannotatorBinary,
-  startUpstreamPlanReview,
+  startUpstreamSession,
   type RunningUpstreamReview,
   type UpstreamDecision,
   type UpstreamOrigin,
@@ -28,19 +29,56 @@ import {
   PLANNOTATOR_REALTIME_CHANNEL,
 } from "./src/constants";
 import { isLocalBindHostname } from "./src/embedded";
-import { hostContract, hostSignals } from "./src/host-contract";
-import { startHostPlanReview, type HostPlanReview } from "./src/host-review";
+import {
+  MAX_ANNOTATE_MARKDOWN,
+  diffTypeSchema,
+  gitRefSchema,
+  hostContract,
+  hostSignals,
+  type SessionRequest,
+  type SessionResult,
+} from "./src/host-contract";
+import { startHostSession, type HostSession } from "./src/host-review";
+import { SESSION_KINDS, resolveAnnotateTarget, type SessionKind } from "./src/session";
 import {
   registerPlannotatorRelayRoutes,
 } from "./src/relay";
 
+const titleSchema = z.string().trim().min(1).max(200);
 const reviewToolParametersSchema = z
   .object({
     planMarkdown: z.string().trim().min(1).max(1_000_000),
-    title: z.string().trim().min(1).max(200).optional(),
+    title: titleSchema.optional(),
     previousPlanMarkdown: z.string().max(1_000_000).optional(),
   })
   .strict();
+const reviewChangesParametersSchema = z
+  .object({ diffType: diffTypeSchema.optional(), base: gitRefSchema.optional(), title: titleSchema.optional() })
+  .strict();
+const annotatePathSchema = z.string().trim().min(1).max(4096);
+const annotateFileParametersSchema = z
+  .object({ path: annotatePathSchema, title: titleSchema.optional() })
+  .strict();
+const annotateMarkdownSchema = z.string().min(1).max(MAX_ANNOTATE_MARKDOWN);
+const annotateReplyParametersSchema = z
+  .object({ markdown: annotateMarkdownSchema.optional(), title: titleSchema.optional() })
+  .strict();
+
+/** What the bb panel can start; plan review is agent-only. */
+const userSessionRequestSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("review"), diffType: diffTypeSchema.optional(), base: gitRefSchema.optional() }).strict(),
+  z.object({ mode: z.literal("annotate"), path: annotatePathSchema }).strict(),
+  z.object({ mode: z.literal("annotate-last"), markdown: annotateMarkdownSchema.optional() }).strict(),
+]);
+
+/** A session request before the server resolves paths and text. */
+type SessionInput =
+  | { mode: "plan"; planMarkdown: string }
+  | z.infer<typeof userSessionRequestSchema>;
+
+const sessionKindSchema = z.enum(["plan", "code-review", "annotate", "annotate-reply"]);
+const sessionInitiatorSchema = z.enum(["agent", "user"]);
+type SessionInitiator = z.infer<typeof sessionInitiatorSchema>;
 
 const interactionPayloadSchema = z
   .object({
@@ -50,6 +88,7 @@ const interactionPayloadSchema = z
     sessionUrl: z.string().url(),
     relayPath: z.literal(PLANNOTATOR_RELAY_PATH),
     title: z.string().min(1),
+    sessionKind: sessionKindSchema.optional(),
     /** Latest upstream release, so the panel can pre-dismiss its update toast. */
     dismissUpdateVersion: z.string().min(1).max(64).optional(),
   })
@@ -84,12 +123,25 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ cancelled: z.boolean() }).strict(),
   },
+  /** Start a code review or annotation from the bb panel. */
+  startSession: {
+    input: z.object({ threadId: z.string().min(1), request: userSessionRequestSchema }).strict(),
+    output: z
+      .object({
+        status: z.enum(["pending", "already_active", "error"]),
+        reviewId: z.string().optional(),
+        error: z.string().optional(),
+      })
+      .strict(),
+  },
 });
 
 type ActiveReview = {
   sessionId: string;
+  kind: SessionKind;
+  initiator: SessionInitiator;
   payload: ReviewPanelPayload;
-  review: RunningUpstreamReview | HostPlanReview;
+  review: RunningUpstreamReview | HostSession;
   controller: AbortController;
   cancelledByUser: boolean;
   /** The thread was deleted or archived: deliver no decision. */
@@ -97,31 +149,35 @@ type ActiveReview = {
   settled?: Promise<void>;
 };
 
-type ReviewResult = {
-  reviewId: string;
-  source: "plannotator";
-  decision: "approved" | "changes_requested" | "cancelled";
-  feedback?: string;
-  savedPath?: string;
-  agentSwitch?: string;
-  error?: string;
-};
+const reviewResultSchema = z.object({
+  reviewId: z.string().uuid(),
+  source: z.literal("plannotator"),
+  kind: sessionKindSchema.optional(),
+  decision: z.enum(["approved", "changes_requested", "annotated", "dismissed", "cancelled"]),
+  feedback: z.string().optional(),
+  savedPath: z.string().optional(),
+  agentSwitch: z.string().optional(),
+  error: z.string().optional(),
+  /** Review and annotate: the agent-facing text upstream composed. */
+  message: z.string().optional(),
+  target: z.union([z.string(), z.array(z.string())]).optional(),
+  annotationCount: z.number().int().optional(),
+  /** Review and annotate: nothing for the agent (bare approval or close). */
+  noop: z.boolean().optional(),
+});
+type ReviewResult = z.infer<typeof reviewResultSchema>;
 
 const storedReviewSchema = z.object({
   id: z.string().uuid(),
   threadId: z.string().min(1),
+  /** Records from 0.4 and earlier are plan reviews started by an agent. */
+  kind: sessionKindSchema.default("plan"),
+  initiator: sessionInitiatorSchema.default("agent"),
   /** Set when the review runs on another bb host. */
   hostId: z.string().min(1).optional(),
-  status: z.enum(["pending", "ready", "delivered"]),
-  result: z.object({
-    reviewId: z.string().uuid(),
-    source: z.literal("plannotator"),
-    decision: z.enum(["approved", "changes_requested", "cancelled"]),
-    feedback: z.string().optional(),
-    savedPath: z.string().optional(),
-    agentSwitch: z.string().optional(),
-    error: z.string().optional(),
-  }).optional(),
+  /** `closed`: finished without a thread message (user-initiated, nothing to say). */
+  status: z.enum(["pending", "ready", "delivered", "closed"]),
+  result: reviewResultSchema.optional(),
   updatedAt: z.number(),
 });
 type StoredReview = z.infer<typeof storedReviewSchema>;
@@ -218,7 +274,7 @@ async function resolveReviewContext(
   return { origin, target: reviewTargetFor(environment, systemConfig.primaryHostId) };
 }
 
-function isHostReview(review: ActiveReview["review"]): review is HostPlanReview {
+function isHostReview(review: ActiveReview["review"]): review is HostSession {
   return "hostId" in review;
 }
 
@@ -387,6 +443,7 @@ function reviewResult(reviewId: string, decision: UpstreamDecision): ReviewResul
   return {
     reviewId,
     source: "plannotator",
+    kind: "plan",
     decision: decisionLabel(decision),
     ...(decision.feedback ? { feedback: feedbackForBbAgent(decision.feedback) } : {}),
     ...(decision.savedPath ? { savedPath: decision.savedPath } : {}),
@@ -394,13 +451,74 @@ function reviewResult(reviewId: string, decision: UpstreamDecision): ReviewResul
   };
 }
 
-function reviewMessage(result: ReviewResult): string {
+function sessionReviewResult(reviewId: string, kind: SessionKind, result: SessionResult): ReviewResult {
+  return {
+    reviewId,
+    source: "plannotator",
+    kind,
+    decision: result.decision,
+    noop: result.noop,
+    ...(result.message.trim() ? { message: result.message } : {}),
+    ...(result.target !== undefined ? { target: result.target } : {}),
+    ...(result.annotationCount !== undefined ? { annotationCount: result.annotationCount } : {}),
+  };
+}
+
+/** The agent tool each kind answers. */
+export const TOOL_FOR_KIND: Record<SessionKind, string> = {
+  plan: "plannotator_review_plan",
+  "code-review": "plannotator_review_changes",
+  annotate: "plannotator_annotate_file",
+  "annotate-reply": "plannotator_annotate_reply",
+};
+const KIND_NOUN: Record<SessionKind, string> = {
+  plan: "review",
+  "code-review": "code review",
+  annotate: "annotation",
+  "annotate-reply": "annotation",
+};
+
+function closingSentence(kind: SessionKind, initiator: SessionInitiator): string {
+  if (kind === "plan") {
+    return "This answers the earlier plannotator_review_plan call. Continue the original task if approved; revise the plan if changes were requested. Cancellation is not approval. Do not repeat this review unless asked.";
+  }
+  const subject = {
+    "code-review": "the worktree changes",
+    annotate: "the annotated file",
+    "annotate-reply": "your earlier reply",
+  }[kind];
+  const opening =
+    initiator === "agent"
+      ? `This answers the earlier ${TOOL_FOR_KIND[kind]} call.`
+      : `The user opened this Plannotator ${KIND_NOUN[kind]} from the bb panel.`;
+  return `${opening} Treat any annotations above as the user's feedback on ${subject}. Approval or dismissal with no annotations means no changes were requested; cancellation is not approval. Do not repeat this ${KIND_NOUN[kind]} unless asked.`;
+}
+
+export function reviewMessage(
+  result: ReviewResult,
+  kind: SessionKind = "plan",
+  initiator: SessionInitiator = "agent",
+): string {
+  const { message, noop: _noop, ...summary } = result;
   return [
-    `Plannotator review ${result.reviewId} has finished.`,
-    JSON.stringify(result),
-    "This answers the earlier plannotator_review_plan call. Continue the original task if approved; revise the plan if changes were requested. Cancellation is not approval. Do not repeat this review unless asked.",
+    `Plannotator ${KIND_NOUN[kind]} ${result.reviewId} has finished.`,
+    JSON.stringify(summary),
+    ...(message ? [message] : []),
+    closingSentence(kind, initiator),
   ].join("\n\n");
 }
+
+/** User-initiated sessions message the thread only when there is feedback. */
+function shouldDeliver(initiator: SessionInitiator, result: ReviewResult): boolean {
+  return initiator === "agent" || result.noop === false;
+}
+
+const DEFAULT_TITLES: Record<SessionKind, string> = {
+  plan: "Plannotator review",
+  "code-review": "Code review",
+  annotate: "Annotate file",
+  "annotate-reply": "Annotate reply",
+};
 
 function errorResponse(message: string) {
   return {
@@ -419,12 +537,29 @@ function alreadyActiveResponse(reviewId: string | undefined) {
         status: "already_active",
         source: "plannotator",
         ...(reviewId ? { reviewId } : {}),
-        error: "A Plannotator review is already pending in this thread. No new review was started.",
-        message: "Ask the user to finish or cancel the pending review. They can reopen it from the Plannotator thread panel action. Its decision will arrive as a new message in this thread.",
+        error: "A Plannotator session is already open in this thread. No new session was started.",
+        message: "Ask the user to finish or cancel the open session. They can reopen it from the Plannotator thread panel action. Its result will arrive as a new message in this thread.",
       }),
     }],
     isError: true,
   };
+}
+
+type StartOutcome =
+  | { status: "pending"; reviewId: string; kind: SessionKind }
+  | { status: "already_active"; reviewId?: string }
+  | { status: "error"; error: string };
+
+function toolResponse(outcome: StartOutcome) {
+  if (outcome.status === "already_active") return alreadyActiveResponse(outcome.reviewId);
+  if (outcome.status === "error") return errorResponse(outcome.error);
+  return JSON.stringify({
+    status: "pending",
+    reviewId: outcome.reviewId,
+    kind: outcome.kind,
+    source: "plannotator",
+    message: `End this turn. The ${KIND_NOUN[outcome.kind]} result will arrive as a new message in this thread.`,
+  });
 }
 
 async function getConfiguredPath(settings: { get(): Promise<{ binaryPath: string }> }): Promise<string> {
@@ -490,7 +625,7 @@ export default async function plugin(bb: BbPluginApi) {
   const activeHostReviews = (hostId: string) =>
     [...activeReviews.values()]
       .map(({ review }) => review)
-      .filter((review): review is HostPlanReview => isHostReview(review) && review.hostId === hostId);
+      .filter((review): review is HostSession => isHostReview(review) && review.hostId === hostId);
   hostClient.experimental_onSignal("reviewChanged", ({ hostId, payload }) => {
     for (const review of activeHostReviews(hostId)) {
       if (review.sessionId === payload.sessionId) review.refresh();
@@ -568,7 +703,7 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.sdk.threads.send({
         threadId: record.threadId,
         mode: "queue-if-active",
-        input: [{ type: "text", text: reviewMessage(record.result), mentions: [] }],
+        input: [{ type: "text", text: reviewMessage(record.result, record.kind, record.initiator), mentions: [] }],
       });
       await bb.storage.kv.set(reviewKey(record.id), {
         ...record,
@@ -603,10 +738,12 @@ export default async function plugin(bb: BbPluginApi) {
         await closeReviewPanel(bb, record.threadId, record.id);
         record = {
           ...record,
-          status: "ready",
+          // The user closed nothing and asked nothing: no message for them.
+          status: record.initiator === "user" ? "closed" : "ready",
           result: {
             reviewId: record.id,
             source: "plannotator",
+            kind: record.kind,
             decision: "cancelled",
             error: "The review ended when the Plannotator plugin restarted.",
           },
@@ -638,11 +775,15 @@ export default async function plugin(bb: BbPluginApi) {
   async function settleReview(threadId: string, active: ActiveReview): Promise<void> {
     let result: ReviewResult;
     try {
-      result = reviewResult(active.sessionId, await active.review.result);
+      const decision = await active.review.result;
+      result = isSessionResult(decision)
+        ? sessionReviewResult(active.sessionId, active.kind, decision)
+        : reviewResult(active.sessionId, decision);
     } catch (error) {
       result = {
         reviewId: active.sessionId,
         source: "plannotator",
+        kind: active.kind,
         decision: "cancelled",
         ...(!active.cancelledByUser
           ? { error: error instanceof Error ? error.message : String(error) }
@@ -670,7 +811,9 @@ export default async function plugin(bb: BbPluginApi) {
     const record: StoredReview = {
       id: active.sessionId,
       threadId,
-      status: "ready",
+      kind: active.kind,
+      initiator: active.initiator,
+      status: shouldDeliver(active.initiator, result) ? "ready" : "closed",
       result,
       updatedAt: Date.now(),
     };
@@ -707,7 +850,174 @@ export default async function plugin(bb: BbPluginApi) {
       await active.review.stop();
       return { cancelled: true };
     },
+    async startSession({ threadId, request }) {
+      const outcome = await startSession(threadId, request, { initiator: "user" });
+      if (outcome.status === "pending") return { status: "pending" as const, reviewId: outcome.reviewId };
+      if (outcome.status === "already_active") {
+        return { status: "already_active" as const, ...(outcome.reviewId ? { reviewId: outcome.reviewId } : {}) };
+      }
+      return { status: "error" as const, error: outcome.error };
+    },
   });
+
+  /** Resolve a request against the thread's worktree and machine. */
+  async function resolveSessionRequest(
+    threadId: string,
+    input: SessionInput,
+    target: ReviewTarget,
+    signal: AbortSignal,
+  ): Promise<SessionRequest> {
+    if (input.mode === "plan" || input.mode === "annotate-last") {
+      if (input.mode === "plan") return input;
+      const markdown =
+        input.markdown ?? (await bb.sdk.threads.output({ threadId, signal })).output ?? "";
+      if (!markdown.trim()) throw new Error("This thread has no assistant reply to annotate yet.");
+      if (markdown.length > MAX_ANNOTATE_MARKDOWN) {
+        throw new Error("The reply is longer than Plannotator's 2 MiB annotation limit.");
+      }
+      return { mode: "annotate-last", markdown };
+    }
+    if (!target.cwd) {
+      throw new Error("Code review and file annotation need the thread's worktree on its machine.");
+    }
+    if (input.mode === "review") return input;
+    // On the server, check the file here. A host checks it again on its own
+    // filesystem before Plannotator starts.
+    const path =
+      target.kind === "server"
+        ? await resolveAnnotateTarget(target.cwd, input.path)
+        : resolve(target.cwd, input.path);
+    return { mode: "annotate", path };
+  }
+
+  /**
+   * Start a session of any kind for a thread. One session is open per thread.
+   * Agent tools and the bb panel share this path.
+   */
+  async function startSession(
+    threadId: string,
+    input: SessionInput,
+    options: { initiator: SessionInitiator; title?: string; signal?: AbortSignal },
+  ): Promise<StartOutcome> {
+    if (activeReviews.has(threadId) || startingReviews.has(threadId)) {
+      return { status: "already_active", reviewId: activeReviews.get(threadId)?.sessionId };
+    }
+    startingReviews.add(threadId);
+
+    const kind = SESSION_KINDS[input.mode];
+    const sessionId = randomUUID();
+    const controller = new AbortController();
+    const abortStartup = () => controller.abort();
+    options.signal?.addEventListener("abort", abortStartup, { once: true });
+    const dismissUpdateVersion = latestUpstreamVersion();
+    let upstream: RunningUpstreamReview | HostSession;
+    let hostId: string | undefined;
+    let annotatedPath: string | undefined;
+    try {
+      const { origin, target } = await resolveReviewContext(bb, threadId, controller.signal);
+      const session = await resolveSessionRequest(threadId, input, target, controller.signal);
+      if (session.mode === "annotate") annotatedPath = session.path;
+      if (target.kind === "host") {
+        hostId = target.hostId;
+        upstream = await startHostSession({
+          client: hostClient,
+          hostId: target.hostId,
+          sessionId,
+          session,
+          cwd: target.cwd,
+          origin,
+          signal: controller.signal,
+          onCleanupNeeded: () => queueHostCleanup(target.hostId, sessionId),
+        });
+      } else {
+        const configuredPath = await getConfiguredPath(settings);
+        const binaryPath = await resolveRuntimeBinary(bb, configuredPath, controller.signal);
+        const runtimeConfig = await resolveUpstreamRuntimeConfig(bb, controller.signal);
+        upstream = await startUpstreamSession({
+          binaryPath,
+          session,
+          sessionId,
+          timeoutSeconds: null,
+          signal: controller.signal,
+          origin,
+          dataDir: runtimeConfig.dataDir,
+          remote: runtimeConfig.remote,
+          embedHost: resolveEmbedHost(bb),
+          cwd: target.cwd,
+        });
+      }
+    } catch (error) {
+      options.signal?.removeEventListener("abort", abortStartup);
+      startingReviews.delete(threadId);
+      // An aborted or timed-out call may still have started and published
+      // the review on the host.
+      if (hostId) queueHostCleanup(hostId, sessionId);
+      return { status: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+    // The process can exit while the panel and stored review are opening.
+    // Attach a rejection handler before any further awaits.
+    void upstream.result.catch(() => undefined);
+
+    const title =
+      options.title?.trim() ||
+      (annotatedPath ? `Annotate ${basename(annotatedPath)}` : DEFAULT_TITLES[kind]);
+    const updateVersion = await dismissUpdateVersion;
+    const payload = interactionPayloadSchema.parse({
+      kind: "plannotator",
+      sessionId,
+      threadId,
+      sessionUrl: upstream.url,
+      relayPath: PLANNOTATOR_RELAY_PATH,
+      title,
+      sessionKind: kind,
+      // RPC results are strict JSON: omit the field rather than send undefined.
+      ...(updateVersion ? { dismissUpdateVersion: updateVersion } : {}),
+    });
+    // Host reviews are published on their own machine; only in-process
+    // listeners go through BB's relay.
+    if (!isHostReview(upstream)) relaySessions.set(sessionId, upstream.url);
+    const active: ActiveReview = {
+      sessionId, kind, initiator: options.initiator, payload, review: upstream, controller,
+      cancelledByUser: false, discarded: false,
+    };
+    activeReviews.set(threadId, active);
+    startingReviews.delete(threadId);
+
+    try {
+      await openReviewPanel(bb, threadId, payload);
+      if (options.signal?.aborted || active.discarded || controller.signal.aborted) {
+        throw new Error("Plannotator review was cancelled before opening");
+      }
+      await bb.storage.kv.set(reviewKey(sessionId), {
+        id: sessionId,
+        threadId,
+        kind,
+        initiator: options.initiator,
+        ...(isHostReview(upstream) ? { hostId: upstream.hostId } : {}),
+        status: "pending",
+        updatedAt: Date.now(),
+      } satisfies StoredReview);
+      bb.realtime.publish(PLANNOTATOR_REALTIME_CHANNEL, {
+        kind: "review-opened",
+        payload,
+      });
+      options.signal?.removeEventListener("abort", abortStartup);
+      active.settled = settleReview(threadId, active).catch((error) => {
+        bb.log.error(`Could not settle Plannotator review ${sessionId}: ${String(error)}`);
+      });
+      return { status: "pending", reviewId: sessionId, kind };
+    } catch (error) {
+      options.signal?.removeEventListener("abort", abortStartup);
+      activeReviews.delete(threadId);
+      relaySessions.delete(sessionId);
+      await Promise.allSettled([
+        bb.storage.kv.delete(reviewKey(sessionId)),
+        closeReviewPanel(bb, threadId, sessionId),
+        upstream.stop(),
+      ]);
+      return { status: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+  }
 
   bb.agents.registerTool({
     name: "plannotator_review_plan",
@@ -723,129 +1033,80 @@ export default async function plugin(bb: BbPluginApi) {
     },
     parameters: reviewToolParametersSchema,
     async execute(params, context) {
-      if (activeReviews.has(context.threadId) || startingReviews.has(context.threadId)) {
-        return alreadyActiveResponse(activeReviews.get(context.threadId)?.sessionId);
-      }
-      startingReviews.add(context.threadId);
-
-      const sessionId = randomUUID();
-      const controller = new AbortController();
-      const abortStartup = () => controller.abort();
-      context.signal.addEventListener("abort", abortStartup, { once: true });
-      const dismissUpdateVersion = latestUpstreamVersion();
-      let upstream: RunningUpstreamReview | HostPlanReview;
-      let hostId: string | undefined;
-      try {
-        const { origin, target } = await resolveReviewContext(
-          bb,
+      return toolResponse(
+        await startSession(
           context.threadId,
-          controller.signal,
-        );
-        if (target.kind === "host") {
-          hostId = target.hostId;
-          upstream = await startHostPlanReview({
-            client: hostClient,
-            hostId: target.hostId,
-            sessionId,
-            planMarkdown: params.planMarkdown,
-            cwd: target.cwd,
-            origin,
-            signal: controller.signal,
-            onCleanupNeeded: () => queueHostCleanup(target.hostId, sessionId),
-          });
-        } else {
-          const configuredPath = await getConfiguredPath(settings);
-          const binaryPath = await resolveRuntimeBinary(bb, configuredPath, controller.signal);
-          const runtimeConfig = await resolveUpstreamRuntimeConfig(bb, controller.signal);
-          upstream = await startUpstreamPlanReview({
-            binaryPath,
-            planMarkdown: params.planMarkdown,
-            timeoutSeconds: null,
-            signal: controller.signal,
-            origin,
-            dataDir: runtimeConfig.dataDir,
-            remote: runtimeConfig.remote,
-            embedHost: resolveEmbedHost(bb),
-            cwd: target.cwd,
-          });
-        }
-      } catch (error) {
-        context.signal.removeEventListener("abort", abortStartup);
-        startingReviews.delete(context.threadId);
-        // An aborted or timed-out call may still have started and published
-        // the review on the host.
-        if (hostId) queueHostCleanup(hostId, sessionId);
-        return errorResponse(error instanceof Error ? error.message : String(error));
-      }
-      // The process can exit while the panel and stored review are opening.
-      // Attach a rejection handler before any further awaits.
-      void upstream.result.catch(() => undefined);
+          { mode: "plan", planMarkdown: params.planMarkdown },
+          { initiator: "agent", title: params.title, signal: context.signal },
+        ),
+      );
+    },
+  });
 
-      const title = params.title?.trim() || "Plannotator review";
-      const updateVersion = await dismissUpdateVersion;
-      const payload = interactionPayloadSchema.parse({
-        kind: "plannotator",
-        sessionId,
-        threadId: context.threadId,
-        sessionUrl: upstream.url,
-        relayPath: PLANNOTATOR_RELAY_PATH,
-        title,
-        // RPC results are strict JSON: omit the field rather than send undefined.
-        ...(updateVersion ? { dismissUpdateVersion: updateVersion } : {}),
-      });
-      // Host reviews are published on their own machine; only in-process
-      // listeners go through BB's relay.
-      if (!isHostReview(upstream)) relaySessions.set(sessionId, upstream.url);
-      const active: ActiveReview = {
-        sessionId, payload, review: upstream, controller,
-        cancelledByUser: false, discarded: false,
-      };
-      activeReviews.set(context.threadId, active);
-      startingReviews.delete(context.threadId);
+  const sessionToolNote =
+    "The tool returns a pending review ID promptly: end your turn and wait for the result in a new message on this thread. Do not poll. Only one Plannotator session can be open per thread.";
 
-      try {
-        await openReviewPanel(bb, context.threadId, payload);
-        if (context.signal.aborted || active.discarded || controller.signal.aborted) {
-          throw new Error("Plannotator review was cancelled before opening");
-        }
-        await bb.storage.kv.set(reviewKey(sessionId), {
-          id: sessionId,
-          threadId: context.threadId,
-          ...(isHostReview(upstream) ? { hostId: upstream.hostId } : {}),
-          status: "pending",
-          updatedAt: Date.now(),
-        } satisfies StoredReview);
-        bb.realtime.publish(PLANNOTATOR_REALTIME_CHANNEL, {
-          kind: "review-opened",
-          payload,
-        });
-        context.signal.removeEventListener("abort", abortStartup);
-        active.settled = settleReview(context.threadId, active).catch((error) => {
-          bb.log.error(`Could not settle Plannotator review ${sessionId}: ${String(error)}`);
-        });
-        return JSON.stringify({
-          status: "pending",
-          reviewId: sessionId,
-          source: "plannotator",
-          message: "End this turn. The review decision will arrive as a new message in this thread.",
-        });
-      } catch (error) {
-        context.signal.removeEventListener("abort", abortStartup);
-        activeReviews.delete(context.threadId);
-        relaySessions.delete(sessionId);
-        await Promise.allSettled([
-          bb.storage.kv.delete(reviewKey(sessionId)),
-          closeReviewPanel(bb, context.threadId, sessionId),
-          upstream.stop(),
-        ]);
-        return errorResponse(error instanceof Error ? error.message : String(error));
-      }
+  bb.agents.registerTool({
+    name: "plannotator_review_changes",
+    description:
+      "Optionally open Plannotator's code review of the thread's worktree changes in BB. The user's annotations arrive in a later thread message.",
+    instructions: `Use this optional tool only when the user asks for Plannotator or a code review of the changes in Plannotator. By default it shows all changes since the default branch, including uncommitted and untracked files; pass diffType to choose another view (uncommitted, staged, unstaged, last-commit, branch, merge-base, all) and base for another git ref. ${sessionToolNote}`,
+    presentation: { label: { pending: "Opening Plannotator code review", completed: "Plannotator code review opened" } },
+    parameters: reviewChangesParametersSchema,
+    async execute(params, context) {
+      return toolResponse(
+        await startSession(
+          context.threadId,
+          {
+            mode: "review",
+            ...(params.diffType ? { diffType: params.diffType } : {}),
+            ...(params.base ? { base: params.base } : {}),
+          },
+          { initiator: "agent", title: params.title, signal: context.signal },
+        ),
+      );
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "plannotator_annotate_file",
+    description:
+      "Optionally open a Markdown or HTML file from the thread's worktree in Plannotator for the user to annotate. The annotations arrive in a later thread message.",
+    instructions: `Use this optional tool only when the user asks to annotate or review a document in Plannotator. Pass a .md, .markdown, .html or .htm path relative to the worktree (or absolute inside it). ${sessionToolNote}`,
+    presentation: { label: { pending: "Opening Plannotator annotation", completed: "Plannotator annotation opened" } },
+    parameters: annotateFileParametersSchema,
+    async execute(params, context) {
+      return toolResponse(
+        await startSession(
+          context.threadId,
+          { mode: "annotate", path: params.path },
+          { initiator: "agent", title: params.title, signal: context.signal },
+        ),
+      );
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "plannotator_annotate_reply",
+    description:
+      "Optionally open an assistant reply in Plannotator for the user to annotate. The annotations arrive in a later thread message.",
+    instructions: `Use this optional tool only when the user asks to annotate a reply in Plannotator. Without markdown it opens this thread's last completed assistant reply; pass markdown to annotate other text, including text from the current turn. ${sessionToolNote}`,
+    presentation: { label: { pending: "Opening Plannotator annotation", completed: "Plannotator annotation opened" } },
+    parameters: annotateReplyParametersSchema,
+    async execute(params, context) {
+      return toolResponse(
+        await startSession(
+          context.threadId,
+          { mode: "annotate-last", ...(params.markdown ? { markdown: params.markdown } : {}) },
+          { initiator: "agent", title: params.title, signal: context.signal },
+        ),
+      );
     },
   });
 
   bb.agents.registerTool({
     name: "plannotator_review_status",
-    description: "Recover the status or decision of a Plannotator review in this thread. Do not poll while a review is pending.",
+    description: "Recover the status or result of a Plannotator session (plan review, code review or annotation) in this thread. Do not poll while a session is open.",
     parameters: z.object({ reviewId: z.string().uuid() }).strict(),
     async execute({ reviewId }, context) {
       const record = await loadReview(reviewId);
@@ -854,6 +1115,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return JSON.stringify({
         reviewId,
+        kind: record.kind,
         status: record.status,
         ...(record.result ? { result: record.result } : {}),
       });
@@ -861,7 +1123,13 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.configure(() => ({
-    tools: ["plannotator_review_plan", "plannotator_review_status"],
+    tools: [
+      "plannotator_review_plan",
+      "plannotator_review_changes",
+      "plannotator_annotate_file",
+      "plannotator_annotate_reply",
+      "plannotator_review_status",
+    ],
     skills: [],
   }));
 
@@ -892,10 +1160,13 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(reviewKey(active.sessionId), {
       id: active.sessionId,
       threadId: thread.id,
-      status: "delivered",
+      kind: active.kind,
+      initiator: active.initiator,
+      status: "closed",
       result: {
         reviewId: active.sessionId,
         source: "plannotator",
+        kind: active.kind,
         decision: "cancelled",
         error: "The review ended when its thread was archived.",
       },

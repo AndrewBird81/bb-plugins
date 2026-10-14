@@ -7,6 +7,26 @@ import { PLANNOTATOR_REALTIME_CHANNEL } from "./constants";
 
 const app = await loadPluginApp(() => import("../app"));
 
+/** SDK fakes for the session launcher's file picker. */
+function launcherSdk(paths: string[] = []) {
+  const calls: Array<Record<string, unknown>> = [];
+  return {
+    calls,
+    sdk: {
+      threads: { get: async () => ({ environmentId: "env-1" }) },
+      environments: {
+        paths: async (args: Record<string, unknown>) => {
+          calls.push(args);
+          return {
+            paths: paths.map((path) => ({ kind: "file", name: path, path, positions: [], score: 1 })),
+            truncated: false,
+          };
+        },
+      },
+    } as never,
+  };
+}
+
 afterEach(() => cleanup());
 
 const payload = {
@@ -170,6 +190,7 @@ describe("Plannotator BB shell", () => {
           getActiveReview: () => payload,
           cancelReview: () => ({ cancelled: true }),
         },
+        sdk: launcherSdk().sdk,
       },
     );
 
@@ -179,7 +200,7 @@ describe("Plannotator BB shell", () => {
       method: "getActiveReview",
       input: { threadId: "thread-1" },
     });
-    expect(slot.queryByText(/Start a plan review from the agent/)).toBeNull();
+    expect(slot.queryByText("Annotate last reply", { selector: "div" })).toBeNull();
 
     fireEvent.click(slot.getByRole("button", { name: "Cancel review" }));
     await waitFor(() =>
@@ -194,10 +215,10 @@ describe("Plannotator BB shell", () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thread-1", params: {} },
-      { rpc: { getActiveReview: () => null } },
+      { rpc: { getActiveReview: () => null }, sdk: launcherSdk().sdk },
     );
 
-    await slot.findByText(/Start a plan review from the agent/);
+    await slot.findByRole("button", { name: "Review changes" });
     await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, {
       kind: "review-opened",
       payload: { ...payload, threadId: "thread-2" },
@@ -215,7 +236,87 @@ describe("Plannotator BB shell", () => {
       threadId: "thread-1",
       sessionId: "session-1",
     });
-    await slot.findByText(/Start a plan review from the agent/);
+    await slot.findByRole("button", { name: "Review changes" });
+  });
+
+  it("starts a code review, an annotation of the last reply, and a file annotation from the launcher", async () => {
+    const { sdk, calls } = launcherSdk(["docs/guide.md", "src/app.ts", "site/index.html"]);
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      {
+        rpc: {
+          getActiveReview: () => null,
+          startSession: () => ({ status: "pending", reviewId: "r-1" }),
+        },
+        sdk,
+      },
+    );
+
+    const idle = () =>
+      waitFor(() =>
+        expect((slot.getByRole("button", { name: "Review changes" }) as HTMLButtonElement).disabled).toBe(false),
+      );
+    fireEvent.change(await slot.findByLabelText("Diff type"), { target: { value: "uncommitted" } });
+    fireEvent.click(slot.getByRole("button", { name: "Review changes" }));
+    await idle();
+    fireEvent.click(slot.getByRole("button", { name: "Annotate last reply" }));
+    await idle();
+    fireEvent.click(await slot.findByRole("button", { name: "site/index.html" }));
+
+    await waitFor(() =>
+      expect(slot.rpcCalls.filter(({ method }) => method === "startSession").map(({ input }) => input)).toEqual([
+        { threadId: "thread-1", request: { mode: "review", diffType: "uncommitted" } },
+        { threadId: "thread-1", request: { mode: "annotate-last" } },
+        { threadId: "thread-1", request: { mode: "annotate", path: "site/index.html" } },
+      ]),
+    );
+    // The picker lists only Markdown and HTML files from bb's workspace search.
+    expect(slot.queryByRole("button", { name: "src/app.ts" })).toBeNull();
+    expect(calls[0]).toMatchObject({ environmentId: "env-1", includeFiles: "true", includeDirectories: "false" });
+  });
+
+  it("starts a launch request from panel params once and shows a refusal", async () => {
+    const params = { launch: { id: "launch-1", request: { mode: "annotate-last", markdown: "Hello" } } };
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params },
+      {
+        rpc: {
+          getActiveReview: () => null,
+          startSession: () => ({ status: "already_active", reviewId: "r-0" }),
+        },
+        sdk: launcherSdk().sdk,
+      },
+    );
+
+    await slot.findByText("A Plannotator session is already open in this thread.");
+    expect(slot.rpcCalls.filter(({ method }) => method === "startSession")).toEqual([
+      { method: "startSession", input: { threadId: "thread-1", request: { mode: "annotate-last", markdown: "Hello" } } },
+    ]);
+  });
+
+  it("annotates a message, or its selected text, through the panel", () => {
+    const action = app.messageActions.find(({ id }) => id === "plannotator-annotate-message")!;
+    const opened: unknown[] = [];
+    const context = (selectedText?: string) =>
+      ({
+        threadId: "thread-1",
+        message: { id: "m-1", threadId: "thread-1", role: "assistant", text: "Full reply", sourceSeqEnd: 1, experimental_messageSeq: 1 },
+        ...(selectedText ? { selectedText } : {}),
+        openPanel: (options: unknown) => {
+          opened.push(options);
+          return true;
+        },
+      }) as never;
+
+    void action.run(context());
+    void action.run(context("Just this"));
+
+    expect(opened).toMatchObject([
+      { actionId: "plannotator-review", params: { launch: { request: { mode: "annotate-last", markdown: "Full reply" } } } },
+      { actionId: "plannotator-review", params: { launch: { request: { mode: "annotate-last", markdown: "Just this" } } } },
+    ]);
   });
 
   it("exposes explicit cancellation without a host interaction deadline", async () => {

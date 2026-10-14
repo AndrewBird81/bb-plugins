@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { HostReviewState } from "./host-contract";
-import { startHostPlanReview, type PlannotatorHostClient } from "./host-review";
+import { hostReviewStateSchema, type HostReviewState } from "./host-contract";
+import { startHostSession, type PlannotatorHostClient } from "./host-review";
 
 const SESSION_ID = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
 
@@ -24,12 +24,12 @@ function start(
   pollIntervalMs = 5,
   extra: { disconnectGraceMs?: number; now?: () => number } = {},
 ) {
-  return startHostPlanReview({
+  return startHostSession({
     ...extra,
     client,
     hostId: "host_mac",
     sessionId: SESSION_ID,
-    planMarkdown: "# Plan",
+    session: { mode: "plan", planMarkdown: "# Plan" },
     cwd: "/Users/me/repo",
     origin: "codex",
     signal: new AbortController().signal,
@@ -50,9 +50,33 @@ describe("host plan review handle", () => {
       method: "startReview",
       hostId: "host_mac",
       timeoutMs: 60_000,
-      input: { sessionId: SESSION_ID, cwd: "/Users/me/repo", origin: "codex", planMarkdown: "# Plan" },
+      input: {
+        sessionId: SESSION_ID,
+        cwd: "/Users/me/repo",
+        origin: "codex",
+        session: { mode: "plan", planMarkdown: "# Plan" },
+      },
     });
     await expect(review.result).resolves.toEqual({ approved: true });
+  });
+
+  it("resolves a review or annotation result record from the host", async () => {
+    const record = {
+      surface: "annotate" as const,
+      decision: "annotated" as const,
+      message: "# Markdown Annotations",
+      noop: false,
+      annotationCount: 2,
+      target: "/repo/a.md",
+    };
+    const { client } = fakeClient([{ status: "decided", decision: record }]);
+    const review = await start(client);
+
+    await expect(review.result).resolves.toEqual(record);
+    expect(hostReviewStateSchema.parse({ status: "decided", decision: record })).toEqual({
+      status: "decided",
+      decision: record,
+    });
   });
 
   it("polls immediately when a host signal arrives", async () => {
@@ -136,14 +160,14 @@ describe("host plan review handle", () => {
   it("reports a stop that could not reach the host", async () => {
     const { client } = fakeClient([{ status: "pending" }]);
     let stopFailed = 0;
-    const review = await startHostPlanReview({
+    const review = await startHostSession({
       client: {
         call: (method, input, options) =>
           method === "stopReview" ? Promise.reject(new Error("host offline")) : client.call(method, input, options),
       },
       hostId: "host_mac",
       sessionId: SESSION_ID,
-      planMarkdown: "# Plan",
+      session: { mode: "plan", planMarkdown: "# Plan" },
       cwd: "/Users/me/repo",
       origin: "codex",
       signal: new AbortController().signal,
@@ -162,11 +186,11 @@ describe("host plan review handle", () => {
   it("asks for cleanup when a fresh worker no longer knows the review", async () => {
     const { client, calls } = fakeClient([{ status: "unknown" }], { stopped: false });
     let cleanups = 0;
-    const review = await startHostPlanReview({
+    const review = await startHostSession({
       client,
       hostId: "host_mac",
       sessionId: SESSION_ID,
-      planMarkdown: "# Plan",
+      session: { mode: "plan", planMarkdown: "# Plan" },
       cwd: "/Users/me/repo",
       origin: "codex",
       signal: new AbortController().signal,

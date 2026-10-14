@@ -193,12 +193,16 @@ describe("BB upstream Plannotator bridge", () => {
       "status",
       "getActiveReview",
       "cancelReview",
+      "startSession",
     ]);
     expect(
       host.harness.inspection.registrations.httpRoutes.map((route) => route.method),
     ).toEqual(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual([
       "plannotator_review_plan",
+      "plannotator_review_changes",
+      "plannotator_annotate_file",
+      "plannotator_annotate_reply",
       "plannotator_review_status",
     ]);
     expect(host.harness.inspection.registrations.agentTools[0]?.instructions).toContain(
@@ -505,8 +509,11 @@ describe("BB upstream Plannotator bridge", () => {
     await sentReview(host);
     first.controller.abort();
     await first.done;
+    // A 0.4 record (no kind or initiator) reads as an agent's plan review.
     expect(await host.bb.storage.kv.get<{ status: string }>(key)).toMatchObject({
       status: "ready",
+      kind: "plan",
+      initiator: "agent",
       result: { decision: "cancelled", error: expect.stringContaining("restarted") },
     });
 
@@ -599,7 +606,7 @@ describe("BB upstream Plannotator bridge", () => {
         sessionId: result.reviewId,
         cwd: "/Users/me/repo",
         origin: "claude-code",
-        planMarkdown: "# Plan\n\n- On the Mac",
+        session: { mode: "plan", planMarkdown: "# Plan\n\n- On the Mac" },
       },
     });
     const panel = JSON.parse(String((await reviewPanelTab(host)).paramsJson)) as Record<string, unknown>;
@@ -634,6 +641,175 @@ describe("BB upstream Plannotator bridge", () => {
     );
   });
 
+  async function hostPlugin(remote = fakeRemoteHost()) {
+    const host = createFakePluginHost({ pluginId: "plannotator", experimental_callHostRpc: remote.call });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    return { host, remote };
+  }
+  const threadContext = { threadId: "thread-1", projectId: "project-1" };
+  const messageText = (sent: unknown[]) => String((sent[0] as { input: Array<{ text: string }> }).input[0]!.text);
+
+  it("starts each new session kind on the thread's host and refuses a second session", async () => {
+    const { host } = await hostPlugin();
+
+    const review = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_changes",
+      { diffType: "uncommitted", base: "origin/main" },
+      threadContext,
+    ))) as { status: string; kind: string; reviewId: string };
+    expect(review).toMatchObject({ status: "pending", kind: "code-review" });
+    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+      method: "startReview",
+      input: { cwd: "/Users/me/repo", session: { mode: "review", diffType: "uncommitted", base: "origin/main" } },
+    });
+    expect(JSON.parse(String((await reviewPanelTab(host)).paramsJson))).toMatchObject({
+      title: "Code review",
+      sessionKind: "code-review",
+    });
+
+    for (const [tool, params] of [
+      ["plannotator_review_plan", { planMarkdown: "# Plan" }],
+      ["plannotator_annotate_file", { path: "docs/a.md" }],
+      ["plannotator_annotate_reply", { markdown: "Text" }],
+    ] as const) {
+      const refusal = (await host.harness.behavior.callAgentTool(tool, params, threadContext)) as {
+        isError: boolean;
+        content: Array<{ text: string }>;
+      };
+      expect(JSON.parse(refusal.content[0]!.text)).toMatchObject({ status: "already_active", reviewId: review.reviewId });
+    }
+  });
+
+  it("resolves an annotated file against the worktree and the last reply from the thread", async () => {
+    for (const [tool, params, session] of [
+      ["plannotator_annotate_file", { path: "docs/a.md" }, { mode: "annotate", path: "/Users/me/repo/docs/a.md" }],
+      ["plannotator_annotate_reply", {}, { mode: "annotate-last", markdown: "Last reply" }],
+    ] as const) {
+      const { host } = await hostPlugin();
+      host.harness.sdk.stub("threads.output", () => ({ output: "Last reply" }));
+      const result = JSON.parse(String(await host.harness.behavior.callAgentTool(tool, params, threadContext))) as {
+        status: string;
+      };
+      expect(result.status).toBe("pending");
+      expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({ input: { session } });
+    }
+  });
+
+  it("explains that there is no reply to annotate", async () => {
+    const { host } = await hostPlugin();
+    host.harness.sdk.stub("threads.output", () => ({ output: null }));
+
+    const result = await host.harness.behavior.callAgentTool("plannotator_annotate_reply", {}, threadContext);
+
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain("no assistant reply to annotate");
+    expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
+  });
+
+  it("checks an annotated file on the server machine before starting", async () => {
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), "bb-plannotator-worktree-")));
+    temporaryDirectories.push(worktree);
+    const host = createFakePluginHost({ pluginId: "plannotator", settings: { binaryPath: await fakePlannotatorBinary() } });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_server", path: worktree });
+
+    const result = await host.harness.behavior.callAgentTool(
+      "plannotator_annotate_file",
+      { path: "../outside.md" },
+      threadContext,
+    );
+
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toMatch(/does not exist|outside/u);
+  });
+
+  it("delivers a code-review result with upstream's message and the right tool name", async () => {
+    const { host, remote } = await hostPlugin();
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_changes",
+      {},
+      threadContext,
+    ))) as { reviewId: string };
+
+    remote.state = {
+      status: "decided",
+      decision: {
+        surface: "review",
+        decision: "annotated",
+        message: "src/a.ts:3 - rename this.\n\nTreat the findings above as unverified.",
+        noop: false,
+        annotationCount: 1,
+        target: "/Users/me/repo",
+      },
+    };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+
+    const text = messageText(await sentReview(host));
+    expect(text).toContain(`Plannotator code review ${reviewId} has finished.`);
+    expect(text).toContain('"kind":"code-review","decision":"annotated"');
+    expect(text).toContain("src/a.ts:3 - rename this.");
+    expect(text).toContain("This answers the earlier plannotator_review_changes call.");
+    expect(text).not.toContain('"noop"');
+    expect(await host.harness.behavior.callAgentTool("plannotator_review_status", { reviewId }, threadContext)).toContain(
+      '"kind":"code-review"',
+    );
+  });
+
+  it("sends a user-started session's result only when it carries feedback", async () => {
+    for (const [decision, delivered] of [
+      [{ surface: "annotate-last", decision: "dismissed", message: "", noop: true }, false],
+      [{ surface: "annotate-last", decision: "annotated", message: "# Message Annotations\n\nShorter.", noop: false }, true],
+    ] as const) {
+      const { host, remote } = await hostPlugin();
+      host.harness.sdk.stub("threads.output", () => ({ output: "Last reply" }));
+      const started = (await host.harness.callRpc("startSession", {
+        threadId: "thread-1",
+        request: { mode: "annotate-last" },
+      })) as { status: string; reviewId: string };
+      expect(started.status).toBe("pending");
+
+      remote.state = { status: "decided", decision };
+      await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: started.reviewId });
+      await vi.waitFor(async () =>
+        expect(await host.bb.storage.kv.get(`review:${started.reviewId}`)).toMatchObject({
+          initiator: "user",
+          status: delivered ? "delivered" : "closed",
+        }),
+      );
+      expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(delivered ? 1 : 0);
+      if (delivered) {
+        const text = messageText(host.harness.sdk.callsTo("threads.send")[0]!);
+        expect(text).toContain("# Message Annotations");
+        expect(text).toContain("The user opened this Plannotator annotation from the bb panel.");
+      }
+    }
+  });
+
+  it("closes a user-started session left pending by a restart without messaging the thread", async () => {
+    const { host } = await hostPlugin();
+    const reviewId = "bb883ad4-4ff7-4183-96eb-6250ae380c3a";
+    await host.bb.storage.kv.set(`review:${reviewId}`, {
+      id: reviewId,
+      threadId: "thread-1",
+      kind: "code-review",
+      initiator: "user",
+      hostId: "host_mac",
+      status: "pending",
+      updatedAt: Date.now(),
+    });
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await vi.waitFor(async () =>
+      expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({ status: "closed" }),
+    );
+    service.controller.abort();
+    await service.done;
+    expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
   it("ends a host review without a message when its thread is archived", async () => {
     const remote = fakeRemoteHost();
     const host = createFakePluginHost({
@@ -658,7 +834,7 @@ describe("BB upstream Plannotator bridge", () => {
     );
     expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
     expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({
-      status: "delivered",
+      status: "closed",
       result: { decision: "cancelled", error: "The review ended when its thread was archived." },
     });
     await new Promise<void>((resolve) => setTimeout(resolve, 20));

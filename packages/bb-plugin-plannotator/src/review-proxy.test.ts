@@ -134,6 +134,10 @@ describe("review proxy", () => {
       "/api/hooks/status",
       "/api/open-in",
       "/api/agent-terminal/ws",
+      "/api/pr-action",
+      "/api/call-flow/install",
+      "/api/editor-annotations",
+      "/api/editor-annotation?id=1",
       "/api/archive/plans?customPath=/etc",
       "/api/x/../host/close",
       "/api/%2e%2e/api/host/status",
@@ -144,6 +148,20 @@ describe("review proxy", () => {
     }
     expect(seen).toHaveLength(0);
     expect((await send("GET", "/api/archive/plans")).status).toBe(200);
+    // Review and annotate endpoints the browser UI needs still pass.
+    for (const path of [
+      "/api/diff",
+      "/api/file-content?path=a.ts",
+      "/api/agents/jobs",
+      "/api/call-flow/install-status",
+      "/api/external-annotations",
+      "/api/html-assets/abc/x.png",
+    ]) {
+      expect((await send("GET", path)).status, path).toBe(200);
+    }
+    for (const path of ["/api/feedback", "/api/exit", "/api/git-add", "/api/agents/jobs", "/api/source/save"]) {
+      expect((await send("POST", path, { headers: { origin }, body: "{}" })).status, path).toBe(200);
+    }
   });
 
   it("allows images and file-browser directories only under the worktree or upload dir", async () => {
@@ -159,13 +177,37 @@ describe("review proxy", () => {
     expect(await ok(`/api/image?path=${q("/etc/hosts.png")}`)).toBe(403);
     expect(await ok(`/api/image?path=${q("../../x.png")}`)).toBe(403);
     expect(await ok(`/api/image?path=${q("etc-link/hosts")}`)).toBe(403);
-    expect(await ok(`/api/image?path=${q("x.png")}&base=${q("/etc")}`)).toBe(403);
+    const outside = await mkdtemp(join(tmpdir(), "bb-plannotator-proxy-outside-"));
+    cleanups.push(() => rm(outside, { recursive: true, force: true }));
+    await writeFile(join(outside, "x.png"), "");
+    expect(await ok(`/api/image?path=x.png&base=${q(outside)}`)).toBe(403);
     expect(await ok(`/api/reference/files?dirPath=${q(worktree)}`)).toBe(200);
     expect(await ok(`/api/reference/files?dirPath=${q("docs")}`)).toBe(200);
     expect(await ok(`/api/reference/files?dirPath=${q("~")}`)).toBe(403);
     expect(await ok(`/api/reference/files?dirPath=${q(`"/etc"`)}`)).toBe(403);
     expect(await ok(`/api/reference/files/stream?dirPath=${q(worktree)}&dirPath=${q("/")}`)).toBe(403);
     expect(seen).toHaveLength(4);
+    // Relative image paths reach upstream as absolute worktree paths.
+    expect(seen.find(({ url }) => url.startsWith("/api/image?") && url.includes("a.png"))?.url).toBe(
+      `/api/image?path=${q(join(worktree, "docs", "a.png"))}`,
+    );
+  });
+
+  it("forwards a document-relative image as the one file upstream would serve", async () => {
+    const { send, seen, worktree } = await setup();
+    await mkdir(join(worktree, "docs"));
+    await mkdir(join(worktree, "img"));
+    await writeFile(join(worktree, "img", "b.png"), "");
+    const q = encodeURIComponent;
+
+    const response = await send(
+      "GET",
+      `/api/image?path=${q("../img/b.png")}&base=${q(join(worktree, "docs"))}`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(new URL(seen[0]!.url, "http://x").searchParams.get("path")).toBe(join(worktree, "img", "b.png"));
+    expect(new URL(seen[0]!.url, "http://x").searchParams.has("base")).toBe(false);
   });
 
   it("strips file-writing and app-opening fields from decision bodies", async () => {

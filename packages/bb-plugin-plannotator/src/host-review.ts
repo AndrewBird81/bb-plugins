@@ -2,8 +2,8 @@
 // same shape as an in-process review so the server's lifecycle code is shared.
 // Host signals are lossy, so the decision is also polled.
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
-import type { RunningUpstreamReview, UpstreamDecision, UpstreamOrigin } from "./bridge";
-import type { HostReviewState, hostContract, hostSignals } from "./host-contract";
+import type { RunningUpstreamReview, SessionDecision, UpstreamOrigin } from "./bridge";
+import type { HostReviewState, SessionRequest, hostContract, hostSignals } from "./host-contract";
 
 export type PlannotatorHostClient = Pick<
   ExperimentalHostClient<typeof hostContract, typeof hostSignals>,
@@ -21,7 +21,7 @@ const HOST_CALL_TIMEOUT_MS = 15_000;
  */
 export const HOST_DISCONNECT_GRACE_MS = 2 * 60_000;
 
-export type HostPlanReview = RunningUpstreamReview & {
+export type HostSession = RunningUpstreamReview & {
   hostId: string;
   sessionId: string;
   /** Poll now, for example after a host signal. */
@@ -34,11 +34,11 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export async function startHostPlanReview(options: {
+export async function startHostSession(options: {
   client: PlannotatorHostClient;
   hostId: string;
   sessionId: string;
-  planMarkdown: string;
+  session: SessionRequest;
   cwd: string;
   origin: UpstreamOrigin;
   signal: AbortSignal;
@@ -50,7 +50,7 @@ export async function startHostPlanReview(options: {
    * worker no longer knows the review. Its process or serve mapping may remain.
    */
   onCleanupNeeded?: () => void;
-}): Promise<HostPlanReview> {
+}): Promise<HostSession> {
   const { client, hostId, sessionId } = options;
   const pollIntervalMs = options.pollIntervalMs ?? HOST_POLL_INTERVAL_MS;
   const disconnectGraceMs = options.disconnectGraceMs ?? HOST_DISCONNECT_GRACE_MS;
@@ -59,17 +59,17 @@ export async function startHostPlanReview(options: {
     "startReview",
     {
       sessionId,
-      planMarkdown: options.planMarkdown,
       cwd: options.cwd,
       origin: options.origin,
+      session: options.session,
     },
     { hostId, signal: options.signal, timeoutMs: HOST_START_TIMEOUT_MS },
   );
 
   let settled = false;
-  let resolveResult!: (decision: UpstreamDecision) => void;
+  let resolveResult!: (decision: SessionDecision) => void;
   let rejectResult!: (error: Error) => void;
-  const result = new Promise<UpstreamDecision>((resolve, reject) => {
+  const result = new Promise<SessionDecision>((resolve, reject) => {
     resolveResult = resolve;
     rejectResult = reject;
   });

@@ -1,9 +1,9 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
-import type { BridgeOptions, RunningUpstreamReview, UpstreamDecision } from "./bridge";
+import type { RunningUpstreamReview, SessionDecision, SessionOptions, UpstreamDecision } from "./bridge";
 import type { ReviewProxyOptions } from "./review-proxy";
 import {
   UNPOLLED_REVIEW_TIMEOUT_MS,
@@ -37,7 +37,7 @@ function fakeHost(options: {
   );
   const commands: Array<{ file: string; args: string[] }> = [];
   const kills: Array<{ pid: number; signal: string }> = [];
-  const started: BridgeOptions[] = [];
+  const started: SessionOptions[] = [];
   const reviews: Array<{
     stopped: boolean;
     decide(decision: UpstreamDecision): void;
@@ -83,7 +83,7 @@ function fakeHost(options: {
       }
       throw new Error(`unexpected command ${file} ${command}`);
     },
-    async startPlanReview(bridgeOptions) {
+    async startSession(bridgeOptions) {
       started.push(bridgeOptions);
       let resolve!: (decision: UpstreamDecision) => void;
       let reject!: (error: Error) => void;
@@ -180,7 +180,7 @@ async function harnessFor(fake: ReturnType<typeof fakeHost>, worktree?: string) 
   const start = (sessionId = SESSION_ID, signal?: AbortSignal) =>
     harness.experimental_call(
       "startReview",
-      { sessionId, planMarkdown: "# Plan", cwd, origin: "claude-code" },
+      { sessionId, cwd, origin: "claude-code", session: { mode: "plan", planMarkdown: "# Plan" } },
       signal ? { signal } : undefined,
     );
   const owned = async () =>
@@ -393,6 +393,62 @@ describe("Plannotator host entry", () => {
     expect(fake.proxies.get(19500)!.closed).toBe(true);
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(0);
     await vi.waitFor(async () => expect(await owned()).toEqual({ processes: [], mappings: [] }));
+    await harness.experimental_dispose();
+  });
+
+  it("passes each session mode through the same publish path, with the annotated file's real path", async () => {
+    const fake = fakeHost();
+    const { harness, cwd } = await harnessFor(fake);
+    await mkdir(join(cwd, "docs"));
+    await writeFile(join(cwd, "docs", "a.md"), "# A");
+    const realCwd = await realpath(cwd);
+
+    await expect(
+      harness.experimental_call("startReview", {
+        sessionId: SESSION_ID,
+        cwd,
+        origin: "codex",
+        session: { mode: "annotate", path: join(cwd, "docs", "a.md") },
+      }),
+    ).resolves.toMatchObject({ port: 19500 });
+    await expect(
+      harness.experimental_call("startReview", {
+        sessionId: SECOND_SESSION_ID,
+        cwd,
+        origin: "codex",
+        session: { mode: "review", diffType: "staged" },
+      }),
+    ).resolves.toMatchObject({ port: 19501 });
+
+    expect(fake.started.map(({ session, sessionId }) => ({ session, sessionId }))).toEqual([
+      { session: { mode: "annotate", path: join(realCwd, "docs", "a.md") }, sessionId: SESSION_ID },
+      { session: { mode: "review", diffType: "staged" }, sessionId: SECOND_SESSION_ID },
+    ]);
+    expect([...fake.serve.keys()].sort()).toEqual([19500, 19501]);
+    await harness.experimental_dispose();
+    expect(fake.serve.size).toBe(0);
+  });
+
+  it("refuses to annotate a file outside the worktree before starting Plannotator", async () => {
+    const fake = fakeHost();
+    const { harness, cwd } = await harnessFor(fake);
+    const outside = await mkdtemp(join(tmpdir(), "bb-plannotator-outside-"));
+    directories.push(outside);
+    await writeFile(join(outside, "secret.md"), "x");
+    await symlink(join(outside, "secret.md"), join(cwd, "link.md"));
+    const annotate = (path: string) =>
+      harness.experimental_call("startReview", {
+        sessionId: SESSION_ID,
+        cwd,
+        origin: "codex",
+        session: { mode: "annotate", path },
+      });
+
+    await expect(annotate(join(outside, "secret.md"))).rejects.toThrow("outside the thread's worktree");
+    await expect(annotate(join(cwd, "link.md"))).rejects.toThrow("outside the thread's worktree");
+    await expect(annotate(join(cwd, "..", "x.md"))).rejects.toThrow();
+    expect(fake.started).toHaveLength(0);
+    expect(fake.serve.size).toBe(0);
     await harness.experimental_dispose();
   });
 

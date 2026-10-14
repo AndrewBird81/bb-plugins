@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ import {
   REMOTE_PORT_RANGE,
   resolvePlannotatorBinary,
   startUpstreamPlanReview,
+  startUpstreamSession,
 } from "./bridge";
 
 const temporaryDirectories: string[] = [];
@@ -200,6 +201,148 @@ process.stdin.resume();
       terminal: null,
     });
     await running.stop();
+  });
+
+  /**
+   * A stand-in for review/annotate: serves /api/plan with the given agent
+   * terminal state, records its argv, cwd and stdin, and writes a result
+   * record (or exits as told) after `PLANNOTATOR_FAKE_DELAY_MS`.
+   */
+  async function fakeSessionBinary(directory: string): Promise<string> {
+    const binary = join(directory, "plannotator");
+    await writeFile(
+      binary,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const http = require("node:http");
+const path = require("node:path");
+const terminal = process.env.FAKE_TERMINAL === "missing" ? undefined : { enabled: process.env.FAKE_TERMINAL === "on" };
+let stdin = "";
+process.stdin.on("data", (chunk) => { stdin += chunk; });
+const server = http.createServer((req, res) => {
+  res.setHeader("content-type", "application/json");
+  res.end(JSON.stringify({ plan: "", ...(terminal ? { agentTerminal: terminal } : {}) }));
+});
+server.listen(0, "127.0.0.1", () => {
+  const port = server.address().port;
+  fs.appendFileSync(process.env.PLANNOTATOR_READY_FILE, JSON.stringify({ url: "http://localhost:" + port, isRemote: false, port }) + "\\n");
+  setTimeout(() => {
+    if (process.env.FAKE_EXIT) {
+      process.stderr.write("line 1\\nBase ref not found: nosuch\\n");
+      process.exit(Number(process.env.FAKE_EXIT));
+    }
+    const file = process.env.PLANNOTATOR_HOST_RESULT_FILE;
+    if (file && process.env.FAKE_WRITE_RESULT !== "0") {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({
+        v: 1, surface: "review", decision: "annotated", noop: false, annotationCount: 1, target: process.cwd(),
+        message: JSON.stringify({ argv: process.argv.slice(2), stdin, cwd: process.cwd(), share: process.env.PLANNOTATOR_SHARE ?? null, pcwd: process.env.PLANNOTATOR_CWD ?? null }),
+      }));
+    }
+    process.exit(0);
+  }, Number(process.env.PLANNOTATOR_FAKE_DELAY_MS || "30"));
+});
+`,
+      "utf8",
+    );
+    await chmod(binary, 0o755);
+    return binary;
+  }
+
+  it("runs a review session and reads its result file, then removes it", async () => {
+    vi.stubEnv("PLANNOTATOR_CWD", "/elsewhere");
+    const directory = await realpath(await mkdtemp(join(tmpdir(), "bb-plannotator-session-test-")));
+    temporaryDirectories.push(directory);
+    const binary = await fakeSessionBinary(directory);
+    const sessionId = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
+
+    const running = await startUpstreamSession({
+      binaryPath: binary,
+      session: { mode: "review", diffType: "uncommitted" },
+      sessionId,
+      timeoutSeconds: null,
+      signal: new AbortController().signal,
+      dataDir: join(directory, "data"),
+      remote: true,
+      cwd: directory,
+    });
+    const result = await running.result;
+    expect(result).toMatchObject({ surface: "review", decision: "annotated", noop: false, target: directory });
+    expect(JSON.parse((result as { message: string }).message)).toEqual({
+      argv: ["review", "--no-git-remote-check", "--diff-type", "uncommitted"],
+      stdin: "",
+      cwd: directory,
+      share: "disabled",
+      pcwd: null,
+    });
+    await expect(stat(join(directory, "data", "claude-code-mod", sessionId))).rejects.toThrow();
+    await running.stop();
+  });
+
+  it("passes annotate-last text on stdin", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-session-test-"));
+    temporaryDirectories.push(directory);
+    vi.stubEnv("FAKE_TERMINAL", "off");
+    const running = await startUpstreamSession({
+      binaryPath: await fakeSessionBinary(directory),
+      session: { mode: "annotate-last", markdown: "The reply" },
+      timeoutSeconds: null,
+      signal: new AbortController().signal,
+      dataDir: join(directory, "data"),
+      cwd: directory,
+    });
+    const message = JSON.parse(((await running.result) as { message: string }).message) as { stdin: string; argv: string[] };
+    expect(message).toMatchObject({ stdin: "The reply", argv: ["annotate-last", "--stdin", "--gate"] });
+    await running.stop();
+  });
+
+  it("refuses to publish an annotate session whose agent terminal is on or unreported", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-session-test-"));
+    temporaryDirectories.push(directory);
+    const binary = await fakeSessionBinary(directory);
+    vi.stubEnv("PLANNOTATOR_FAKE_DELAY_MS", "60000");
+    for (const [terminal, error] of [["on", "enabled its agent terminal"], ["missing", "Could not confirm"]] as const) {
+      vi.stubEnv("FAKE_TERMINAL", terminal);
+      await expect(
+        startUpstreamSession({
+          binaryPath: binary,
+          session: { mode: "annotate", path: join(directory, "a.md") },
+          timeoutSeconds: null,
+          signal: new AbortController().signal,
+          dataDir: join(directory, "data"),
+          cwd: directory,
+        }),
+      ).rejects.toThrow(error);
+    }
+  });
+
+  it("reports a missing result as too old, a startup failure with its stderr, and a stop as an error", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-session-test-"));
+    temporaryDirectories.push(directory);
+    const binary = await fakeSessionBinary(directory);
+    const start = () =>
+      startUpstreamSession({
+        binaryPath: binary,
+        session: { mode: "review" },
+        timeoutSeconds: null,
+        signal: new AbortController().signal,
+        dataDir: join(directory, "data"),
+        cwd: directory,
+      });
+
+    vi.stubEnv("FAKE_WRITE_RESULT", "0");
+    await expect((await start()).result).rejects.toThrow("too old");
+    vi.stubEnv("FAKE_WRITE_RESULT", "1");
+
+    vi.stubEnv("FAKE_EXIT", "1");
+    await expect((await start()).result).rejects.toThrow("Plannotator exited with code 1: line 1 Base ref not found: nosuch");
+    vi.stubEnv("FAKE_EXIT", "");
+
+    vi.stubEnv("PLANNOTATOR_FAKE_DELAY_MS", "60000");
+    const running = await start();
+    const outcome = running.result.catch((error: Error) => error.message);
+    await running.stop();
+    expect(await outcome).toMatch(/Plannotator exited with code/u);
   });
 
   it("reads the latest upstream release for the update-toast dismissal", async () => {

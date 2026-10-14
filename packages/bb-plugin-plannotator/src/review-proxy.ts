@@ -8,13 +8,13 @@
 // allowlist so new upstream endpoints keep working instead of breaking the UI
 // silently.
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream";
 
-/** Endpoints a tailnet browser never needs during a plan review. */
+/** Endpoints a tailnet browser never needs during a review or annotation. */
 const DENIED_PATHS: ReadonlyArray<{ path: string; prefix: boolean }> = [
   { path: "/api/host/", prefix: true },
   { path: "/api/ai/bridge/", prefix: true },
@@ -25,6 +25,12 @@ const DENIED_PATHS: ReadonlyArray<{ path: string; prefix: boolean }> = [
   { path: "/api/hooks/status", prefix: false },
   { path: "/api/open-in", prefix: true },
   { path: "/api/agent-terminal", prefix: true },
+  // PR mode only; BB never opens a PR review.
+  { path: "/api/pr-action", prefix: false },
+  // Downloads and builds a native runtime on the host.
+  { path: "/api/call-flow/install", prefix: false },
+  // The VS Code extension's injection API; the browser UI uses it only inside VS Code.
+  { path: "/api/editor-annotation", prefix: true },
 ];
 
 /** Decision-body fields that write files or open apps on the host. */
@@ -87,7 +93,18 @@ async function createPathGuard(roots: readonly string[]) {
   };
 }
 
-/** Why a request is refused, or null when it may be forwarded. */
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Why a request is refused, or null when it may be forwarded. An `/api/image`
+ * request is rewritten in place to the one absolute path upstream would serve.
+ */
 export async function refusalFor(
   url: URL,
   options: Pick<ReviewProxyOptions, "cwd">,
@@ -105,12 +122,15 @@ export async function refusalFor(
   if (path === "/api/image") {
     const raw = url.searchParams.get("path");
     if (raw !== null) {
-      const targets = [resolve(options.cwd, raw)];
+      // Upstream serves `path` resolved against its cwd when that file
+      // exists, and otherwise `path` under `base` (a document's directory).
+      const direct = resolve(options.cwd, raw);
       const base = url.searchParams.get("base");
-      if (base !== null && !raw.startsWith("/")) targets.push(resolve(options.cwd, base, raw));
-      for (const target of targets) {
-        if (!(await isAllowedPath(target))) return "Images outside the worktree are not available.";
-      }
+      const viaBase = base !== null && !raw.startsWith("/") ? resolve(options.cwd, base, raw) : null;
+      const chosen = viaBase && !(await isFile(direct)) && (await isFile(viaBase)) ? viaBase : direct;
+      if (!(await isAllowedPath(chosen))) return "Images outside the worktree are not available.";
+      url.searchParams.set("path", chosen);
+      url.searchParams.delete("base");
     }
   }
   if (path === "/api/reference/files" || path === "/api/reference/files/stream") {

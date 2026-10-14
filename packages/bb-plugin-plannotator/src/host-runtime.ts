@@ -10,7 +10,8 @@ import {
   type ExperimentalHostRpcContext,
   type ExperimentalHostWorkerLease,
 } from "@get-bb/plugin-sdk";
-import type { BridgeOptions, RunningUpstreamReview } from "./bridge";
+import type { RunningUpstreamReview, SessionOptions } from "./bridge";
+import { resolveAnnotateTarget, sessionErrorOutput } from "./session";
 import type { ReviewProxyOptions, RunningReviewProxy } from "./review-proxy";
 import {
   HOST_PORT_RANGE,
@@ -38,7 +39,7 @@ export type CommandResult = {
 export type HostRuntimeDeps = {
   /** Run argv without a shell. Rejects only when the command cannot start. */
   runCommand(file: string, args: readonly string[], timeoutMs: number): Promise<CommandResult>;
-  startPlanReview(options: BridgeOptions): Promise<RunningUpstreamReview>;
+  startSession(options: SessionOptions): Promise<RunningUpstreamReview>;
   /** Listen on 127.0.0.1:port. Rejects with code EADDRINUSE when it is taken. */
   startProxy(port: number, options: ReviewProxyOptions): Promise<RunningReviewProxy>;
   /** Plannotator's image upload directory, which `/api/image` may read. */
@@ -407,7 +408,13 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
   }
 
   async function startClaimed(
-    input: { sessionId: string; planMarkdown: string; cwd: string; origin: BridgeOptions["origin"] },
+    input: {
+      sessionId: string;
+      cwd: string;
+      origin: SessionOptions["origin"];
+      session: SessionOptions["session"];
+      frameAncestor?: string;
+    },
     context: HostContext,
     claim: StartClaim,
   ): Promise<{ url: string; port: number }> {
@@ -422,6 +429,11 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     if (!isAbsolute(input.cwd) || !(await isDirectory(input.cwd))) {
       throw new Error(`The thread's worktree ${input.cwd} does not exist on this machine.`);
     }
+    // Plannotator gets the file's real path, checked here on its own machine.
+    const session =
+      input.session.mode === "annotate"
+        ? { ...input.session, path: await resolveAnnotateTarget(input.cwd, input.session.path) }
+        : input.session;
     const binaryPath = deps.findExecutable("plannotator");
     if (!binaryPath) {
       throw new Error("plannotator is not on this machine's PATH for the bb host daemon.");
@@ -436,9 +448,10 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     let published = false;
     try {
       // A random loopback port: only the proxy below is published.
-      review = await deps.startPlanReview({
+      review = await deps.startSession({
         binaryPath,
-        planMarkdown: input.planMarkdown,
+        session,
+        sessionId: input.sessionId,
         timeoutSeconds: null,
         signal: controller.signal,
         origin: input.origin,
@@ -465,6 +478,7 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
         upstreamPort: review.port,
         cwd: input.cwd,
         allowedRoots: [input.cwd, deps.uploadDir],
+        ...(input.frameAncestor ? { frameAncestor: input.frameAncestor } : {}),
       });
       const port = proxy.port;
       // Record before publishing, so a crash in between still gets cleaned up.
@@ -513,7 +527,10 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     startWatchdog();
     void review.result.then(
       (decision) => settle(entry, { status: "decided", decision }, context),
-      (error: unknown) => settle(entry, { status: "failed", error: errorMessage(error) }, context),
+      (error: unknown) => {
+        const output = sessionErrorOutput(error);
+        settle(entry, { status: "failed", error: errorMessage(error), ...(output ? { output } : {}) }, context);
+      },
     );
     return { url: `https://${dnsName}:${entry.port}`, port: entry.port };
   }

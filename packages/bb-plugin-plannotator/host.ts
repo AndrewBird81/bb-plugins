@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { startUpstreamPlanReview } from "./src/bridge";
+import { startUpstreamSession } from "./src/bridge";
 import { createPlannotatorHostEntry, type CommandResult } from "./src/host-runtime";
 import { startReviewProxy } from "./src/review-proxy";
 
@@ -35,7 +35,7 @@ export default createPlannotatorHostEntry({
       );
     });
   },
-  startPlanReview: startUpstreamPlanReview,
+  startSession: startUpstreamSession,
   startProxy: startReviewProxy,
   // Upstream's upload directory: the child inherits this process's TMPDIR.
   uploadDir: join(tmpdir(), "plannotator"),

@@ -20,6 +20,14 @@ import { homedir, tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import type { SessionRequest, SessionResult } from "./host-contract";
+import {
+  assertAgentTerminalOff,
+  buildSessionLaunch,
+  readSessionResult,
+} from "./session";
+
+export { buildUpstreamInput } from "./session";
 
 export const UPSTREAM_REPOSITORY = "https://github.com/backnotprop/plannotator";
 export const DEFAULT_BINARY = "plannotator";
@@ -113,9 +121,18 @@ export type UpstreamOrigin =
   | "gemini-cli"
   | "pi";
 
-export type BridgeOptions = {
+/** A plan decision (stdout hook protocol) or a review/annotate result record. */
+export type SessionDecision = UpstreamDecision | SessionResult;
+
+export function isSessionResult(decision: SessionDecision): decision is SessionResult {
+  return "surface" in decision;
+}
+
+export type SessionOptions = {
   binaryPath: string;
-  planMarkdown: string;
+  session: SessionRequest;
+  /** Names the result file of review and annotate sessions. */
+  sessionId?: string;
   timeoutSeconds: number | null;
   signal: AbortSignal;
   /** Do not let the child infer an agent from unrelated host environment. */
@@ -132,11 +149,15 @@ export type BridgeOptions = {
   readyTimeoutMs?: number;
 };
 
-export type RunningUpstreamReview = {
+export type BridgeOptions = Omit<SessionOptions, "session" | "sessionId"> & {
+  planMarkdown: string;
+};
+
+export type RunningUpstreamReview<Decision = SessionDecision> = {
   url: string;
   port: number;
   pid: number | undefined;
-  result: Promise<UpstreamDecision>;
+  result: Promise<Decision>;
   stop(): Promise<void>;
 };
 
@@ -463,16 +484,6 @@ export function parseUpstreamDecision(stdout: string, stderr = ""): UpstreamDeci
   );
 }
 
-export function buildUpstreamInput(planMarkdown: string): string {
-  // Feed the official generic plan-review hook. Unlike the OpenCode-specific
-  // bridge, this path uses PLANNOTATOR_ORIGIN when constructing /api/plan.
-  return JSON.stringify({
-    hook_event_name: "PermissionRequest",
-    permission_mode: "default",
-    tool_input: { plan: planMarkdown },
-  });
-}
-
 export function rehostUpstreamUrl(url: string, host: string | undefined): string {
   if (!host) return url;
   const parsed = new URL(url);
@@ -528,9 +539,30 @@ async function waitForReady(
 /** Start the upstream plan-review process and expose its real browser session. */
 export async function startUpstreamPlanReview(
   options: BridgeOptions,
+): Promise<RunningUpstreamReview<UpstreamDecision>> {
+  const { planMarkdown, ...rest } = options;
+  return (await startUpstreamSession({
+    ...rest,
+    session: { mode: "plan", planMarkdown },
+  })) as RunningUpstreamReview<UpstreamDecision>;
+}
+
+/** Start one upstream session in any mode and expose its real browser session. */
+export async function startUpstreamSession(
+  options: SessionOptions,
 ): Promise<RunningUpstreamReview> {
   if (options.signal.aborted) throw new Error("Plannotator review was cancelled");
 
+  const launch = buildSessionLaunch(options.session, {
+    dataDir: options.dataDir,
+    sessionId: options.sessionId ?? randomUUID(),
+    remote: options.remote === true,
+  });
+  const resultDir = launch.resultFile ? dirname(launch.resultFile) : null;
+  const cleanUp = async (tempDir: string) => {
+    await rm(tempDir, { recursive: true, force: true });
+    if (resultDir) await rm(resultDir, { recursive: true, force: true });
+  };
   const tempDir = await mkdtemp(join(tmpdir(), "bb-plannotator-"));
   const readyFile = join(tempDir, "ready.jsonl");
   let stdout = "";
@@ -550,20 +582,19 @@ export async function startUpstreamPlanReview(
     ...(portRange ? { PLANNOTATOR_PORT: portRange } : {}),
     ...(options.origin ? { PLANNOTATOR_ORIGIN: options.origin } : {}),
     ...(options.dataDir ? { PLANNOTATOR_DATA_DIR: options.dataDir } : {}),
+    ...launch.env,
   };
-  // The agent terminal is a shell in the browser. Never inherit a setting that
-  // exposes it beyond loopback.
-  delete env.PLANNOTATOR_AGENT_TERMINAL_REMOTE;
+  for (const name of launch.deleteEnv) delete env[name];
 
   let child: ChildProcess;
   try {
-    child = spawn(options.binaryPath, [], {
+    child = spawn(options.binaryPath, launch.args, {
       cwd: options.cwd ?? process.cwd(),
       env,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: [launch.stdin === null ? "ignore" : "pipe", "pipe", "pipe"],
     });
   } catch (error) {
-    await rm(tempDir, { recursive: true, force: true });
+    await cleanUp(tempDir);
     throw error;
   }
 
@@ -590,22 +621,28 @@ export async function startUpstreamPlanReview(
   options.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    child.stdin?.end(buildUpstreamInput(options.planMarkdown));
+    if (launch.stdin !== null) child.stdin?.end(launch.stdin);
     const ready = await waitForReady(
       readyFile,
       child,
       options.readyTimeoutMs ?? READY_TIMEOUT_MS,
       options.signal,
     );
+    await assertAgentTerminalOff(ready.port, options.session.mode);
 
-    const decision = exited.then(() => {
+    const decision: Promise<SessionDecision> = exited.then(async () => {
       if (spawnError) throw spawnError;
       if (child.exitCode !== 0) {
         throw new Error(
-          `Plannotator exited with code ${child.exitCode ?? "unknown"}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
+          `Plannotator exited with code ${child.exitCode ?? "unknown"}${stderr.trim() ? `: ${stderr.trim().split(/\r?\n/u).slice(-4).join(" ")}` : ""}`,
         );
       }
-      return parseUpstreamDecision(stdout, stderr);
+      if (!launch.resultFile) return parseUpstreamDecision(stdout, stderr);
+      try {
+        return await readSessionResult(launch.resultFile, stdout);
+      } finally {
+        if (resultDir) await rm(resultDir, { recursive: true, force: true });
+      }
     });
 
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -619,7 +656,7 @@ export async function startUpstreamPlanReview(
     const result =
       timeoutMs === null
         ? decision
-        : new Promise<UpstreamDecision>((resolveResult, rejectResult) => {
+        : new Promise<SessionDecision>((resolveResult, rejectResult) => {
             timeoutHandle = setTimeout(() => {
               timedOut = true;
               void terminateChild(child, exited).then(
@@ -651,13 +688,15 @@ export async function startUpstreamPlanReview(
       async stop() {
         options.signal.removeEventListener("abort", onAbort);
         await terminateChild(child, exited);
-        await rm(tempDir, { recursive: true, force: true });
+        // Let a decision that raced the stop finish reading its result first.
+        await decision.catch(() => undefined);
+        await cleanUp(tempDir);
       },
     };
   } catch (error) {
     options.signal.removeEventListener("abort", onAbort);
     await terminateChild(child, exited);
-    await rm(tempDir, { recursive: true, force: true });
+    await cleanUp(tempDir);
     throw error;
   }
 }

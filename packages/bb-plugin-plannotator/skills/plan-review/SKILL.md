@@ -38,3 +38,15 @@ and that they can reopen it from the Plannotator thread panel action.
 Do not claim a review decision from the presence of a panel or the pending
 tool result alone. Only the later decision message describes what happened in
 Plannotator; it does not authorize or prohibit file changes.
+
+## Code review and annotation
+
+The same rules apply to `plannotator_review_changes` (the worktree changes),
+`plannotator_annotate_file` (a Markdown or HTML file in the worktree) and
+`plannotator_annotate_reply` (the last reply, or `markdown` you pass, such as
+text from the current turn). Use them only when the user asks. Each returns a
+pending review ID; end the turn and wait for the result message. A result with
+annotations is the user's feedback to address; approval or dismissal with no
+annotations means no changes were requested. The user can also start these
+from the bb panel; those results arrive as messages only when they contain
+feedback.

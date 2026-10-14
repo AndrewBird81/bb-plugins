@@ -27,6 +27,29 @@ BB stores the review state until it delivers the decision. If the plugin restart
 
 Plannotator's plan history and configuration are stored under the plugin's BB data directory. Local child sessions use BB's session-scoped same-origin relay, and BB acknowledges the current upstream look-and-feel announcement before mounting the iframe, so the standalone setup wizard does not interrupt each review. The upstream plan UI remains otherwise unmodified. **Open externally** is available as a fallback, but external browser tabs may have a separate cookie jar from the BB panel.
 
+## Code review and annotation
+
+Besides plan review, the plugin opens three other Plannotator sessions. Each
+runs where the thread runs, in its worktree, and one session is open per
+thread at a time.
+
+| Session | Agent tool | From BB |
+|---|---|---|
+| Code review of the worktree changes (default: all changes since the default branch, including uncommitted and untracked files) | `plannotator_review_changes` (`diffType`, `base`) | Panel: **Review changes** with a diff-type menu; palette: *Plannotator: Review changes* |
+| Annotate a `.md`/`.markdown`/`.html`/`.htm` file inside the worktree | `plannotator_annotate_file` (`path`) | Panel: **Annotate file…** picker; palette: *Plannotator: Annotate file…* |
+| Annotate a reply | `plannotator_annotate_reply` (`markdown`, default the thread's last reply) | Panel: **Annotate last reply**; message action **Annotate in Plannotator** (uses selected text when there is a selection); palette: *Plannotator: Annotate last reply* |
+
+Plannotator writes each result to a file the plugin reads
+(`PLANNOTATOR_HOST_RESULT_FILE`), so these sessions need plannotator 0.28.6 or
+later. An agent's session always answers with a thread message. A session you
+start yourself sends a message only when you send feedback; approving with no
+notes, closing or cancelling sends nothing.
+
+The plugin refuses to publish an annotation session whose agent terminal (a
+shell in the browser) is on, or does not report its state. Code review runs
+with `--no-git-remote-check`, so it compares against local refs. Sessions on
+the BB server in remote mode run with sharing disabled.
+
 ## Remote BB and Tailscale access
 
 When BB is configured with a non-loopback `BB_APP_URL` (for example, its
@@ -35,7 +58,9 @@ Plannotator in its supported remote mode. The upstream listener binds beyond
 loopback and selects a port from `19432-19441`. The embedded panel uses a
 session-scoped same-origin relay for local child listeners over both HTTP and
 HTTPS, so a one-port Tailscale Serve endpoint is enough and the browser never
-has to reach the upstream port directly. Local-only BB sessions use the same
+has to reach the upstream port directly. The relay accepts writes only from
+the bb page's own origin, and never forwards a browser's `Authorization`
+header or cookies. Local-only BB sessions use the same
 relay while the review is open; **Open externally** can still use the direct
 upstream port when the network allows it.
 
@@ -76,9 +101,15 @@ The tailnet is the trust boundary, as for BB itself: anyone who can reach the
 host's tailnet name can use the review while it is open. The proxy answers
 only requests addressed to `<MagicDNS name>:<port>` (blocking DNS rebinding)
 and accepts writes only from that origin (blocking cross-site requests from
-other web pages). It also denies upstream endpoints a review never needs from
-another device (host control, editor and note-app integrations, file reads
-outside the worktree, custom save paths).
+other web pages), and lets only the bb page frame the review. It also denies
+upstream endpoints a review never needs from another device (host control,
+editor and note-app integrations, open-in-app, PR actions, the call-flow
+runtime installer, file reads outside the worktree, custom save paths).
+Plannotator's own random loopback port is not published, but, as with stock
+local Plannotator, a web page in a browser on that host could still reach it
+and use endpoints the proxy denies, such as open-in-app (which opens a repo
+file with its default handler) and agent jobs. Browsers that block public
+pages from reaching localhost, such as Brave by default, stop this.
 
 ## Boundary
 

@@ -225,7 +225,7 @@
     {
       "id": "plannotator",
       "displayName": "Plannotator",
-      "description": "Review plans in Plannotator inside BB and send decisions to agents as new thread messages.",
+      "description": "Review plans, code changes and documents in Plannotator inside BB, and send the feedback to agents as thread messages.",
       "icon": "ClipboardCheck",
       "tags": [
         "planning",

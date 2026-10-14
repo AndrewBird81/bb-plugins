@@ -8,13 +8,13 @@
 // allowlist so new upstream endpoints keep working instead of breaking the UI
 // silently.
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream";
 
-/** Endpoints a tailnet browser never needs during a plan review. */
+/** Endpoints a tailnet browser never needs during a review or annotation. */
 const DENIED_PATHS: ReadonlyArray<{ path: string; prefix: boolean }> = [
   { path: "/api/host/", prefix: true },
   { path: "/api/ai/bridge/", prefix: true },
@@ -25,12 +25,18 @@ const DENIED_PATHS: ReadonlyArray<{ path: string; prefix: boolean }> = [
   { path: "/api/hooks/status", prefix: false },
   { path: "/api/open-in", prefix: true },
   { path: "/api/agent-terminal", prefix: true },
+  // PR mode only; BB never opens a PR review.
+  { path: "/api/pr-action", prefix: false },
+  // Downloads and builds a native runtime on the host.
+  { path: "/api/call-flow/install", prefix: false },
+  // The VS Code extension's injection API; the browser UI uses it only inside VS Code.
+  { path: "/api/editor-annotation", prefix: true },
 ];
 
 /** Decision-body fields that write files or open apps on the host. */
 const STRIPPED_DECISION_FIELDS = ["obsidian", "bear", "octarine"] as const;
 const DECISION_PATHS = new Set(["/api/approve", "/api/deny"]);
-const MAX_DECISION_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_DECISION_BODY_BYTES = 1024 * 1024;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -51,7 +57,25 @@ export type ReviewProxyOptions = {
   cwd: string;
   /** Directories `/api/image` and the file browser may read. */
   allowedRoots: readonly string[];
+  /**
+   * The bb page's origin. Only it and the review itself may frame the
+   * review, which stops other sites from framing it to steal clicks.
+   */
+  frameAncestor?: string;
 };
+
+/** `frame-ancestors` for a review that bb iframes; null without a bb origin. */
+export function frameAncestorsPolicy(frameAncestor: string | undefined): string | null {
+  if (!frameAncestor) return null;
+  try {
+    const { origin, protocol } = new URL(frameAncestor);
+    if (protocol !== "https:" && protocol !== "http:") return null;
+    // 'self' keeps nested frames working, such as an annotated HTML document.
+    return `frame-ancestors 'self' ${origin}`;
+  } catch {
+    return null;
+  }
+}
 
 export type RunningReviewProxy = {
   port: number;
@@ -69,8 +93,9 @@ function resolveUserPath(input: string, cwd: string): string {
   if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]) {
     value = value.slice(1, -1);
   }
+  // Upstream expands `~\` on every platform, not only on Windows.
   if (value === "~") value = homedir();
-  else if (value.startsWith("~/")) value = join(homedir(), value.slice(2));
+  else if (value.startsWith("~/") || value.startsWith("~\\")) value = join(homedir(), value.slice(2));
   return resolve(cwd, value);
 }
 
@@ -87,7 +112,18 @@ async function createPathGuard(roots: readonly string[]) {
   };
 }
 
-/** Why a request is refused, or null when it may be forwarded. */
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Why a request is refused, or null when it may be forwarded. An `/api/image`
+ * request is rewritten in place to the one absolute path upstream would serve.
+ */
 export async function refusalFor(
   url: URL,
   options: Pick<ReviewProxyOptions, "cwd">,
@@ -105,18 +141,27 @@ export async function refusalFor(
   if (path === "/api/image") {
     const raw = url.searchParams.get("path");
     if (raw !== null) {
-      const targets = [resolve(options.cwd, raw)];
+      // Upstream serves `path` resolved against its cwd when that file
+      // exists, and otherwise `path` under `base` (a document's directory).
+      const direct = resolve(options.cwd, raw);
       const base = url.searchParams.get("base");
-      if (base !== null && !raw.startsWith("/")) targets.push(resolve(options.cwd, base, raw));
-      for (const target of targets) {
-        if (!(await isAllowedPath(target))) return "Images outside the worktree are not available.";
-      }
+      const viaBase = base !== null && !raw.startsWith("/") ? resolve(options.cwd, base, raw) : null;
+      const chosen = viaBase && !(await isFile(direct)) && (await isFile(viaBase)) ? viaBase : direct;
+      if (!(await isAllowedPath(chosen))) return "Images outside the worktree are not available.";
+      url.searchParams.set("path", chosen);
+      url.searchParams.delete("base");
     }
   }
   if (path === "/api/reference/files" || path === "/api/reference/files/stream") {
     for (const raw of url.searchParams.getAll("dirPath")) {
       if (!(await isAllowedPath(resolveUserPath(raw, options.cwd)))) {
         return "Directories outside the worktree are not available.";
+      }
+    }
+    // The stream also watches single files (and so their directory).
+    for (const raw of url.searchParams.getAll("filePath")) {
+      if (!(await isAllowedPath(resolveUserPath(raw, options.cwd)))) {
+        return "Files outside the worktree are not available.";
       }
     }
   }
@@ -145,15 +190,20 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer | null> {
   return new Promise((resolveBody, rejectBody) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    req.on("data", (chunk: Buffer) => {
+    const collect = (chunk: Buffer) => {
       size += chunk.length;
-      if (size > limit) {
-        resolveBody(null);
-        req.destroy();
+      if (size <= limit) {
+        chunks.push(chunk);
         return;
       }
-      chunks.push(chunk);
-    });
+      // Discard the rest without buffering it, and let the caller answer 413.
+      // Destroying the socket instead would reach the browser as a 502.
+      chunks.length = 0;
+      req.off("data", collect);
+      req.resume();
+      resolveBody(null);
+    };
+    req.on("data", collect);
     req.on("end", () => resolveBody(Buffer.concat(chunks)));
     req.on("error", rejectBody);
   });
@@ -186,6 +236,7 @@ export async function startReviewProxy(
   options: ReviewProxyOptions,
 ): Promise<RunningReviewProxy> {
   const isAllowedPath = await createPathGuard(options.allowedRoots);
+  const framePolicy = frameAncestorsPolicy(options.frameAncestor);
   let publicHost = "";
   let publicOrigin = "";
 
@@ -226,6 +277,7 @@ export async function startReviewProxy(
     if (DECISION_PATHS.has(url.pathname) && method !== "GET" && method !== "HEAD") {
       const raw = await readBody(req, MAX_DECISION_BODY_BYTES);
       if (raw === null) {
+        res.setHeader("connection", "close");
         reply(res, 413, "Request body too large.");
         return;
       }
@@ -253,7 +305,15 @@ export async function startReviewProxy(
       headers,
     });
     upstream.on("response", (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode ?? 502, forwardedResponseHeaders(upstreamRes));
+      const headers = forwardedResponseHeaders(upstreamRes);
+      if (framePolicy) {
+        const existing = headers["content-security-policy"];
+        headers["content-security-policy"] = [
+          ...(existing === undefined ? [] : Array.isArray(existing) ? existing : [existing]),
+          framePolicy,
+        ];
+      }
+      res.writeHead(upstreamRes.statusCode ?? 502, headers);
       // Event streams must reach the browser as they arrive.
       res.flushHeaders();
       pipeline(upstreamRes, res, () => undefined);
@@ -278,6 +338,9 @@ export async function startReviewProxy(
   });
   // The plan review has no agent terminal or other WebSocket endpoint.
   server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
+    // Node drops its own socket error handler before `upgrade`; a reset peer
+    // must not crash the worker.
+    socket.on("error", () => undefined);
     socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
   });
 

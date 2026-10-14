@@ -14,8 +14,12 @@ export type PlannotatorHostClient = Pick<
 export const HOST_START_TIMEOUT_MS = 60_000;
 export const HOST_POLL_INTERVAL_MS = 5_000;
 const HOST_CALL_TIMEOUT_MS = 15_000;
-/** Consecutive failed polls before the host counts as disconnected. */
-export const HOST_POLL_FAILURE_LIMIT = 3;
+/**
+ * How long polls may keep failing before the review is cancelled. A daemon
+ * that misses heartbeats reconnects within seconds; the host worker keeps the
+ * review running meanwhile.
+ */
+export const HOST_DISCONNECT_GRACE_MS = 2 * 60_000;
 
 export type HostPlanReview = RunningUpstreamReview & {
   hostId: string;
@@ -39,6 +43,8 @@ export async function startHostPlanReview(options: {
   origin: UpstreamOrigin;
   signal: AbortSignal;
   pollIntervalMs?: number;
+  disconnectGraceMs?: number;
+  now?: () => number;
   /**
    * The host's worker did not stop the review: it is offline, or a fresh
    * worker no longer knows the review. Its process or serve mapping may remain.
@@ -47,6 +53,8 @@ export async function startHostPlanReview(options: {
 }): Promise<HostPlanReview> {
   const { client, hostId, sessionId } = options;
   const pollIntervalMs = options.pollIntervalMs ?? HOST_POLL_INTERVAL_MS;
+  const disconnectGraceMs = options.disconnectGraceMs ?? HOST_DISCONNECT_GRACE_MS;
+  const now = options.now ?? Date.now;
   const started = await client.call(
     "startReview",
     {
@@ -68,7 +76,7 @@ export async function startHostPlanReview(options: {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let polling = false;
   let pollAgain = false;
-  let failures = 0;
+  let failingSince: number | null = null;
   let stopping: Promise<void> | undefined;
 
   const fail = (message: string) => {
@@ -107,10 +115,12 @@ export async function startHostPlanReview(options: {
       apply(
         await client.call("getReview", { sessionId }, { hostId, timeoutMs: HOST_CALL_TIMEOUT_MS }),
       );
-      failures = 0;
+      failingSince = null;
     } catch (error) {
-      failures += 1;
-      if (failures >= HOST_POLL_FAILURE_LIMIT) {
+      // Not connected or a transport error. An answer of `unknown` or a
+      // worker-exit event still ends the review at once.
+      failingSince ??= now();
+      if (now() - failingSince >= disconnectGraceMs) {
         fail(`Lost contact with the thread's machine during the review: ${errorMessage(error)}`);
       }
     } finally {

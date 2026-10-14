@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { HostReviewState } from "./host-contract";
-import { HOST_POLL_FAILURE_LIMIT, startHostPlanReview, type PlannotatorHostClient } from "./host-review";
+import { startHostPlanReview, type PlannotatorHostClient } from "./host-review";
 
 const SESSION_ID = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
 
@@ -19,8 +19,13 @@ function fakeClient(states: Array<HostReviewState | Error>, behavior: { stopped?
   return { client, calls };
 }
 
-function start(client: PlannotatorHostClient, pollIntervalMs = 5) {
+function start(
+  client: PlannotatorHostClient,
+  pollIntervalMs = 5,
+  extra: { disconnectGraceMs?: number; now?: () => number } = {},
+) {
   return startHostPlanReview({
+    ...extra,
     client,
     hostId: "host_mac",
     sessionId: SESSION_ID,
@@ -60,14 +65,46 @@ describe("host plan review handle", () => {
     expect(calls.filter(({ method }) => method === "getReview")).toHaveLength(1);
   });
 
-  it("ends the review after repeated failed polls", async () => {
-    const { client } = fakeClient([new Error("host offline")]);
-    const review = await start(client);
+  it("ends the review only after polls fail for the whole grace period", async () => {
+    const { client } = fakeClient([new Error("Host is not connected")]);
+    let clock = 0;
+    const review = await start(client, 5, { disconnectGraceMs: 120_000, now: () => clock });
+    let settled = false;
+    const outcome = review.result.catch((error: Error) => {
+      settled = true;
+      return error.message;
+    });
 
-    await expect(review.result).rejects.toThrow(
-      "Lost contact with the thread's machine during the review: host offline",
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    clock = 119_000;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+
+    clock = 120_000;
+    expect(await outcome).toBe(
+      "Lost contact with the thread's machine during the review: Host is not connected",
     );
-    expect(HOST_POLL_FAILURE_LIMIT).toBeGreaterThan(1);
+  });
+
+  it("keeps the review through a short disconnect", async () => {
+    let clock = 0;
+    const { client } = fakeClient([
+      new Error("Host is not connected"),
+      new Error("Host is not connected"),
+      new Error("Host is not connected"),
+      new Error("Host is not connected"),
+      { status: "pending" },
+      { status: "decided", decision: { approved: true } },
+    ]);
+    const review = await start(client, 5, {
+      disconnectGraceMs: 120_000,
+      now: () => {
+        clock += 13_000;
+        return clock;
+      },
+    });
+
+    await expect(review.result).resolves.toEqual({ approved: true });
   });
 
   it("tolerates a single failed poll", async () => {

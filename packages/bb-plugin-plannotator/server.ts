@@ -92,7 +92,8 @@ type ActiveReview = {
   review: RunningUpstreamReview | HostPlanReview;
   controller: AbortController;
   cancelledByUser: boolean;
-  deleted: boolean;
+  /** The thread was deleted or archived: deliver no decision. */
+  discarded: boolean;
   settled?: Promise<void>;
 };
 
@@ -294,19 +295,25 @@ async function openReviewPanel(
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const current = await bb.sdk.threads.tabs.get({ threadId });
-      const alreadyOpen = current.tabs.some(
+      const isReviewTab = (existing: (typeof current.tabs)[number]) =>
+        existing.kind === "plugin-panel" &&
+        existing.pluginId === bb.pluginId &&
+        existing.actionId === PANEL_ACTION_ID;
+      // Only one review is pending per thread, so any other review tab is
+      // left over from an earlier review.
+      const kept = current.tabs.filter(
         (existing) =>
-          existing.kind === "plugin-panel" &&
-          existing.pluginId === bb.pluginId &&
-          existing.actionId === PANEL_ACTION_ID &&
-          panelSessionId(existing.paramsJson) === payload.sessionId,
+          !isReviewTab(existing) ||
+          (existing.kind === "plugin-panel" &&
+            panelSessionId(existing.paramsJson) === payload.sessionId),
       );
-      if (alreadyOpen) return;
+      const alreadyOpen = kept.some(isReviewTab);
+      if (alreadyOpen && kept.length === current.tabs.length) return;
 
       await bb.sdk.threads.tabs.update({
         threadId,
         expectedRevision: current.revision,
-        tabs: [...current.tabs, tab],
+        tabs: alreadyOpen ? kept : [...kept, tab],
       });
       return;
     } catch (error) {
@@ -365,12 +372,23 @@ function decisionLabel(decision: UpstreamDecision): "approved" | "changes_reques
   return decision.feedback?.trim() ? "changes_requested" : "cancelled";
 }
 
+/**
+ * Upstream's feedback tells the agent to resubmit with its own plan tool,
+ * such as ExitPlanMode. A bb agent resubmits with this plugin's tool.
+ */
+export function feedbackForBbAgent(feedback: string): string {
+  return feedback.replace(
+    /before calling \S+ again\./u,
+    "before calling plannotator_review_plan again with the revised plan.",
+  );
+}
+
 function reviewResult(reviewId: string, decision: UpstreamDecision): ReviewResult {
   return {
     reviewId,
     source: "plannotator",
     decision: decisionLabel(decision),
-    ...(decision.feedback ? { feedback: decision.feedback } : {}),
+    ...(decision.feedback ? { feedback: feedbackForBbAgent(decision.feedback) } : {}),
     ...(decision.savedPath ? { savedPath: decision.savedPath } : {}),
     ...(decision.agentSwitch ? { agentSwitch: decision.agentSwitch } : {}),
   };
@@ -648,7 +666,7 @@ export default async function plugin(bb: BbPluginApi) {
     // The review is over once the upstream process ends. Free the thread now
     // so a slow or retried decision delivery does not block the next review.
     if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
-    if (disposing || active.deleted) return;
+    if (disposing || active.discarded) return;
     const record: StoredReview = {
       id: active.sessionId,
       threadId,
@@ -780,14 +798,14 @@ export default async function plugin(bb: BbPluginApi) {
       if (!isHostReview(upstream)) relaySessions.set(sessionId, upstream.url);
       const active: ActiveReview = {
         sessionId, payload, review: upstream, controller,
-        cancelledByUser: false, deleted: false,
+        cancelledByUser: false, discarded: false,
       };
       activeReviews.set(context.threadId, active);
       startingReviews.delete(context.threadId);
 
       try {
         await openReviewPanel(bb, context.threadId, payload);
-        if (context.signal.aborted || active.deleted || controller.signal.aborted) {
+        if (context.signal.aborted || active.discarded || controller.signal.aborted) {
           throw new Error("Plannotator review was cancelled before opening");
         }
         await bb.storage.kv.set(reviewKey(sessionId), {
@@ -847,22 +865,47 @@ export default async function plugin(bb: BbPluginApi) {
     skills: [],
   }));
 
+  /** Stop a thread's pending review without delivering a decision. */
+  async function discardActiveReview(threadId: string): Promise<ActiveReview | null> {
+    const active = activeReviews.get(threadId);
+    if (!active) return null;
+    // Remove the lookup before asynchronous cleanup starts. A discarded
+    // review must not be eligible for panel reconciliation while the
+    // upstream process is winding down.
+    activeReviews.delete(threadId);
+    active.discarded = true;
+    active.controller.abort();
+    await Promise.allSettled([
+      closeReviewPanel(bb, threadId, active.sessionId),
+      active.review.stop(),
+    ]);
+    relaySessions.delete(active.sessionId);
+    return active;
+  }
+
+  // An archived thread's review would otherwise keep its process and serve
+  // mapping until someone cancels it. Record the cancellation for
+  // plannotator_review_status without messaging the archived thread.
+  bb.events.on("thread.archived", async ({ thread }) => {
+    const active = await discardActiveReview(thread.id);
+    if (!active) return;
+    await bb.storage.kv.set(reviewKey(active.sessionId), {
+      id: active.sessionId,
+      threadId: thread.id,
+      status: "delivered",
+      result: {
+        reviewId: active.sessionId,
+        source: "plannotator",
+        decision: "cancelled",
+        error: "The review ended when its thread was archived.",
+      },
+      updatedAt: Date.now(),
+    } satisfies StoredReview);
+  });
+
   bb.events.on("thread.deleted", async ({ thread }) => {
-    const active = activeReviews.get(thread.id);
-    if (active) {
-      // Remove the lookup before asynchronous cleanup starts. A deleted
-      // thread must not be eligible for panel reconciliation while the
-      // upstream process is winding down.
-      activeReviews.delete(thread.id);
-      active.deleted = true;
-      active.controller.abort();
-      await Promise.allSettled([
-        closeReviewPanel(bb, thread.id, active.sessionId),
-        active.review.stop(),
-      ]);
-      relaySessions.delete(active.sessionId);
-      await bb.storage.kv.delete(reviewKey(active.sessionId));
-    }
+    const active = await discardActiveReview(thread.id);
+    if (active) await bb.storage.kv.delete(reviewKey(active.sessionId));
     for (const key of await bb.storage.kv.list(REVIEW_KEY_PREFIX)) {
       const parsed = storedReviewSchema.safeParse(await bb.storage.kv.get(key));
       if (parsed.success && parsed.data.threadId === thread.id) {

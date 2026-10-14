@@ -93,6 +93,22 @@ describe("upstream Plannotator bridge", () => {
     ).toEqual({ approved: false, feedback: "Please split this step." });
   });
 
+  it("ignores upstream's permission-mode and agent-switch hints on approval", () => {
+    expect(
+      parseUpstreamDecision(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: "PermissionRequest",
+            decision: {
+              behavior: "allow",
+              updatedPermissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+            },
+          },
+        }),
+      ),
+    ).toEqual({ approved: true });
+  });
+
   it("normalizes the embedded URL host without changing the upstream port", () => {
     expect(rehostUpstreamUrl("http://localhost:43210", "127.0.0.1")).toBe(
       "http://127.0.0.1:43210",

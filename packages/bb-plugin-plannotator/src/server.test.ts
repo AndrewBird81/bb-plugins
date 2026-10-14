@@ -14,6 +14,7 @@ import {
 } from "./constants";
 import type { HostReviewState } from "./host-contract";
 import plugin, {
+  feedbackForBbAgent,
   reviewTargetFor,
   shouldUseRemotePlannotatorMode,
   upstreamOriginForProvider,
@@ -631,6 +632,85 @@ describe("BB upstream Plannotator bridge", () => {
         "stopReview",
       ),
     );
+  });
+
+  it("ends a host review without a message when its thread is archived", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+
+    await host.harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({ id: "thread-1", archivedAt: Date.now() }),
+    });
+
+    expect(host.harness.inspection.experimental_hostRpcCalls).toContainEqual(
+      expect.objectContaining({ method: "stopReview", hostId: "host_mac", input: { sessionId: reviewId } }),
+    );
+    expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
+    expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({
+      status: "delivered",
+      result: { decision: "cancelled", error: "The review ended when its thread was archived." },
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("closes a previous review's tab when a new review opens", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const staleTab = {
+      kind: "plugin-panel",
+      id: "plugin-panel:plannotator:plannotator-review:old",
+      actionId: "plannotator-review",
+      pluginId: "plannotator",
+      title: "Plannotator review",
+      paramsJson: JSON.stringify({ sessionId: "old" }),
+    };
+    await host.bb.sdk.threads.tabs.update({
+      threadId: "thread-1",
+      expectedRevision: 1,
+      tabs: [{ kind: "thread-info", id: "thread-info" }, staleTab] as never,
+    });
+
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+
+    const { tabs } = await host.bb.sdk.threads.tabs.get({ threadId: "thread-1" });
+    expect(tabs.map((tab) => tab.id)).toEqual([
+      "thread-info",
+      `plugin-panel:plannotator:plannotator-review:${reviewId}`,
+    ]);
+  });
+
+  it("tells the agent to resubmit with plannotator_review_plan, not upstream's plan tool", () => {
+    const upstream =
+      "YOUR PLAN WAS NOT APPROVED.\n\nYou MUST revise the plan to address ALL of the feedback below before calling ExitPlanMode again.\n\nRules:\n- Do not resubmit the same plan unchanged.\n\nDrop step 2.";
+    expect(feedbackForBbAgent(upstream)).toBe(
+      "YOUR PLAN WAS NOT APPROVED.\n\nYou MUST revise the plan to address ALL of the feedback below before calling plannotator_review_plan again with the revised plan.\n\nRules:\n- Do not resubmit the same plan unchanged.\n\nDrop step 2.",
+    );
+    expect(feedbackForBbAgent("before calling submit_plan again.")).toBe(
+      "before calling plannotator_review_plan again with the revised plan.",
+    );
+    expect(feedbackForBbAgent("Just a note.")).toBe("Just a note.");
   });
 
   it("cancels a host review when the host worker exits", async () => {

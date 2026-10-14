@@ -2,11 +2,7 @@
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
-import {
-  PLANNOTATOR_RELAY_PATH,
-  UPSTREAM_LOOK_AND_FEEL_COOKIE,
-  UPSTREAM_LOOK_AND_FEEL_VERSION,
-} from "./embedded";
+import { PLANNOTATOR_RELAY_PATH } from "./embedded";
 import { PLANNOTATOR_REALTIME_CHANNEL } from "./constants";
 
 const app = await loadPluginApp(() => import("../app"));
@@ -139,9 +135,30 @@ describe("Plannotator BB shell", () => {
       `http://${window.location.host}${PLANNOTATOR_RELAY_PATH}?sessionId=session-1&path=%2F`,
     );
     expect(iframe.getAttribute("allow")).toBe("clipboard-read; clipboard-write");
-    expect(document.cookie).toContain(
-      `${UPSTREAM_LOOK_AND_FEEL_COOKIE}=${UPSTREAM_LOOK_AND_FEEL_VERSION}`,
+    expect(document.cookie).toContain("plannotator-look-feel-announcement-seen=2");
+    expect(document.cookie).toContain("plannotator-plan-look-choice-resolved=true");
+  });
+
+  it("iframes a session published by another host directly and pre-dismisses its update toast", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      {
+        threadId: "thread-1",
+        params: {
+          ...payload,
+          sessionId: "session-2",
+          sessionUrl: "https://mac.tailnet-example.ts.net:19500",
+          dismissUpdateVersion: "0.29.0",
+        },
+      },
     );
+
+    const iframe = await slot.findByTitle("Plannotator review");
+    expect(iframe.getAttribute("src")).toBe("https://mac.tailnet-example.ts.net:19500");
+    expect((await slot.findByText("Open externally")).getAttribute("href")).toBe(
+      "https://mac.tailnet-example.ts.net:19500",
+    );
+    expect(document.cookie).toContain("update-dismissed-version=0.29.0");
   });
 
   it("recovers the pending review when the panel action opens without params", async () => {

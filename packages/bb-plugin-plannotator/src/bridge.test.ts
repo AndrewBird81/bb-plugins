@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildUpstreamInput,
   BUNDLED_BINARY,
   bundledAssetFor,
   bundledTargetFor,
   ensureBundledPlannotatorBinary,
+  fetchLatestUpstreamVersion,
   missingBinaryMessage,
   parseReadyMetadata,
   parseUpstreamDecision,
@@ -21,6 +22,7 @@ import {
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true }),
@@ -91,6 +93,22 @@ describe("upstream Plannotator bridge", () => {
     ).toEqual({ approved: false, feedback: "Please split this step." });
   });
 
+  it("ignores upstream's permission-mode and agent-switch hints on approval", () => {
+    expect(
+      parseUpstreamDecision(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: "PermissionRequest",
+            decision: {
+              behavior: "allow",
+              updatedPermissions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
+            },
+          },
+        }),
+      ),
+    ).toEqual({ approved: true });
+  });
+
   it("normalizes the embedded URL host without changing the upstream port", () => {
     expect(rehostUpstreamUrl("http://localhost:43210", "127.0.0.1")).toBe(
       "http://127.0.0.1:43210",
@@ -141,6 +159,59 @@ process.stdin.resume();
       }),
     });
     await running.stop();
+  });
+
+  it("binds loopback on a caller's port range and never inherits the remote agent terminal", async () => {
+    vi.stubEnv("PLANNOTATOR_AGENT_TERMINAL_REMOTE", "1");
+    const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-env-test-"));
+    temporaryDirectories.push(directory);
+    const binary = join(directory, "plannotator");
+    await writeFile(
+      binary,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(process.env.PLANNOTATOR_READY_FILE, JSON.stringify({ url: "http://localhost:19503", isRemote: false, port: 19503 }) + "\\n");
+setTimeout(() => process.stdout.write(JSON.stringify({
+  approved: true,
+  feedback: JSON.stringify({ cwd: process.cwd(), remote: process.env.PLANNOTATOR_REMOTE, port: process.env.PLANNOTATOR_PORT, terminal: process.env.PLANNOTATOR_AGENT_TERMINAL_REMOTE ?? null }),
+}) + "\\n"), 20);
+process.stdin.resume();
+`,
+      "utf8",
+    );
+    await chmod(binary, 0o755);
+
+    const running = await startUpstreamPlanReview({
+      binaryPath: binary,
+      planMarkdown: "# Plan",
+      timeoutSeconds: null,
+      signal: new AbortController().signal,
+      remote: false,
+      portRange: "19500-19509",
+      cwd: directory,
+    });
+    expect(running.port).toBe(19503);
+    expect(running.pid).toEqual(expect.any(Number));
+    const decision = await running.result;
+    expect(JSON.parse(decision.feedback!)).toEqual({
+      cwd: await realpath(directory),
+      remote: "0",
+      port: "19500-19509",
+      terminal: null,
+    });
+    await running.stop();
+  });
+
+  it("reads the latest upstream release for the update-toast dismissal", async () => {
+    const release = (body: unknown, status = 200) => async () => Response.json(body, { status });
+    expect(await fetchLatestUpstreamVersion(release({ tag_name: "v0.29.0" }))).toBe("0.29.0");
+    expect(await fetchLatestUpstreamVersion(release({}, 403))).toBeNull();
+    expect(await fetchLatestUpstreamVersion(release({ tag_name: "v1; domain=evil" }))).toBeNull();
+    expect(
+      await fetchLatestUpstreamVersion(async () => {
+        throw new Error("offline");
+      }),
+    ).toBeNull();
   });
 
   it("returns a terminal decision when the upstream review times out", async () => {

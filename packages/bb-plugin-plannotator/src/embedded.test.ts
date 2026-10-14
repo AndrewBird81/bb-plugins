@@ -4,7 +4,8 @@ import {
   buildPlannotatorRelayUrl,
   embeddedSessionUrl,
   normalizeEmbeddedSessionUrl,
-  upstreamOnboardingCookie,
+  sharedCookieDomain,
+  upstreamOnboardingCookies,
 } from "./embedded";
 
 describe("embedded Plannotator host seams", () => {
@@ -35,10 +36,39 @@ describe("embedded Plannotator host seams", () => {
     ).toBe("http://review.example.test:43210");
   });
 
-  it("pins the current upstream look-and-feel announcement as seen", () => {
-    expect(upstreamOnboardingCookie()).toBe(
+  it("pre-dismisses every upstream first-run dialog host-only by default", () => {
+    expect(upstreamOnboardingCookies()).toEqual([
       "plannotator-look-feel-announcement-seen=2; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-plan-look-choice-resolved=true; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-permission-mode-configured=true; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-announce-tui-herdr-seen=1; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-announce-ask-session-seen=1; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-announce-agent-tool-seen=1; path=/; max-age=31536000; SameSite=Lax",
+    ]);
+  });
+
+  it("also scopes the cookies to a shared parent domain and dismisses the update toast", () => {
+    const cookies = upstreamOnboardingCookies({
+      domain: "tailnet-example.ts.net",
+      dismissUpdateVersion: "0.29.0",
+    });
+    expect(cookies).toHaveLength(14);
+    expect(cookies).toContain(
+      "update-dismissed-version=0.29.0; path=/; max-age=31536000; SameSite=Lax",
     );
+    expect(cookies).toContain(
+      "plannotator-announce-tui-herdr-seen=1; path=/; max-age=31536000; SameSite=Lax; domain=tailnet-example.ts.net",
+    );
+  });
+
+  it("finds the parent domain a BB page shares with another tailnet host", () => {
+    expect(
+      sharedCookieDomain("bb-server.tailnet-example.ts.net", "https://laptop.tailnet-example.ts.net:19500"),
+    ).toBe("tailnet-example.ts.net");
+    expect(sharedCookieDomain("bb-server.tailnet-example.ts.net", "https://bb-server.tailnet-example.ts.net/x")).toBeNull();
+    expect(sharedCookieDomain("localhost", "http://127.0.0.1:43210")).toBeNull();
+    expect(sharedCookieDomain("a.example", "https://b.test")).toBeNull();
+    expect(sharedCookieDomain("100.64.0.1", "https://mac.tailnet-example.ts.net:19500")).toBeNull();
   });
 
   it("uses the same-origin relay for local sessions over HTTP and HTTPS", () => {

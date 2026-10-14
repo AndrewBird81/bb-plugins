@@ -3,6 +3,7 @@
 // annotations, history, and feedback formatting. BB supplies the agent tool,
 // embeds the upstream session, and delivers decisions in a later thread message.
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   defineRpcContract,
@@ -13,6 +14,7 @@ import {
   BUNDLED_BINARY,
   DEFAULT_BINARY,
   ensureBundledPlannotatorBinary,
+  fetchLatestUpstreamVersion,
   missingBinaryMessage,
   resolvePlannotatorBinary,
   startUpstreamPlanReview,
@@ -26,6 +28,8 @@ import {
   PLANNOTATOR_REALTIME_CHANNEL,
 } from "./src/constants";
 import { isLocalBindHostname } from "./src/embedded";
+import { hostContract, hostSignals } from "./src/host-contract";
+import { startHostPlanReview, type HostPlanReview } from "./src/host-review";
 import {
   registerPlannotatorRelayRoutes,
 } from "./src/relay";
@@ -46,6 +50,8 @@ const interactionPayloadSchema = z
     sessionUrl: z.string().url(),
     relayPath: z.literal(PLANNOTATOR_RELAY_PATH),
     title: z.string().min(1),
+    /** Latest upstream release, so the panel can pre-dismiss its update toast. */
+    dismissUpdateVersion: z.string().min(1).max(64).optional(),
   })
   .strict();
 type ReviewPanelPayload = z.infer<typeof interactionPayloadSchema>;
@@ -83,10 +89,11 @@ export const rpcContract = defineRpcContract({
 type ActiveReview = {
   sessionId: string;
   payload: ReviewPanelPayload;
-  review: RunningUpstreamReview;
+  review: RunningUpstreamReview | HostPlanReview;
   controller: AbortController;
   cancelledByUser: boolean;
-  deleted: boolean;
+  /** The thread was deleted or archived: deliver no decision. */
+  discarded: boolean;
   settled?: Promise<void>;
 };
 
@@ -103,6 +110,8 @@ type ReviewResult = {
 const storedReviewSchema = z.object({
   id: z.string().uuid(),
   threadId: z.string().min(1),
+  /** Set when the review runs on another bb host. */
+  hostId: z.string().min(1).optional(),
   status: z.enum(["pending", "ready", "delivered"]),
   result: z.object({
     reviewId: z.string().uuid(),
@@ -119,6 +128,16 @@ type StoredReview = z.infer<typeof storedReviewSchema>;
 const REVIEW_KEY_PREFIX = "review:";
 const DELIVERED_REVIEW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DELIVERY_RETRY_MS = 30_000;
+const LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
+/** A failed release lookup is retried soon, so one timeout does not show the toast for hours. */
+const LATEST_VERSION_FAILURE_TTL_MS = 5 * 60 * 1000;
+const HOST_CLEANUP_KEY_PREFIX = "host-cleanup:";
+/** A host that stays unreachable this long is assumed gone. */
+const HOST_CLEANUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const hostCleanupSchema = z
+  .object({ hostId: z.string().min(1), sessionId: z.string().uuid(), queuedAt: z.number() })
+  .strict();
+type HostCleanup = z.infer<typeof hostCleanupSchema>;
 
 /**
  * Map BB's provider ids to the identities the upstream UI knows how to name.
@@ -151,19 +170,56 @@ export function upstreamOriginForProvider(
   return "codex";
 }
 
-async function resolveUpstreamOrigin(
+/** Where a thread's review runs: in the server process, or on its own host. */
+export type ReviewTarget =
+  | { kind: "server"; cwd?: string }
+  | { kind: "host"; hostId: string; cwd: string };
+
+/**
+ * A thread on the server machine keeps the in-process runtime, in its
+ * worktree when that path exists here. Any other machine runs Plannotator
+ * through this plugin's host entry, which needs the worktree path.
+ */
+export function reviewTargetFor(
+  environment: { hostId: string; path: string | null },
+  primaryHostId: string | null,
+  pathExists: (path: string) => boolean = existsSync,
+): ReviewTarget {
+  if (!primaryHostId || environment.hostId === primaryHostId) {
+    return environment.path && pathExists(environment.path)
+      ? { kind: "server", cwd: environment.path }
+      : { kind: "server" };
+  }
+  if (!environment.path) {
+    throw new Error("The thread's environment has no workspace path on its machine.");
+  }
+  return { kind: "host", hostId: environment.hostId, cwd: environment.path };
+}
+
+async function resolveReviewContext(
   bb: BbPluginApi,
   threadId: string,
   signal: AbortSignal,
-): Promise<UpstreamOrigin> {
+): Promise<{ origin: UpstreamOrigin; target: ReviewTarget }> {
+  let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
   try {
-    const thread = await bb.sdk.threads.get({ threadId, signal });
-    return upstreamOriginForProvider(thread.providerId);
+    thread = await bb.sdk.threads.get({ threadId, signal });
   } catch {
-    // The provider identity is presentation-only. A failed metadata lookup
-    // must not prevent the review gate from opening.
-    return "codex";
+    // Without thread metadata, keep the original in-process behavior. The
+    // provider identity is presentation-only.
+    return { origin: "codex", target: { kind: "server" } };
   }
+  const origin = upstreamOriginForProvider(thread.providerId);
+  if (!thread.environmentId) return { origin, target: { kind: "server" } };
+  const [environment, systemConfig] = await Promise.all([
+    bb.sdk.environments.get({ environmentId: thread.environmentId, signal }),
+    bb.sdk.system.config({ signal }),
+  ]);
+  return { origin, target: reviewTargetFor(environment, systemConfig.primaryHostId) };
+}
+
+function isHostReview(review: ActiveReview["review"]): review is HostPlanReview {
+  return "hostId" in review;
 }
 
 export function shouldUseRemotePlannotatorMode(
@@ -239,19 +295,25 @@ async function openReviewPanel(
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const current = await bb.sdk.threads.tabs.get({ threadId });
-      const alreadyOpen = current.tabs.some(
+      const isReviewTab = (existing: (typeof current.tabs)[number]) =>
+        existing.kind === "plugin-panel" &&
+        existing.pluginId === bb.pluginId &&
+        existing.actionId === PANEL_ACTION_ID;
+      // Only one review is pending per thread, so any other review tab is
+      // left over from an earlier review.
+      const kept = current.tabs.filter(
         (existing) =>
-          existing.kind === "plugin-panel" &&
-          existing.pluginId === bb.pluginId &&
-          existing.actionId === PANEL_ACTION_ID &&
-          panelSessionId(existing.paramsJson) === payload.sessionId,
+          !isReviewTab(existing) ||
+          (existing.kind === "plugin-panel" &&
+            panelSessionId(existing.paramsJson) === payload.sessionId),
       );
-      if (alreadyOpen) return;
+      const alreadyOpen = kept.some(isReviewTab);
+      if (alreadyOpen && kept.length === current.tabs.length) return;
 
       await bb.sdk.threads.tabs.update({
         threadId,
         expectedRevision: current.revision,
-        tabs: [...current.tabs, tab],
+        tabs: alreadyOpen ? kept : [...kept, tab],
       });
       return;
     } catch (error) {
@@ -310,12 +372,23 @@ function decisionLabel(decision: UpstreamDecision): "approved" | "changes_reques
   return decision.feedback?.trim() ? "changes_requested" : "cancelled";
 }
 
+/**
+ * Upstream's feedback tells the agent to resubmit with its own plan tool,
+ * such as ExitPlanMode. A bb agent resubmits with this plugin's tool.
+ */
+export function feedbackForBbAgent(feedback: string): string {
+  return feedback.replace(
+    /before calling \S+ again\./u,
+    "before calling plannotator_review_plan again with the revised plan.",
+  );
+}
+
 function reviewResult(reviewId: string, decision: UpstreamDecision): ReviewResult {
   return {
     reviewId,
     source: "plannotator",
     decision: decisionLabel(decision),
-    ...(decision.feedback ? { feedback: decision.feedback } : {}),
+    ...(decision.feedback ? { feedback: feedbackForBbAgent(decision.feedback) } : {}),
     ...(decision.savedPath ? { savedPath: decision.savedPath } : {}),
     ...(decision.agentSwitch ? { agentSwitch: decision.agentSwitch } : {}),
   };
@@ -410,6 +483,70 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const hostClient = bb.hosts.experimental_client({
+    contract: hostContract,
+    experimental_signals: hostSignals,
+  });
+  const activeHostReviews = (hostId: string) =>
+    [...activeReviews.values()]
+      .map(({ review }) => review)
+      .filter((review): review is HostPlanReview => isHostReview(review) && review.hostId === hostId);
+  hostClient.experimental_onSignal("reviewChanged", ({ hostId, payload }) => {
+    for (const review of activeHostReviews(hostId)) {
+      if (review.sessionId === payload.sessionId) review.refresh();
+    }
+  });
+  hostClient.experimental_onWorkerExit(({ hostId }) => {
+    for (const review of activeHostReviews(hostId)) review.workerExited();
+    // The next call starts a fresh worker, which removes what the dead one left.
+    void hostClient.call("reconcile", {}, { hostId }).catch((error: unknown) => {
+      bb.log.warn(`Could not reconcile Plannotator on ${hostId}: ${String(error)}`);
+    });
+  });
+
+  // Host reviews that may have left a process or serve mapping behind. Kept in
+  // KV so a plugin or server restart does not lose them, and retried until the
+  // host answers: stop the review if its worker survived, then reconcile so
+  // the worker removes what it recorded.
+  const hostCleanupKey = (sessionId: string) => `${HOST_CLEANUP_KEY_PREFIX}${sessionId}`;
+  async function runHostCleanup(cleanup: HostCleanup): Promise<void> {
+    try {
+      await hostClient.call("stopReview", { sessionId: cleanup.sessionId }, { hostId: cleanup.hostId });
+      await hostClient.call("reconcile", {}, { hostId: cleanup.hostId });
+      await bb.storage.kv.delete(hostCleanupKey(cleanup.sessionId));
+    } catch {
+      // Still unreachable; try again on the next delivery pass.
+    }
+  }
+  function queueHostCleanup(hostId: string, sessionId: string): void {
+    const cleanup: HostCleanup = { hostId, sessionId, queuedAt: Date.now() };
+    void bb.storage.kv
+      .set(hostCleanupKey(sessionId), cleanup)
+      .then(() => runHostCleanup(cleanup))
+      .catch((error: unknown) => {
+        bb.log.warn(`Could not queue Plannotator cleanup on ${hostId}: ${String(error)}`);
+      });
+  }
+  async function retryHostCleanups(): Promise<void> {
+    for (const key of await bb.storage.kv.list(HOST_CLEANUP_KEY_PREFIX)) {
+      const parsed = hostCleanupSchema.safeParse(await bb.storage.kv.get(key));
+      if (!parsed.success || Date.now() - parsed.data.queuedAt > HOST_CLEANUP_RETENTION_MS) {
+        await bb.storage.kv.delete(key);
+        continue;
+      }
+      await runHostCleanup(parsed.data);
+    }
+  }
+
+  let latestVersion: { value: string | null; fetchedAt: number } | null = null;
+  async function latestUpstreamVersion(): Promise<string | undefined> {
+    const ttl = latestVersion?.value ? LATEST_VERSION_TTL_MS : LATEST_VERSION_FAILURE_TTL_MS;
+    if (!latestVersion || Date.now() - latestVersion.fetchedAt > ttl) {
+      latestVersion = { value: await fetchLatestUpstreamVersion(), fetchedAt: Date.now() };
+    }
+    return latestVersion.value ?? undefined;
+  }
+
   const activeReviews = new Map<string, ActiveReview>();
   const startingReviews = new Set<string>();
   const relaySessions = new Map<string, string>();
@@ -462,6 +599,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (record.status === "pending") {
         if (activeReviews.get(record.threadId)?.sessionId === record.id) continue;
+        if (record.hostId) queueHostCleanup(record.hostId, record.id);
         await closeReviewPanel(bb, record.threadId, record.id);
         record = {
           ...record,
@@ -485,6 +623,7 @@ export default async function plugin(bb: BbPluginApi) {
       while (!signal.aborted) {
         try {
           await recoverReviews();
+          await retryHostCleanups();
         } catch (error) {
           if (!signal.aborted) bb.log.warn(`Could not recover Plannotator reviews: ${String(error)}`);
         }
@@ -527,7 +666,7 @@ export default async function plugin(bb: BbPluginApi) {
     // The review is over once the upstream process ends. Free the thread now
     // so a slow or retried decision delivery does not block the next review.
     if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
-    if (disposing || active.deleted) return;
+    if (disposing || active.discarded) return;
     const record: StoredReview = {
       id: active.sessionId,
       threadId,
@@ -589,44 +728,53 @@ export default async function plugin(bb: BbPluginApi) {
       }
       startingReviews.add(context.threadId);
 
-      let configuredPath: string;
-      try {
-        configuredPath = await getConfiguredPath(settings);
-      } catch (error) {
-        startingReviews.delete(context.threadId);
-        return errorResponse(error instanceof Error ? error.message : String(error));
-      }
-      let binaryPath: string;
-      try {
-        binaryPath = await resolveRuntimeBinary(bb, configuredPath, context.signal);
-      } catch (error) {
-        startingReviews.delete(context.threadId);
-        return errorResponse(error instanceof Error ? error.message : String(error));
-      }
-
       const sessionId = randomUUID();
       const controller = new AbortController();
       const abortStartup = () => controller.abort();
       context.signal.addEventListener("abort", abortStartup, { once: true });
-      let upstream: RunningUpstreamReview;
+      const dismissUpdateVersion = latestUpstreamVersion();
+      let upstream: RunningUpstreamReview | HostPlanReview;
+      let hostId: string | undefined;
       try {
-        const [origin, runtimeConfig] = await Promise.all([
-          resolveUpstreamOrigin(bb, context.threadId, controller.signal),
-          resolveUpstreamRuntimeConfig(bb, controller.signal),
-        ]);
-        upstream = await startUpstreamPlanReview({
-          binaryPath,
-          planMarkdown: params.planMarkdown,
-          timeoutSeconds: null,
-          signal: controller.signal,
-          origin,
-          dataDir: runtimeConfig.dataDir,
-          remote: runtimeConfig.remote,
-          embedHost: resolveEmbedHost(bb),
-        });
+        const { origin, target } = await resolveReviewContext(
+          bb,
+          context.threadId,
+          controller.signal,
+        );
+        if (target.kind === "host") {
+          hostId = target.hostId;
+          upstream = await startHostPlanReview({
+            client: hostClient,
+            hostId: target.hostId,
+            sessionId,
+            planMarkdown: params.planMarkdown,
+            cwd: target.cwd,
+            origin,
+            signal: controller.signal,
+            onCleanupNeeded: () => queueHostCleanup(target.hostId, sessionId),
+          });
+        } else {
+          const configuredPath = await getConfiguredPath(settings);
+          const binaryPath = await resolveRuntimeBinary(bb, configuredPath, controller.signal);
+          const runtimeConfig = await resolveUpstreamRuntimeConfig(bb, controller.signal);
+          upstream = await startUpstreamPlanReview({
+            binaryPath,
+            planMarkdown: params.planMarkdown,
+            timeoutSeconds: null,
+            signal: controller.signal,
+            origin,
+            dataDir: runtimeConfig.dataDir,
+            remote: runtimeConfig.remote,
+            embedHost: resolveEmbedHost(bb),
+            cwd: target.cwd,
+          });
+        }
       } catch (error) {
         context.signal.removeEventListener("abort", abortStartup);
         startingReviews.delete(context.threadId);
+        // An aborted or timed-out call may still have started and published
+        // the review on the host.
+        if (hostId) queueHostCleanup(hostId, sessionId);
         return errorResponse(error instanceof Error ? error.message : String(error));
       }
       // The process can exit while the panel and stored review are opening.
@@ -634,6 +782,7 @@ export default async function plugin(bb: BbPluginApi) {
       void upstream.result.catch(() => undefined);
 
       const title = params.title?.trim() || "Plannotator review";
+      const updateVersion = await dismissUpdateVersion;
       const payload = interactionPayloadSchema.parse({
         kind: "plannotator",
         sessionId,
@@ -641,23 +790,28 @@ export default async function plugin(bb: BbPluginApi) {
         sessionUrl: upstream.url,
         relayPath: PLANNOTATOR_RELAY_PATH,
         title,
+        // RPC results are strict JSON: omit the field rather than send undefined.
+        ...(updateVersion ? { dismissUpdateVersion: updateVersion } : {}),
       });
-      relaySessions.set(sessionId, upstream.url);
+      // Host reviews are published on their own machine; only in-process
+      // listeners go through BB's relay.
+      if (!isHostReview(upstream)) relaySessions.set(sessionId, upstream.url);
       const active: ActiveReview = {
         sessionId, payload, review: upstream, controller,
-        cancelledByUser: false, deleted: false,
+        cancelledByUser: false, discarded: false,
       };
       activeReviews.set(context.threadId, active);
       startingReviews.delete(context.threadId);
 
       try {
         await openReviewPanel(bb, context.threadId, payload);
-        if (context.signal.aborted || active.deleted || controller.signal.aborted) {
+        if (context.signal.aborted || active.discarded || controller.signal.aborted) {
           throw new Error("Plannotator review was cancelled before opening");
         }
         await bb.storage.kv.set(reviewKey(sessionId), {
           id: sessionId,
           threadId: context.threadId,
+          ...(isHostReview(upstream) ? { hostId: upstream.hostId } : {}),
           status: "pending",
           updatedAt: Date.now(),
         } satisfies StoredReview);
@@ -711,22 +865,47 @@ export default async function plugin(bb: BbPluginApi) {
     skills: [],
   }));
 
+  /** Stop a thread's pending review without delivering a decision. */
+  async function discardActiveReview(threadId: string): Promise<ActiveReview | null> {
+    const active = activeReviews.get(threadId);
+    if (!active) return null;
+    // Remove the lookup before asynchronous cleanup starts. A discarded
+    // review must not be eligible for panel reconciliation while the
+    // upstream process is winding down.
+    activeReviews.delete(threadId);
+    active.discarded = true;
+    active.controller.abort();
+    await Promise.allSettled([
+      closeReviewPanel(bb, threadId, active.sessionId),
+      active.review.stop(),
+    ]);
+    relaySessions.delete(active.sessionId);
+    return active;
+  }
+
+  // An archived thread's review would otherwise keep its process and serve
+  // mapping until someone cancels it. Record the cancellation for
+  // plannotator_review_status without messaging the archived thread.
+  bb.events.on("thread.archived", async ({ thread }) => {
+    const active = await discardActiveReview(thread.id);
+    if (!active) return;
+    await bb.storage.kv.set(reviewKey(active.sessionId), {
+      id: active.sessionId,
+      threadId: thread.id,
+      status: "delivered",
+      result: {
+        reviewId: active.sessionId,
+        source: "plannotator",
+        decision: "cancelled",
+        error: "The review ended when its thread was archived.",
+      },
+      updatedAt: Date.now(),
+    } satisfies StoredReview);
+  });
+
   bb.events.on("thread.deleted", async ({ thread }) => {
-    const active = activeReviews.get(thread.id);
-    if (active) {
-      // Remove the lookup before asynchronous cleanup starts. A deleted
-      // thread must not be eligible for panel reconciliation while the
-      // upstream process is winding down.
-      activeReviews.delete(thread.id);
-      active.deleted = true;
-      active.controller.abort();
-      await Promise.allSettled([
-        closeReviewPanel(bb, thread.id, active.sessionId),
-        active.review.stop(),
-      ]);
-      relaySessions.delete(active.sessionId);
-      await bb.storage.kv.delete(reviewKey(active.sessionId));
-    }
+    const active = await discardActiveReview(thread.id);
+    if (active) await bb.storage.kv.delete(reviewKey(active.sessionId));
     for (const key of await bb.storage.kv.list(REVIEW_KEY_PREFIX)) {
       const parsed = storedReviewSchema.safeParse(await bb.storage.kv.get(key));
       if (parsed.success && parsed.data.threadId === thread.id) {

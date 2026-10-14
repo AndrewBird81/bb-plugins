@@ -1,9 +1,10 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createFakePluginHost,
+  makePluginAgentConfigurationContext,
   makeThreadResponse,
   type FakePluginHost,
 } from "@get-bb/plugin-sdk/testing";
@@ -11,7 +12,10 @@ import {
   PLANNOTATOR_REALTIME_CHANNEL,
   PLANNOTATOR_RELAY_PATH,
 } from "./constants";
+import type { HostReviewState } from "./host-contract";
 import plugin, {
+  feedbackForBbAgent,
+  reviewTargetFor,
   shouldUseRemotePlannotatorMode,
   upstreamOriginForProvider,
 } from "../server";
@@ -19,7 +23,14 @@ import plugin, {
 const hosts: FakePluginHost[] = [];
 const temporaryDirectories: string[] = [];
 
+beforeEach(() => {
+  // The upstream release lookup that pre-dismisses the update toast.
+  vi.stubGlobal("fetch", async () => Response.json({ tag_name: "v0.29.0" }));
+});
+
 afterEach(async () => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   await Promise.all(hosts.splice(0).map((host) => host.harness.lifecycle.dispose()));
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
@@ -41,6 +52,8 @@ async function fakePlannotatorBinary(
 const fs = require("node:fs");
 const path = require("node:path");
 const ready = process.env.PLANNOTATOR_READY_FILE;
+// The ready file last: tests read the other files as soon as the session opens.
+if (process.env.FAKE_PLANNOTATOR_CWD_FILE) fs.writeFileSync(process.env.FAKE_PLANNOTATOR_CWD_FILE, process.cwd());
 fs.mkdirSync(path.dirname(ready), { recursive: true });
 fs.appendFileSync(ready, JSON.stringify({ url: "http://127.0.0.1:43210", isRemote: false, port: 43210 }) + "\\n");
 ${approveAfterMs === null
@@ -110,6 +123,40 @@ async function sentReview(host: FakePluginHost) {
   throw new Error("Expected a Plannotator decision message");
 }
 
+function wireThreadOnHost(
+  host: FakePluginHost,
+  environment: { hostId: string; path: string },
+): void {
+  wireInteractionSdk(host);
+  host.harness.sdk.stub("threads.get", () =>
+    makeThreadResponse({ id: "thread-1", providerId: "claude-code", environmentId: "env-1" }),
+  );
+  host.harness.sdk.stub("environments.get", () => ({ id: "env-1", ...environment }) as never);
+  host.harness.sdk.stub("system.config", () =>
+    ({ primaryHostId: "host_server", dataDir: "/tmp/bb-plannotator-test-data", serverUrl: "http://127.0.0.1:38886" }) as never,
+  );
+}
+
+/** A host entry stand-in whose review state the test controls. */
+function fakeRemoteHost(options: { startError?: string } = {}) {
+  const remote = {
+    state: { status: "pending" } as HostReviewState,
+    /** Whether the host worker still knows the review when it is stopped. */
+    stopped: true,
+    async call({ method }: { method: string }) {
+      if (method === "startReview") {
+        if (options.startError) throw new Error(options.startError);
+        return { url: "https://mac.tailnet-example.ts.net:19500", port: 19500 };
+      }
+      if (method === "getReview") return remote.state;
+      if (method === "stopReview") return { stopped: remote.stopped };
+      if (method === "reconcile") return { removedPorts: [], killedPids: [] };
+      throw new Error(`unexpected host method ${method}`);
+    },
+  };
+  return remote;
+}
+
 describe("BB upstream Plannotator bridge", () => {
   it("enables remote Plannotator mode only for remotely reachable BB configurations", () => {
     expect(shouldUseRemotePlannotatorMode("http://127.0.0.1:38886")).toBe(false);
@@ -163,30 +210,9 @@ describe("BB upstream Plannotator bridge", () => {
     );
     expect(host.harness.inspection.registrations.cli).toBeNull();
 
-    const resolved = await host.harness.behavior.resolveAgentConfiguration({
-      thread: {
-        id: "thread-1",
-        title: "Bridge test",
-        parentThreadId: null,
-        sourceThreadId: null,
-      },
-      project: {
-        id: "project-1",
-        kind: "standard" as const,
-        name: "Test project",
-        gitRemoteUrl: null,
-      },
-      environment: {
-        id: "environment-1",
-        name: "Local",
-        path: "/workspace",
-        workspaceProvisionType: "unmanaged" as const,
-        branchName: null,
-      },
-      host: { id: "host-1", name: "Local host" },
-      provider: { id: "codex", model: "test-model", capabilities: { supportsNativeUserQuestion: false } },
-      origin: { kind: null, pluginId: null },
-    });
+    const resolved = await host.harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext(),
+    );
     expect(resolved.skills).toEqual([]);
   });
 
@@ -513,5 +539,389 @@ describe("BB upstream Plannotator bridge", () => {
     );
     expect(result).toMatchObject({ isError: true });
     expect(JSON.stringify(result)).toContain("bundled");
+  });
+  it("routes a review to the server or to the thread's own host", () => {
+    const exists = (path: string) => path === "/home/node/worktree";
+    expect(reviewTargetFor({ hostId: "host_server", path: "/home/node/worktree" }, "host_server", exists))
+      .toEqual({ kind: "server", cwd: "/home/node/worktree" });
+    expect(reviewTargetFor({ hostId: "host_server", path: "/gone" }, "host_server", exists))
+      .toEqual({ kind: "server" });
+    expect(reviewTargetFor({ hostId: "host_mac", path: "/Users/me/repo" }, "host_server", exists))
+      .toEqual({ kind: "host", hostId: "host_mac", cwd: "/Users/me/repo" });
+    expect(() => reviewTargetFor({ hostId: "host_mac", path: null }, "host_server", exists))
+      .toThrow("no workspace path");
+  });
+
+  it("starts an in-process review in the thread's worktree on the server machine", async () => {
+    const binary = await fakePlannotatorBinary({ approveAfterMs: null });
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), "bb-plannotator-worktree-")));
+    temporaryDirectories.push(worktree);
+    const cwdFile = join(worktree, "cwd.txt");
+    vi.stubEnv("FAKE_PLANNOTATOR_CWD_FILE", cwdFile);
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      settings: { binaryPath: binary },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_server", path: worktree });
+
+    const result = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { status: string };
+
+    expect(result.status).toBe("pending");
+    expect(await readFile(cwdFile, "utf8")).toBe(worktree);
+    expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
+  });
+
+  it("runs a review on the thread's own host and delivers its signalled decision", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+    const result = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan\n\n- On the Mac" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { status: string; reviewId: string };
+    expect(result.status).toBe("pending");
+    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+      method: "startReview",
+      hostId: "host_mac",
+      input: {
+        sessionId: result.reviewId,
+        cwd: "/Users/me/repo",
+        origin: "claude-code",
+        planMarkdown: "# Plan\n\n- On the Mac",
+      },
+    });
+    const panel = JSON.parse(String((await reviewPanelTab(host)).paramsJson)) as Record<string, unknown>;
+    expect(panel).toMatchObject({
+      sessionId: result.reviewId,
+      sessionUrl: "https://mac.tailnet-example.ts.net:19500",
+      dismissUpdateVersion: "0.29.0",
+    });
+    expect(await host.bb.storage.kv.get(`review:${result.reviewId}`)).toMatchObject({
+      hostId: "host_mac",
+      status: "pending",
+    });
+    // A host review is published by its own machine, never through BB's relay.
+    const relay = await host.harness.behavior.fetchHttp(
+      "GET",
+      `/review?sessionId=${result.reviewId}&path=/`,
+    );
+    expect(relay.status).toBe(404);
+
+    remote.state = { status: "decided", decision: { approved: false, feedback: "Split step 2" } };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", {
+      sessionId: result.reviewId,
+    });
+    const sent = await sentReview(host);
+    expect(String((sent[0] as { input: Array<{ text: string }> }).input[0]!.text)).toContain(
+      '"decision":"changes_requested"',
+    );
+    await vi.waitFor(() =>
+      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain(
+        "stopReview",
+      ),
+    );
+  });
+
+  it("ends a host review without a message when its thread is archived", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+
+    await host.harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({ id: "thread-1", archivedAt: Date.now() }),
+    });
+
+    expect(host.harness.inspection.experimental_hostRpcCalls).toContainEqual(
+      expect.objectContaining({ method: "stopReview", hostId: "host_mac", input: { sessionId: reviewId } }),
+    );
+    expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
+    expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({
+      status: "delivered",
+      result: { decision: "cancelled", error: "The review ended when its thread was archived." },
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("closes a previous review's tab when a new review opens", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const staleTab = {
+      kind: "plugin-panel",
+      id: "plugin-panel:plannotator:plannotator-review:old",
+      actionId: "plannotator-review",
+      pluginId: "plannotator",
+      title: "Plannotator review",
+      paramsJson: JSON.stringify({ sessionId: "old" }),
+    };
+    await host.bb.sdk.threads.tabs.update({
+      threadId: "thread-1",
+      expectedRevision: 1,
+      tabs: [{ kind: "thread-info", id: "thread-info" }, staleTab] as never,
+    });
+
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+
+    const { tabs } = await host.bb.sdk.threads.tabs.get({ threadId: "thread-1" });
+    expect(tabs.map((tab) => tab.id)).toEqual([
+      "thread-info",
+      `plugin-panel:plannotator:plannotator-review:${reviewId}`,
+    ]);
+  });
+
+  it("tells the agent to resubmit with plannotator_review_plan, not upstream's plan tool", () => {
+    const upstream =
+      "YOUR PLAN WAS NOT APPROVED.\n\nYou MUST revise the plan to address ALL of the feedback below before calling ExitPlanMode again.\n\nRules:\n- Do not resubmit the same plan unchanged.\n\nDrop step 2.";
+    expect(feedbackForBbAgent(upstream)).toBe(
+      "YOUR PLAN WAS NOT APPROVED.\n\nYou MUST revise the plan to address ALL of the feedback below before calling plannotator_review_plan again with the revised plan.\n\nRules:\n- Do not resubmit the same plan unchanged.\n\nDrop step 2.",
+    );
+    expect(feedbackForBbAgent("before calling submit_plan again.")).toBe(
+      "before calling plannotator_review_plan again with the revised plan.",
+    );
+    expect(feedbackForBbAgent("Just a note.")).toBe("Just a note.");
+  });
+
+  it("cancels a host review when the host worker exits", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    );
+
+    await host.harness.behavior.experimental_emitHostWorkerExit("host_mac");
+
+    const sent = await sentReview(host);
+    const text = String((sent[0] as { input: Array<{ text: string }> }).input[0]!.text);
+    expect(text).toContain('"decision":"cancelled"');
+    expect(text).toContain("worker on the thread's machine exited");
+    expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain(
+      "reconcile",
+    );
+  });
+
+  it("returns the host's error when it cannot publish the review", async () => {
+    const remote = fakeRemoteHost({
+      startError: "The tailscale CLI is not on this machine's PATH or at /usr/local/bin/tailscale.",
+    });
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+    const result = await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    );
+
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain("tailscale CLI is not on this machine");
+    expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
+  });
+
+  it("retries cleanup on a host that was offline when its review was cancelled", async () => {
+    const remote = fakeRemoteHost();
+    let offline = false;
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: (call) => {
+        if (offline && call.method !== "startReview") throw new Error("host offline");
+        return remote.call(call);
+      },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+
+    offline = true;
+    await host.harness.callRpc("cancelReview", { threadId: "thread-1", sessionId: reviewId });
+    await sentReview(host);
+    await vi.waitFor(async () =>
+      expect(await host.bb.storage.kv.list("host-cleanup:")).toEqual([`host-cleanup:${reviewId}`]),
+    );
+    // The queue is in KV, so it survives a plugin restart.
+    const reloaded = await host.harness.lifecycle.reload(plugin);
+    offline = false;
+    const service = reloaded.harness.behavior.runService("review-delivery");
+    await vi.waitFor(async () =>
+      expect(await reloaded.bb.storage.kv.list("host-cleanup:")).toEqual([]),
+    );
+    expect(reloaded.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method).slice(-2)).toEqual([
+      "stopReview",
+      "reconcile",
+    ]);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("reconciles the host when a fresh worker no longer knows the review", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+
+    remote.state = { status: "unknown" };
+    remote.stopped = false;
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", {
+      sessionId: reviewId,
+    });
+
+    const sent = await sentReview(host);
+    expect(String((sent[0] as { input: Array<{ text: string }> }).input[0]!.text)).toContain(
+      '"decision":"cancelled"',
+    );
+    await vi.waitFor(() =>
+      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain(
+        "reconcile",
+      ),
+    );
+    await vi.waitFor(async () => expect(await host.bb.storage.kv.list("host-cleanup:")).toEqual([]));
+  });
+
+  it("cleans up the host when the start call fails after the host may have started", async () => {
+    const remote = fakeRemoteHost({ startError: "Host RPC timed out after 60000ms" });
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+    const result = await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    );
+
+    expect(result).toMatchObject({ isError: true });
+    const startCall = host.harness.inspection.experimental_hostRpcCalls[0]!;
+    await vi.waitFor(() =>
+      expect(host.harness.inspection.experimental_hostRpcCalls.slice(1)).toEqual([
+        expect.objectContaining({ method: "stopReview", input: { sessionId: (startCall.input as { sessionId: string }).sessionId } }),
+        expect.objectContaining({ method: "reconcile" }),
+      ]),
+    );
+  });
+
+  it("retries a failed upstream release lookup after five minutes, not six hours", async () => {
+    let now = Date.parse("2026-10-14T12:00:00Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    let releases = 0;
+    vi.stubGlobal("fetch", async () => {
+      releases += 1;
+      return releases === 1 ? new Response("rate limited", { status: 403 }) : Response.json({ tag_name: "v0.29.0" });
+    });
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const review = async (threadId: string) => {
+      await host.harness.behavior.callAgentTool(
+        "plannotator_review_plan",
+        { planMarkdown: "# Plan" },
+        { threadId, projectId: "project-1" },
+      );
+      return (await host.harness.callRpc("getActiveReview", { threadId })) as { dismissUpdateVersion?: string };
+    };
+
+    expect((await review("thread-a")).dismissUpdateVersion).toBeUndefined();
+    now += 60_000;
+    expect((await review("thread-b")).dismissUpdateVersion).toBeUndefined();
+    expect(releases).toBe(1);
+    now += 5 * 60_000;
+    expect((await review("thread-c")).dismissUpdateVersion).toBe("0.29.0");
+    expect(releases).toBe(2);
+    vi.restoreAllMocks();
+  });
+
+  it("stops a host review left pending by a plugin restart", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireInteractionSdk(host);
+    const reviewId = "bb883ad4-4ff7-4183-96eb-6250ae380c3a";
+    await host.bb.storage.kv.set(`review:${reviewId}`, {
+      id: reviewId,
+      threadId: "thread-1",
+      hostId: "host_mac",
+      status: "pending",
+      updatedAt: Date.now(),
+    });
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await sentReview(host);
+    service.controller.abort();
+    await service.done;
+
+    expect(host.harness.inspection.experimental_hostRpcCalls).toContainEqual(
+      expect.objectContaining({ method: "stopReview", hostId: "host_mac", input: { sessionId: reviewId } }),
+    );
   });
 });

@@ -41,8 +41,44 @@ upstream port when the network allows it.
 
 If you choose **Open externally** over plain HTTP, allow the `19432-19441` port
 range between the Tailscale client and the BB machine. With the recommended
-Tailscale Serve setup, no additional Plannotator port mapping is required; this
-plugin does not modify the machine's Tailscale configuration.
+Tailscale Serve setup, no additional Plannotator port mapping is required on
+the BB server machine; the plugin changes Tailscale configuration only on
+other hosts, as described below.
+
+## Threads on other machines
+
+A review runs where the thread runs, in the thread's worktree, so linked
+documents, repository info, and plan history come from that checkout.
+
+- **Server machine:** the plugin starts Plannotator in the BB server process,
+  as above, with the worktree as its working directory.
+- **Any other bb host:** the plugin's `bb.host` entry starts `plannotator`
+  from that host's `PATH` (never the bundled download) on a random loopback
+  port, and a small proxy in the host worker on a loopback port in
+  `19500-19509`. It publishes the proxy with
+  `tailscale serve --bg --https=<port> http://127.0.0.1:<port>` and the panel
+  iframes `https://<host MagicDNS name>:<port>` directly. The host needs the
+  `tailscale` CLI on `PATH` or at `/usr/local/bin/tailscale`, signed in with
+  MagicDNS and HTTPS certificates enabled. Without it, the tool returns an
+  error; it does not fall back to the server.
+
+The host entry removes the serve mapping and stops Plannotator when the
+review ends, is cancelled, or its worker stops. It records every process and
+serve mapping it creates; a new worker removes recorded leftovers that still
+proxy to `http://127.0.0.1:<same port>`, and never touches other serve
+mappings. If a review moves to the next free port, a foreign mapping is left
+alone. It never uses `tailscale funnel`. Decisions arrive by host signal,
+backed by status polling; if the host disconnects or its worker dies, the
+thread receives a cancellation message. Plan history on each host lives in the
+plugin's host data directory.
+
+The tailnet is the trust boundary, as for BB itself: anyone who can reach the
+host's tailnet name can use the review while it is open. The proxy answers
+only requests addressed to `<MagicDNS name>:<port>` (blocking DNS rebinding)
+and accepts writes only from that origin (blocking cross-site requests from
+other web pages). It also denies upstream endpoints a review never needs from
+another device (host control, editor and note-app integrations, file reads
+outside the worktree, custom save paths).
 
 ## Boundary
 

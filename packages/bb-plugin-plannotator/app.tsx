@@ -23,7 +23,8 @@ import {
 import {
   PLANNOTATOR_RELAY_PATH,
   embeddedSessionUrl,
-  upstreamOnboardingCookie,
+  sharedCookieDomain,
+  upstreamOnboardingCookies,
 } from "./src/embedded";
 
 type PlannotatorPayload = {
@@ -33,6 +34,7 @@ type PlannotatorPayload = {
   sessionUrl: string;
   relayPath: typeof PLANNOTATOR_RELAY_PATH;
   title: string;
+  dismissUpdateVersion?: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -47,7 +49,8 @@ function parsePayload(value: unknown): PlannotatorPayload | null {
     typeof value.threadId !== "string" ||
     typeof value.sessionUrl !== "string" ||
     (value.relayPath !== undefined && value.relayPath !== PLANNOTATOR_RELAY_PATH) ||
-    typeof value.title !== "string"
+    typeof value.title !== "string" ||
+    (value.dismissUpdateVersion !== undefined && typeof value.dismissUpdateVersion !== "string")
   ) {
     return null;
   }
@@ -64,6 +67,7 @@ function parsePayload(value: unknown): PlannotatorPayload | null {
     sessionUrl: value.sessionUrl,
     relayPath: PLANNOTATOR_RELAY_PATH,
     title: value.title,
+    ...(value.dismissUpdateVersion ? { dismissUpdateVersion: value.dismissUpdateVersion } : {}),
   };
 }
 
@@ -222,11 +226,11 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
     };
   }, [embeddedUrl, reloadKey]);
 
-  // The upstream runtime stores its one-time announcement dismissal in a
-  // cookie. Prime that cookie from BB before mounting the iframe. HTTPS pages
-  // use the same-origin relay; plain HTTP pages rewrite loopback URLs to the
-  // browser-facing hostname. This keeps the real upstream UI while removing
-  // standalone-browser onboarding from the embedded workflow.
+  // The upstream runtime stores its one-time dialog dismissals in cookies.
+  // Prime them from BB before mounting the iframe: host-only for the relay,
+  // and on the shared parent domain for a session on another tailnet host.
+  // This keeps the real upstream UI while removing standalone-browser
+  // onboarding from the embedded workflow.
   useLayoutEffect(() => {
     setCanceling(false);
     if (!payload) {
@@ -234,7 +238,12 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
       return;
     }
 
-    document.cookie = upstreamOnboardingCookie();
+    for (const cookie of upstreamOnboardingCookies({
+      domain: sharedCookieDomain(window.location.hostname, payload.sessionUrl),
+      dismissUpdateVersion: payload.dismissUpdateVersion,
+    })) {
+      document.cookie = cookie;
+    }
     setEmbeddedUrl(
       embeddedSessionUrl(payload.sessionUrl, payload.sessionId, {
         hostname: window.location.hostname,
@@ -242,7 +251,7 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
         origin: window.location.origin,
       }),
     );
-  }, [payload?.sessionId, payload?.sessionUrl]);
+  }, [payload?.sessionId, payload?.sessionUrl, payload?.dismissUpdateVersion]);
 
   if (!payload) return <EmptyPanel />;
 

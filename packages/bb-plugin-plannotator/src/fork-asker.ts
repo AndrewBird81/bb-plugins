@@ -5,7 +5,7 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 type Threads = BbPluginApi["sdk"]["threads"];
-export type ForkAskerThreads = Pick<Threads, "fork" | "send" | "output" | "stop" | "archive" | "list"> & {
+export type ForkAskerThreads = Pick<Threads, "fork" | "send" | "wait" | "output" | "stop" | "archive" | "list"> & {
   events: Pick<Threads["events"], "list" | "wait">;
 };
 
@@ -16,6 +16,8 @@ export const MAX_QA_SUMMARY_CHARS = 4_000;
 const MAX_QA_QUESTION_CHARS = 400;
 const MAX_QA_ANSWER_CHARS = 800;
 const EVENT_WAIT_MS = 60_000;
+/** A new fork starts its provider session before it can take a turn. */
+const FORK_READY_MS = 2 * 60_000;
 
 export type AskExchange = { question: string; answer?: string; error?: string };
 
@@ -158,12 +160,15 @@ export function createForkAsker(options: {
         fork.catch(() => forks.delete(chatId));
       }
       forkId = await fork;
-      // An idle fork, then the question as a new turn: waiting from the
-      // sequence before it cannot match a turn copied from the source.
+      // Start the question as a turn of an idle fork. A send to a fork that
+      // is still starting would be queued, and a hidden fork's queue does not
+      // drain on its own. Waiting from the sequence before the send cannot
+      // match a turn copied from the source.
+      await threads.wait({ threadId: forkId, status: "idle", timeoutMs: FORK_READY_MS, signal });
       const afterSeq = await latestSequence(threads, forkId);
       await threads.send({
         threadId: forkId,
-        mode: "queue-if-active",
+        mode: "start",
         input: [{ type: "text", text: question.text, mentions: [] }],
       });
       const completed = await waitForTurn(forkId, afterSeq, signal);

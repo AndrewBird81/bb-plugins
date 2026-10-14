@@ -37,6 +37,10 @@ function fakeThreads(
       forks += 1;
       return { id: `fork-${forks}` };
     },
+    async wait(args: Record<string, unknown>) {
+      calls.push({ method: "wait", args: { threadId: args.threadId, status: args.status } });
+      return {};
+    },
     async send(args: Record<string, unknown>) {
       calls.push({ method: "send", args });
       seq += 5;
@@ -101,14 +105,16 @@ describe("ForkAsker", () => {
         sourceSeqEnd: 42,
       },
     });
-    expect(methods(calls)).toEqual(["fork", "events.list", "send", "events.wait", "output"]);
-    expect(calls[2]!.args).toMatchObject({
+    expect(methods(calls)).toEqual(["fork", "wait", "events.list", "send", "events.wait", "output"]);
+    // The question starts a turn once the fork is idle, never a queued message.
+    expect(calls[1]!.args).toEqual({ threadId: "fork-1", status: "idle" });
+    expect(calls[3]!.args).toMatchObject({
       threadId: "fork-1",
-      mode: "queue-if-active",
+      mode: "start",
       input: [{ type: "text", text: ASK_TEXT, mentions: [] }],
     });
     // The wait starts after the sequence read before the question was sent.
-    expect(calls[3]!.args).toMatchObject({ threadId: "fork-1", type: "turn/completed", afterSeq: "100" });
+    expect(calls[4]!.args).toMatchObject({ threadId: "fork-1", type: "turn/completed", afterSeq: "100" });
     expect(asker.exchanges()).toEqual([{ question: "Why step 1?", answer: "Because it is first." }]);
   });
 

@@ -907,6 +907,31 @@ describe("BB upstream Plannotator bridge", () => {
     expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
   });
 
+  it("stops retrying a result whose thread was archived before delivery", async () => {
+    const { host } = await hostPlugin();
+    host.harness.sdk.stub("threads.send", () => {
+      throw new Error("HTTP 409: Thread is archived");
+    });
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thread-1", archivedAt: Date.now() }));
+    const reviewId = "bb883ad4-4ff7-4183-96eb-6250ae380c3a";
+    await host.bb.storage.kv.set(`review:${reviewId}`, {
+      id: reviewId,
+      threadId: "thread-1",
+      kind: "plan",
+      initiator: "agent",
+      status: "ready",
+      result: { reviewId, source: "plannotator", decision: "approved" },
+      updatedAt: Date.now(),
+    });
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await vi.waitFor(async () =>
+      expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({ status: "closed" }),
+    );
+    service.controller.abort();
+    await service.done;
+  });
+
   it("forgets closed records after the delivered-record retention", async () => {
     const { host } = await hostPlugin();
     const old = Date.now() - 31 * 24 * 60 * 60 * 1000;
@@ -1101,6 +1126,7 @@ describe("BB upstream Plannotator bridge", () => {
       lastQuestion.set(input.threadId, input.input[0]!.text);
       return { ok: true, delivery: "started" } as never;
     });
+    host.harness.sdk.stub("threads.wait", async () => ({}) as never);
     host.harness.sdk.stub("threads.events.wait", () => ({ seq: 50, type: "turn/completed", data: { status: "completed" } }) as never);
     host.harness.sdk.stub("threads.output", (args) => {
       const question = lastQuestion.get((args as unknown as { threadId: string }).threadId) ?? "";

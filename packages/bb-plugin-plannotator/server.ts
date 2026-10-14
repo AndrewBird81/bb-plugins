@@ -745,7 +745,15 @@ export default async function plugin(bb: BbPluginApi) {
         updatedAt: Date.now(),
       } satisfies StoredReview);
     } catch (error) {
-      bb.log.warn(`Could not deliver Plannotator review ${record.id}: ${String(error)}`);
+      // An archived or deleted thread takes no message: stop retrying.
+      const thread = await bb.sdk.threads.get({ threadId: record.threadId }).catch(() => null);
+      if (thread && (thread.archivedAt !== null || thread.deletedAt !== null)) {
+        await bb.storage.kv
+          .set(reviewKey(record.id), { ...record, status: "closed", updatedAt: Date.now() } satisfies StoredReview)
+          .catch(() => undefined);
+      } else {
+        bb.log.warn(`Could not deliver Plannotator review ${record.id}: ${String(error)}`);
+      }
     } finally {
       delivering.delete(record.id);
     }

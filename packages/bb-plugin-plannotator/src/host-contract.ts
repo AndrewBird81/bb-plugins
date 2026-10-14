@@ -86,6 +86,14 @@ export type SessionResult = z.infer<typeof sessionResultSchema>;
 
 const sessionIdSchema = z.object({ sessionId: z.string().uuid() }).strict();
 
+/**
+ * Who Plannotator's "Ask this session" bridge says it is talking to. Upstream
+ * knows no `bb` or `codex` value; `opencode` has the fewest side effects.
+ */
+export const bridgeHostSchema = z.enum(["claude-code", "pi", "opencode"]);
+export type BridgeHost = z.infer<typeof bridgeHostSchema>;
+export const BRIDGE_PATHS = ["/api/ai/bridge/poll", "/api/ai/bridge/event"] as const;
+
 export const hostReviewStateSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("pending") }).strict(),
   z
@@ -117,6 +125,8 @@ export const hostContract = defineRpcContract({
         session: sessionRequestSchema,
         /** The bb page's origin, the only other page allowed to frame the review. */
         frameAncestor: z.string().url().max(2048).optional(),
+        /** Ask AI answered by the thread's agent through the session bridge. */
+        bridgeHost: bridgeHostSchema.optional(),
       })
       .strict(),
     output: z
@@ -130,6 +140,21 @@ export const hostContract = defineRpcContract({
   stopReview: {
     input: sessionIdSchema,
     output: z.object({ stopped: z.boolean() }).strict(),
+  },
+  /**
+   * One request of the session bridge, sent to Plannotator on loopback with
+   * the bearer token the host generated. The token never leaves the host.
+   */
+  bridgeFetch: {
+    input: z
+      .object({
+        sessionId: z.string().uuid(),
+        path: z.enum(BRIDGE_PATHS),
+        body: z.string().max(2 * 1024 * 1024),
+        waitMs: z.number().int().min(0).max(25_000).optional(),
+      })
+      .strict(),
+    output: z.object({ status: z.number().int(), body: z.string() }).strict(),
   },
   /** Remove stale serve mappings and orphan processes from a dead worker. */
   reconcile: {

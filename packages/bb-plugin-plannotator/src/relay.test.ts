@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { createFakePluginHost, type FakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { createRequestFilter } from "./request-filter";
 import {
   PLANNOTATOR_RELAY_ROUTE,
   createPlannotatorRelayHandler,
@@ -23,6 +24,11 @@ afterEach(async () => {
     ),
   );
 });
+
+async function relaySessions(url: string) {
+  const filter = await createRequestFilter({ cwd: process.cwd(), allowedRoots: [process.cwd()] });
+  return new Map([["session-1", { url, filter }]]);
+}
 
 async function startUpstreamServer(): Promise<string> {
   const server = createServer((request, response) => {
@@ -100,7 +106,7 @@ describe("Plannotator same-origin relay", () => {
     const upstreamBaseUrl = await startUpstreamServer();
     const host = createFakePluginHost({ pluginId: "plannotator" });
     hosts.push(host);
-    const sessions = new Map([["session-1", upstreamBaseUrl]]);
+    const sessions = await relaySessions(upstreamBaseUrl);
     registerPlannotatorRelayRoutes(host.bb, sessions);
 
     const html = await host.harness.fetchHttp(
@@ -134,7 +140,7 @@ describe("Plannotator same-origin relay", () => {
     const upstreamBaseUrl = await startUpstreamServer();
     const host = createFakePluginHost({ pluginId: "plannotator" });
     hosts.push(host);
-    const sessions = new Map([["session-1", upstreamBaseUrl]]);
+    const sessions = await relaySessions(upstreamBaseUrl);
     registerPlannotatorRelayRoutes(host.bb, sessions);
 
     const unknown = await host.harness.fetchHttp(
@@ -157,7 +163,7 @@ describe("Plannotator same-origin relay", () => {
     const upstreamBaseUrl = await startUpstreamServer();
     const host = createFakePluginHost({ pluginId: "plannotator" });
     hosts.push(host);
-    registerPlannotatorRelayRoutes(host.bb, new Map([["session-1", upstreamBaseUrl]]), () => "https://bb.example.ts.net");
+    registerPlannotatorRelayRoutes(host.bb, await relaySessions(upstreamBaseUrl), () => "https://bb.example.ts.net");
     const post = async (headers: Record<string, string>) =>
       (
         await host.harness.fetchHttp("POST", `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=%2Fapi%2Fplan`, {

@@ -1,5 +1,10 @@
 import type { BbPluginApi, PluginHttpHandler } from "@get-bb/plugin-sdk";
 import { PLANNOTATOR_RELAY_PATH } from "./constants";
+import {
+  MAX_DECISION_BODY_BYTES,
+  rewriteDecisionBody,
+  type RequestFilter,
+} from "./request-filter";
 
 /** The single BB route used when the browser can only reach BB's origin. */
 export const PLANNOTATOR_RELAY_ROUTE = "/review";
@@ -18,7 +23,9 @@ const HOP_BY_HOP_HEADERS = [
   "upgrade",
 ];
 
-type RelaySessionMap = Map<string, string>;
+/** A session BB relays: Plannotator's loopback URL and its request filter. */
+export type RelaySession = { url: string; filter: RequestFilter };
+type RelaySessionMap = Map<string, RelaySession>;
 type RelayContext = Parameters<PluginHttpHandler>[0];
 type FetchLike = typeof fetch;
 
@@ -78,6 +85,12 @@ function copyResponseHeaders(
 ): Headers {
   const headers = new Headers(response.headers);
   for (const header of HOP_BY_HOP_HEADERS) headers.delete(header);
+  // The relay answers on BB's origin; never let upstream grant it to others.
+  const grants: string[] = [];
+  headers.forEach((_value, name) => {
+    if (name.startsWith("access-control-allow-")) grants.push(name);
+  });
+  for (const name of grants) headers.delete(name);
   if (options.html) {
     // The embedded document is served by BB's origin and receives our inline
     // transport bootstrap. Upstream CSP/frame headers would otherwise block
@@ -226,21 +239,11 @@ export function injectRelayBootstrap(
   return `${html.slice(0, insertAt)}${script}${html.slice(insertAt)}`;
 }
 
-/**
- * Whether a request may write through the relay. Only the bb page may: its
- * origin, or no Origin with `Sec-Fetch-Site: same-origin`. A sandboxed
- * document inside the review (an annotated HTML file) sends `Origin: null`.
- */
-export function isRelayWriteAllowed(
-  request: Request,
-  bbOrigin: string | undefined,
-): boolean {
-  if (request.method === "GET" || request.method === "HEAD") return true;
-  const origin = request.headers.get("origin");
-  if (origin === null) return request.headers.get("sec-fetch-site") === "same-origin";
-  const host = request.headers.get("host");
-  const allowed = [bbOrigin, host ? `https://${host}` : undefined, host ? `http://${host}` : undefined];
-  return allowed.some((candidate) => candidate !== undefined && candidate.toLowerCase() === origin.toLowerCase());
+/** Origins a page on BB may write from: the relay's own and the bb page's. */
+function relayOrigins(host: string | undefined, bbOrigin: string | undefined): string[] {
+  const origins = bbOrigin ? [bbOrigin] : [];
+  if (host) origins.push(`https://${host}`, `http://${host}`);
+  return origins;
 }
 
 export function createPlannotatorRelayHandler(
@@ -252,30 +255,43 @@ export function createPlannotatorRelayHandler(
   return async (context: RelayContext) => {
     const sessionId = context.req.query("sessionId")?.trim() ?? "";
     const path = context.req.query("path") ?? "/";
-    const upstreamBaseUrl = sessions.get(sessionId);
-    if (!sessionId || !upstreamBaseUrl) {
+    const session = sessions.get(sessionId);
+    if (!sessionId || !session) {
       return errorResponse("Unknown or expired Plannotator session", 404);
     }
+    const upstreamBaseUrl = session.url;
 
-    const targetUrl = buildUpstreamUrl(upstreamBaseUrl, path);
-    if (!targetUrl) return errorResponse("Invalid Plannotator path", 400);
+    const requestedUrl = buildUpstreamUrl(upstreamBaseUrl, path);
+    if (!requestedUrl) return errorResponse("Invalid Plannotator path", 400);
 
     const request = context.req.raw;
-    // Before the Origin header is removed for upstream.
-    if (!isRelayWriteAllowed(request, bbOrigin())) {
-      return errorResponse("Cross-origin requests are not allowed.", 403);
-    }
+    // The same filter as the review proxy on a Mac. The relay always reaches
+    // Plannotator with a loopback Host (fetch derives it from the URL), so the
+    // filter's loopback-Host rewrite needs no action here: the bridge and
+    // host-control endpoints that check Host are denied, and the relay never
+    // forwards an Authorization header.
+    const decision = await session.filter({
+      method: request.method,
+      url: new URL(requestedUrl),
+      origin: request.headers.get("origin") ?? undefined,
+      secFetchSite: request.headers.get("sec-fetch-site") ?? undefined,
+      upgrade: request.headers.has("upgrade"),
+      allowedOrigins: relayOrigins(request.headers.get("host") ?? undefined, bbOrigin()),
+    });
+    if (!decision.allowed) return errorResponse(decision.message, decision.status);
+    const targetUrl = decision.url.toString();
+
     const requestHeaders = new Headers(request.headers);
     for (const header of [
-      // Never pass a browser's credentials on to Plannotator.
       "authorization",
-      "cookie",
       "connection",
       "content-length",
+      "cookie",
       "host",
       "origin",
       "referer",
       "transfer-encoding",
+      "upgrade",
       "x-forwarded-host",
       "x-forwarded-proto",
     ]) {
@@ -286,6 +302,15 @@ export function createPlannotatorRelayHandler(
     let body: ArrayBuffer | undefined;
     if (request.method !== "GET" && request.method !== "HEAD") {
       body = await request.arrayBuffer();
+      if (decision.decisionBody) {
+        if (body.byteLength > MAX_DECISION_BODY_BYTES) {
+          return errorResponse("Request body too large.", 413);
+        }
+        const rewritten = rewriteDecisionBody(new Uint8Array(body));
+        if (!rewritten) return errorResponse("Decision body must be a JSON object.", 400);
+        body = new Uint8Array(rewritten).buffer;
+        requestHeaders.set("content-type", "application/json");
+      }
     }
 
     let upstreamResponse: Response;

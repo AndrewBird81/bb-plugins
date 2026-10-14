@@ -15,6 +15,7 @@ import {
 import type { HostReviewState } from "./host-contract";
 import plugin, {
   bbPageOrigin,
+  bridgeHostForProvider,
   feedbackForBbAgent,
   reviewTargetFor,
   shouldUseRemotePlannotatorMode,
@@ -56,6 +57,7 @@ const ready = process.env.PLANNOTATOR_READY_FILE;
 fs.mkdirSync(path.dirname(ready), { recursive: true });
 fs.appendFileSync(ready, JSON.stringify({ url: "http://127.0.0.1:43210", isRemote: false, port: 43210 }) + "\\n");
 if (process.env.FAKE_PLANNOTATOR_CWD_FILE) fs.writeFileSync(process.env.FAKE_PLANNOTATOR_CWD_FILE, process.cwd());
+if (process.env.FAKE_PLANNOTATOR_ENV_FILE) fs.writeFileSync(process.env.FAKE_PLANNOTATOR_ENV_FILE, JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("PLANNOTATOR_")))));
 ${approveAfterMs === null
   ? "setInterval(() => undefined, 1000);"
   : `setTimeout(() => process.stdout.write(JSON.stringify({ approved: true }) + "\\n"), ${approveAfterMs});`}
@@ -150,6 +152,8 @@ function fakeRemoteHost(options: { startError?: string } = {}) {
       if (method === "getReview") return remote.state;
       if (method === "stopReview") return { stopped: remote.stopped };
       if (method === "reconcile") return { removedPorts: [], killedPids: [] };
+      // No session bridge unless a test sets one up.
+      if (method === "bridgeFetch") return { status: 404, body: "" };
       throw new Error(`unexpected host method ${method}`);
     },
   };
@@ -563,6 +567,35 @@ describe("BB upstream Plannotator bridge", () => {
     expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
   });
 
+  it("runs a remote BB's own sessions on loopback with the session bridge and sharing off", async () => {
+    vi.stubEnv("BB_APP_URL", "https://bb-server.example.ts.net");
+    const binary = await fakePlannotatorBinary({ approveAfterMs: null });
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), "bb-plannotator-worktree-")));
+    temporaryDirectories.push(worktree);
+    const envFile = join(worktree, "env.json");
+    vi.stubEnv("FAKE_PLANNOTATOR_ENV_FILE", envFile);
+    const host = createFakePluginHost({ pluginId: "plannotator", settings: { binaryPath: binary } });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_server", path: worktree });
+
+    await host.harness.behavior.callAgentTool("plannotator_review_plan", { planMarkdown: "# Plan" }, threadContext);
+
+    const env = JSON.parse(await readFile(envFile, "utf8")) as Record<string, string>;
+    expect(env).toMatchObject({
+      PLANNOTATOR_REMOTE: "0",
+      PLANNOTATOR_PORT: "19432-19441",
+      PLANNOTATOR_SHARE: "disabled",
+      PLANNOTATOR_SESSION_BRIDGE_HOST: "claude-code",
+      PLANNOTATOR_SESSION_BRIDGE_MODES: "turn",
+    });
+    expect(env.PLANNOTATOR_SESSION_BRIDGE_TOKEN!.length).toBeGreaterThanOrEqual(32);
+    // The token stays on the server: the browser's panel payload never carries it.
+    expect(JSON.stringify(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" }))).not.toContain(
+      env.PLANNOTATOR_SESSION_BRIDGE_TOKEN,
+    );
+  });
+
   it("runs a review on the thread's own host and delivers its signalled decision", async () => {
     const remote = fakeRemoteHost();
     const host = createFakePluginHost({
@@ -973,6 +1006,180 @@ describe("BB upstream Plannotator bridge", () => {
 
     const { tabs } = await host.bb.sdk.threads.tabs.get({ threadId: "thread-1" });
     expect(tabs.map((tab) => tab.id)).toEqual(["thread-info", sharedTab.id]);
+  });
+
+  /** A Mac host whose session bridge hands out the given questions once each. */
+  function askingRemoteHost(questions: Array<{ askId: string; text: string }>) {
+    const remote = fakeRemoteHost();
+    const events: Array<Record<string, unknown>> = [];
+    const queue = [...questions];
+    const base = remote.call;
+    return {
+      remote,
+      events,
+      async call(call: { method: string; input: unknown }) {
+        if (call.method !== "bridgeFetch") return base(call);
+        const input = call.input as { path: string; body: string };
+        if (input.path === "/api/ai/bridge/event") {
+          events.push(JSON.parse(input.body) as Record<string, unknown>);
+          return { status: 200, body: '{"ok":true}' };
+        }
+        const next = queue.shift();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { status: 200, body: JSON.stringify({ commands: next ? [{ type: "ask", mode: "turn", ...next }] : [] }) };
+      },
+    };
+  }
+
+  /** Fake bb threads for hidden forks: each question gets the answer it asks for. */
+  function wireForks(host: FakePluginHost) {
+    let forks = 0;
+    const lastQuestion = new Map<string, string>();
+    host.harness.sdk.stub("threads.events.list", () => [{ seq: 41 }] as never);
+    host.harness.sdk.stub("threads.fork", () => {
+      forks += 1;
+      return makeThreadResponse({ id: `thr_fork${forks}` });
+    });
+    host.harness.sdk.stub("threads.send", (args) => {
+      const input = args as unknown as { threadId: string; input: Array<{ text: string }> };
+      lastQuestion.set(input.threadId, input.input[0]!.text);
+      return { ok: true, delivery: "started" } as never;
+    });
+    host.harness.sdk.stub("threads.events.wait", () => ({ seq: 50, type: "turn/completed", data: { status: "completed" } }) as never);
+    host.harness.sdk.stub("threads.output", (args) => {
+      const question = lastQuestion.get((args as unknown as { threadId: string }).threadId) ?? "";
+      return { output: `The thread says: ${question.split("\n").at(-1)}` };
+    });
+    host.harness.sdk.stub("threads.stop", async () => ({}) as never);
+    host.harness.sdk.stub("threads.archive", async () => makeThreadResponse({ id: "x" }) as never);
+  }
+
+  it("maps thread providers to the session bridge's host values", () => {
+    expect(bridgeHostForProvider("claude-code")).toBe("claude-code");
+    expect(bridgeHostForProvider("pi")).toBe("pi");
+    expect(bridgeHostForProvider("omp")).toBe("pi");
+    expect(bridgeHostForProvider("codex")).toBe("opencode");
+    expect(bridgeHostForProvider(null)).toBe("opencode");
+  });
+
+  it("answers Ask AI in a hidden fork of the thread and adds the Q&A to the result message", async () => {
+    const asking = askingRemoteHost([
+      { askId: "chat-1:1", text: "[Plannotator Ask AI] header\nSurface: plan review\n\nWhat did I ask for first?" },
+    ]);
+    const host = createFakePluginHost({ pluginId: "plannotator", experimental_callHostRpc: asking.call });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    wireForks(host);
+
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+      method: "startReview",
+      input: { bridgeHost: "claude-code" },
+    });
+
+    await vi.waitFor(() => expect(asking.events.map(({ type }) => type)).toEqual(["started", "delta", "done"]));
+    expect(asking.events[2]).toEqual({
+      type: "done",
+      askId: "chat-1:1",
+      answer: "The thread says: What did I ask for first?",
+    });
+    expect(host.harness.sdk.callsTo("threads.fork")[0]![0]).toMatchObject({
+      sourceThreadId: "thread-1",
+      lifecycleOwnerThreadId: "thread-1",
+      visibility: "hidden",
+      sourceSeqEnd: 41,
+    });
+    // The bridge's polls go through the host with room for a 25 s long-poll.
+    const poll = host.harness.inspection.experimental_hostRpcCalls.find(
+      ({ method, input }) => method === "bridgeFetch" && (input as { path: string }).path === "/api/ai/bridge/poll",
+    );
+    expect(poll).toMatchObject({ hostId: "host_mac", input: { sessionId: reviewId, waitMs: 25_000 } });
+
+    asking.remote.state = { status: "decided", decision: { approved: true } };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+    let text = "";
+    await vi.waitFor(() => {
+      const toThread = host.harness.sdk.callsTo("threads.send").find(
+        (call) => (call[0] as { threadId: string }).threadId === "thread-1",
+      );
+      expect(toThread).toBeDefined();
+      text = String((toThread![0] as { input: Array<{ text: string }> }).input[0]!.text);
+    });
+    expect(text).toContain("Ask AI exchanges during this review (answered in a hidden fork of this thread):");
+    expect(text).toContain("1. Q: What did I ask for first?\n   A: The thread says: What did I ask for first?");
+    expect(text).not.toContain("askAiSummary");
+    // The session settled: its fork is stopped and archived.
+    await vi.waitFor(() => expect(host.harness.sdk.callsTo("threads.archive")).toContainEqual([{ threadId: "thr_fork1" }]));
+    expect(host.harness.sdk.callsTo("threads.stop")).toContainEqual([{ threadId: "thr_fork1" }]);
+  });
+
+  it("keeps the local Ask AI providers when the setting says local", async () => {
+    const asking = askingRemoteHost([{ askId: "chat-1:1", text: "q" }]);
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      settings: { askAiSource: "local" },
+      experimental_callHostRpc: asking.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+    await host.harness.behavior.callAgentTool("plannotator_review_plan", { planMarkdown: "# Plan" }, threadContext);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(host.harness.inspection.experimental_hostRpcCalls[0]!.input).not.toHaveProperty("bridgeHost");
+    expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).not.toContain("bridgeFetch");
+  });
+
+  it("archives Ask AI forks left by an earlier plugin when it starts", async () => {
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireInteractionSdk(host);
+    let listed = false;
+    host.harness.sdk.stub("threads.list", () => {
+      if (listed) return [];
+      listed = true;
+      return [
+        makeThreadResponse({ id: "thr_old_fork", originKind: "fork", originPluginId: "plannotator", visibility: "hidden" }),
+        makeThreadResponse({ id: "thr_side_chat", originKind: "fork", originPluginId: "side-chat", visibility: "hidden" }),
+      ];
+    });
+    host.harness.sdk.stub("threads.stop", async () => ({}) as never);
+    host.harness.sdk.stub("threads.archive", async () => makeThreadResponse({ id: "x" }) as never);
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await vi.waitFor(() => expect(host.harness.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "thr_old_fork" }]]));
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("annotates the last finished reply, not the text of a turn still running", async () => {
+    const { host } = await hostPlugin();
+    host.harness.sdk.stub("threads.output", () => ({ output: "Let me open that for you." }));
+    host.harness.sdk.stub("threads.events.list", (args) => {
+      const types = (args as unknown as { types: string[] }).types;
+      if (types[0] === "turn/started") {
+        return [{ seq: 90, type: "turn/started", scope: { kind: "turn", turnId: "turn-2" }, data: {} }] as never;
+      }
+      if (types[0] === "turn/completed") return [] as never;
+      return [
+        { seq: 70, type: "item/completed", data: { item: { type: "commandExecution" } } },
+        { seq: 60, type: "item/completed", data: { item: { type: "agentMessage", text: "The finished reply." } } },
+      ] as never;
+    });
+
+    await host.harness.behavior.callAgentTool("plannotator_annotate_reply", {}, threadContext);
+
+    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+      input: { session: { mode: "annotate-last", markdown: "The finished reply." } },
+    });
+    expect(host.harness.sdk.callsTo("threads.events.list")[2]![0]).toMatchObject({ beforeSeq: "90", order: "desc" });
   });
 
   it("tells the agent to resubmit with plannotator_review_plan, not upstream's plan tool", () => {

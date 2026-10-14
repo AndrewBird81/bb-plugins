@@ -2,8 +2,9 @@
 // review product. The released upstream binary owns the plan renderer,
 // annotations, history, and feedback formatting. BB supplies the agent tool,
 // embeds the upstream session, and delivers decisions in a later thread message.
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import {
   defineRpcContract,
@@ -17,6 +18,7 @@ import {
   fetchLatestUpstreamVersion,
   isSessionResult,
   missingBinaryMessage,
+  REMOTE_PORT_RANGE,
   resolvePlannotatorBinary,
   startUpstreamSession,
   type RunningUpstreamReview,
@@ -29,12 +31,16 @@ import {
   PLANNOTATOR_REALTIME_CHANNEL,
 } from "./src/constants";
 import { isLocalBindHostname } from "./src/embedded";
+import { runBridgeClient, type BridgeTransport } from "./src/bridge-client";
+import { createForkAsker, summarizeExchanges, sweepForks, type ForkAsker } from "./src/fork-asker";
+import { createRequestFilter } from "./src/request-filter";
 import {
   MAX_ANNOTATE_MARKDOWN,
   diffTypeSchema,
   gitRefSchema,
   hostContract,
   hostSignals,
+  type BridgeHost,
   type SessionRequest,
   type SessionResult,
 } from "./src/host-contract";
@@ -43,6 +49,7 @@ import { lastFinishedReply } from "./src/last-reply";
 import { SESSION_KINDS, resolveAnnotateTarget, sessionErrorOutput, type SessionKind } from "./src/session";
 import {
   registerPlannotatorRelayRoutes,
+  type RelaySession,
 } from "./src/relay";
 
 const titleSchema = z.string().trim().min(1).max(200);
@@ -148,6 +155,8 @@ type ActiveReview = {
   /** The thread was deleted or archived: deliver no decision. */
   discarded: boolean;
   settled?: Promise<void>;
+  /** Ask AI answered by the thread's agent: the bridge client and its forks. */
+  askAi?: { controller: AbortController; asker: ForkAsker };
 };
 
 const reviewResultSchema = z.object({
@@ -167,6 +176,8 @@ const reviewResultSchema = z.object({
   noop: z.boolean().optional(),
   /** What Plannotator printed when its result could not be read. */
   printedOutput: z.string().max(8_000).optional(),
+  /** Ask AI questions and answers during the session, for the agent. */
+  askAiSummary: z.string().max(8_000).optional(),
 });
 type ReviewResult = z.infer<typeof reviewResultSchema>;
 
@@ -259,22 +270,47 @@ async function resolveReviewContext(
   bb: BbPluginApi,
   threadId: string,
   signal: AbortSignal,
-): Promise<{ origin: UpstreamOrigin; target: ReviewTarget }> {
+): Promise<{ origin: UpstreamOrigin; providerId: string | null; target: ReviewTarget }> {
   let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
   try {
     thread = await bb.sdk.threads.get({ threadId, signal });
   } catch {
     // Without thread metadata, keep the original in-process behavior. The
     // provider identity is presentation-only.
-    return { origin: "codex", target: { kind: "server" } };
+    return { origin: "codex", providerId: null, target: { kind: "server" } };
   }
   const origin = upstreamOriginForProvider(thread.providerId);
-  if (!thread.environmentId) return { origin, target: { kind: "server" } };
+  if (!thread.environmentId) return { origin, providerId: thread.providerId, target: { kind: "server" } };
   const [environment, systemConfig] = await Promise.all([
     bb.sdk.environments.get({ environmentId: thread.environmentId, signal }),
     bb.sdk.system.config({ signal }),
   ]);
-  return { origin, target: reviewTargetFor(environment, systemConfig.primaryHostId) };
+  return {
+    origin,
+    providerId: thread.providerId,
+    target: reviewTargetFor(environment, systemConfig.primaryHostId),
+  };
+}
+
+/**
+ * The bridge host value for a thread's provider. It drives upstream's Ask AI
+ * label; there is no `bb` or `codex` value, and `opencode` advertises nothing.
+ */
+export function bridgeHostForProvider(providerId: string | null | undefined): BridgeHost {
+  const normalized = providerId?.trim().toLowerCase() ?? "";
+  if (normalized === "claude" || normalized.includes("claude-code")) return "claude-code";
+  if (normalized === "pi" || normalized === "omp" || normalized.includes("oh-my-pi")) return "pi";
+  return "opencode";
+}
+
+/** The thread's latest event sequence, where Ask AI forks are pinned. */
+async function latestThreadSequence(bb: BbPluginApi, threadId: string): Promise<number | undefined> {
+  try {
+    const rows = await bb.sdk.threads.events.list({ threadId, order: "desc", limit: "1" });
+    return rows[0]?.seq;
+  } catch {
+    return undefined;
+  }
 }
 
 function isHostReview(review: ActiveReview["review"]): review is HostSession {
@@ -473,12 +509,13 @@ export function reviewMessage(
   kind: SessionKind = "plan",
   initiator: SessionInitiator = "agent",
 ): string {
-  const { message, noop: _noop, printedOutput, ...summary } = result;
+  const { message, noop: _noop, printedOutput, askAiSummary, ...summary } = result;
   return [
     `Plannotator ${KIND_NOUN[kind]} ${result.reviewId} has finished.`,
     JSON.stringify(summary),
     ...(message ? [message] : []),
     ...(printedOutput ? [`What Plannotator printed:\n\n${printedOutput}`] : []),
+    ...(askAiSummary ? [askAiSummary] : []),
     closingSentence(kind, initiator),
   ].join("\n\n");
 }
@@ -595,6 +632,14 @@ export default async function plugin(bb: BbPluginApi) {
         `Use the bundled official runtime by default, or enter a path/command to override it. Set to \"${BUNDLED_BINARY}\" to restore the default.`,
       default: BUNDLED_BINARY,
     },
+    askAiSource: {
+      type: "select",
+      label: "Ask AI answers from",
+      description:
+        "thread: Plannotator's Ask AI is answered by the thread's own agent, in a hidden fork that knows the conversation. local: the AI tools installed on the thread's machine (Claude, Codex, Pi, OpenCode), which start without the conversation.",
+      options: ["thread", "local"],
+      default: "thread",
+    },
   });
 
   const hostClient = bb.hosts.experimental_client({
@@ -663,7 +708,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const activeReviews = new Map<string, ActiveReview>();
   const startingReviews = new Set<string>();
-  const relaySessions = new Map<string, string>();
+  const relaySessions = new Map<string, RelaySession>();
   const delivering = new Set<string>();
   let disposing = false;
 
@@ -736,6 +781,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.background.service("review-delivery", {
     async start(signal) {
+      // Forks a crashed or replaced plugin left behind. No session is open yet.
+      try {
+        const swept = await sweepForks(bb.sdk.threads, bb.pluginId, (message) => bb.log.warn(message));
+        if (swept > 0) bb.log.info(`Archived ${swept} Plannotator Ask AI fork(s) left from earlier sessions`);
+      } catch (error) {
+        bb.log.warn(`Could not sweep Plannotator Ask AI forks: ${String(error)}`);
+      }
       while (!signal.aborted) {
         try {
           await recoverReviews();
@@ -788,6 +840,11 @@ export default async function plugin(bb: BbPluginApi) {
         });
       }
     }
+    const askAiSummary = active.askAi
+      ? summarizeExchanges(active.askAi.asker.exchanges(), KIND_NOUN[active.kind])
+      : null;
+    if (askAiSummary) result = { ...result, askAiSummary };
+    void stopAskAi(active);
     relaySessions.delete(active.sessionId);
     await closeReviewPanel(bb, threadId, active.sessionId);
     // Panels opened manually from the thread action carry no session params,
@@ -902,6 +959,41 @@ export default async function plugin(bb: BbPluginApi) {
     return { mode: "annotate", path };
   }
 
+  /** Answer the session's Ask AI questions with the thread's agent. */
+  function startAskAi(
+    active: ActiveReview,
+    threadId: string,
+    transport: BridgeTransport,
+    sourceSeqEnd: number | undefined,
+  ): void {
+    const controller = new AbortController();
+    const asker = createForkAsker({
+      threads: bb.sdk.threads,
+      sourceThreadId: threadId,
+      ...(sourceSeqEnd !== undefined ? { sourceSeqEnd } : {}),
+      sessionId: active.sessionId,
+      log: (message) => bb.log.warn(message),
+    });
+    active.askAi = { controller, asker };
+    void runBridgeClient({
+      transport,
+      answer: (question, signal) => asker.ask(question, signal),
+      signal: controller.signal,
+      log: (message) => bb.log.info(`${message} (session ${active.sessionId})`),
+    }).catch((error: unknown) => {
+      bb.log.warn(`Plannotator bridge for ${active.sessionId} failed: ${String(error)}`);
+    });
+  }
+
+  /** Stop the bridge client and archive the session's forks. */
+  async function stopAskAi(active: ActiveReview): Promise<void> {
+    if (!active.askAi) return;
+    active.askAi.controller.abort();
+    await active.askAi.asker.dispose().catch((error: unknown) => {
+      bb.log.warn(`Could not archive Plannotator forks of ${active.sessionId}: ${String(error)}`);
+    });
+  }
+
   /**
    * Start a session of any kind for a thread. One session is open per thread.
    * Agent tools and the bb panel share this path.
@@ -925,10 +1017,16 @@ export default async function plugin(bb: BbPluginApi) {
     let upstream: RunningUpstreamReview | HostSession;
     let hostId: string | undefined;
     let annotatedPath: string | undefined;
+    let transport: BridgeTransport | undefined;
+    let relaySession: RelaySession | undefined;
+    let sourceSeqEnd: number | undefined;
     try {
-      const { origin, target } = await resolveReviewContext(bb, threadId, controller.signal);
+      const { origin, providerId, target } = await resolveReviewContext(bb, threadId, controller.signal);
       const session = await resolveSessionRequest(threadId, input, target, controller.signal);
       if (session.mode === "annotate") annotatedPath = session.path;
+      const { askAiSource } = await settings.get();
+      const bridgeHost = askAiSource === "thread" ? bridgeHostForProvider(providerId) : undefined;
+      if (bridgeHost) sourceSeqEnd = await latestThreadSequence(bb, threadId);
       if (target.kind === "host") {
         hostId = target.hostId;
         const systemConfig = await bb.sdk.system.config({ signal: controller.signal });
@@ -941,13 +1039,27 @@ export default async function plugin(bb: BbPluginApi) {
           cwd: target.cwd,
           origin,
           ...(frameAncestor ? { frameAncestor } : {}),
+          ...(bridgeHost ? { bridgeHost } : {}),
           signal: controller.signal,
           onCleanupNeeded: () => queueHostCleanup(target.hostId, sessionId),
         });
+        const hostTarget = target.hostId;
+        // The worker adds the token it generated; it never leaves the host.
+        if (bridgeHost) {
+          transport = (path, body, { waitMs, signal }) =>
+            hostClient.call(
+              "bridgeFetch",
+              { sessionId, path, body, ...(waitMs !== undefined ? { waitMs } : {}) },
+              { hostId: hostTarget, signal, timeoutMs: (waitMs ?? 0) + 10_000 },
+            );
+        }
       } else {
         const configuredPath = await getConfiguredPath(settings);
         const binaryPath = await resolveRuntimeBinary(bb, configuredPath, controller.signal);
         const runtimeConfig = await resolveUpstreamRuntimeConfig(bb, controller.signal);
+        const token = bridgeHost ? randomBytes(32).toString("base64url") : undefined;
+        // Loopback only, as on a Mac: upstream turns the bridge off in remote
+        // mode, and the relay is the only way in. Remote BB keeps its port range.
         upstream = await startUpstreamSession({
           binaryPath,
           session,
@@ -956,10 +1068,31 @@ export default async function plugin(bb: BbPluginApi) {
           signal: controller.signal,
           origin,
           dataDir: runtimeConfig.dataDir,
-          remote: runtimeConfig.remote,
+          remote: false,
+          ...(runtimeConfig.remote ? { portRange: REMOTE_PORT_RANGE } : {}),
+          disableSharing: runtimeConfig.remote,
+          ...(token && bridgeHost ? { bridge: { token, host: bridgeHost } } : {}),
           embedHost: resolveEmbedHost(bb),
           cwd: target.cwd,
         });
+        const cwd = target.cwd ?? process.cwd();
+        relaySession = {
+          url: upstream.url,
+          filter: await createRequestFilter({ cwd, allowedRoots: [cwd, join(tmpdir(), "plannotator")] }),
+        };
+        if (token) {
+          const base = `http://127.0.0.1:${upstream.port}`;
+          // No Origin header: upstream refuses bridge requests from a browser.
+          transport = async (path, body, { waitMs, signal }) => {
+            const response = await fetch(`${base}${path}`, {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+              body,
+              signal: AbortSignal.any([signal, AbortSignal.timeout((waitMs ?? 0) + 10_000)]),
+            });
+            return { status: response.status, body: await response.text() };
+          };
+        }
       }
     } catch (error) {
       options.signal?.removeEventListener("abort", abortStartup);
@@ -990,13 +1123,14 @@ export default async function plugin(bb: BbPluginApi) {
     });
     // Host reviews are published on their own machine; only in-process
     // listeners go through BB's relay.
-    if (!isHostReview(upstream)) relaySessions.set(sessionId, upstream.url);
+    if (relaySession) relaySessions.set(sessionId, relaySession);
     const active: ActiveReview = {
       sessionId, kind, initiator: options.initiator, payload, review: upstream, controller,
       cancelledByUser: false, discarded: false,
     };
     activeReviews.set(threadId, active);
     startingReviews.delete(threadId);
+    if (transport) startAskAi(active, threadId, transport, sourceSeqEnd);
 
     try {
       if (options.signal?.aborted || active.discarded || controller.signal.aborted) {
@@ -1024,6 +1158,7 @@ export default async function plugin(bb: BbPluginApi) {
       options.signal?.removeEventListener("abort", abortStartup);
       activeReviews.delete(threadId);
       relaySessions.delete(sessionId);
+      void stopAskAi(active);
       await Promise.allSettled([
         bb.storage.kv.delete(reviewKey(sessionId)),
         closeReviewPanel(bb, threadId, sessionId),
@@ -1166,6 +1301,7 @@ export default async function plugin(bb: BbPluginApi) {
     await Promise.allSettled([
       closeReviewPanel(bb, threadId, active.sessionId),
       active.review.stop(),
+      stopAskAi(active),
     ]);
     relaySessions.delete(active.sessionId);
     return active;
@@ -1208,11 +1344,13 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(async () => {
     disposing = true;
     await Promise.allSettled(
-      [...activeReviews.entries()].map(async ([threadId, { sessionId, review, controller, settled }]) => {
+      [...activeReviews.entries()].map(async ([threadId, active]) => {
+        const { sessionId, review, controller, settled } = active;
         controller.abort();
         await Promise.allSettled([
           closeReviewPanel(bb, threadId, sessionId),
           review.stop(),
+          stopAskAi(active),
         ]);
         if (settled) await settled;
       }),

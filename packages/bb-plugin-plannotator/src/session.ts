@@ -5,6 +5,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   sessionResultSchema,
+  type BridgeHost,
   type SessionMode,
   type SessionRequest,
   type SessionResult,
@@ -48,16 +49,37 @@ export function buildUpstreamInput(planMarkdown: string): string {
  * entries, never shell text. Upstream accepts a result file only as a
  * `result.json` under `<data dir>/claude-code-mod/`.
  */
+export type SessionBridgeConfig = { token: string; host: BridgeHost };
+
+const BRIDGE_ENV = [
+  "PLANNOTATOR_SESSION_BRIDGE_TOKEN",
+  "PLANNOTATOR_SESSION_BRIDGE_HOST",
+  "PLANNOTATOR_SESSION_BRIDGE_MODES",
+];
+
 export function buildSessionLaunch(
   request: SessionRequest,
-  options: { dataDir?: string; sessionId: string; remote: boolean },
+  options: {
+    dataDir?: string;
+    sessionId: string;
+    /** No uploads to the paste service, for sessions on the BB server. */
+    disableSharing: boolean;
+    /** Ask AI answered by the thread's agent; without it, local providers. */
+    bridge?: SessionBridgeConfig;
+  },
 ): SessionLaunch {
   const env: Record<string, string> = {};
   // The agent terminal is a shell in the browser. Never inherit a setting that
   // exposes it beyond loopback.
   const deleteEnv = ["PLANNOTATOR_AGENT_TERMINAL_REMOTE"];
-  // A remote (pod) session must not upload documents to the paste service.
-  if (options.remote) env.PLANNOTATOR_SHARE = "disabled";
+  if (options.disableSharing) env.PLANNOTATOR_SHARE = "disabled";
+  if (options.bridge) {
+    env.PLANNOTATOR_SESSION_BRIDGE_TOKEN = options.bridge.token;
+    env.PLANNOTATOR_SESSION_BRIDGE_HOST = options.bridge.host;
+    env.PLANNOTATOR_SESSION_BRIDGE_MODES = "turn";
+  } else {
+    deleteEnv.push(...BRIDGE_ENV);
+  }
   if (request.mode === "plan") {
     return { args: [], stdin: buildUpstreamInput(request.planMarkdown), env, deleteEnv, resultFile: null };
   }

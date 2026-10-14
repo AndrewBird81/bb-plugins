@@ -21,7 +21,12 @@ async function tempDir(prefix: string): Promise<string> {
 }
 
 const SESSION_ID = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
-const base = { dataDir: "/data", sessionId: SESSION_ID, remote: false };
+const base = { dataDir: "/data", sessionId: SESSION_ID, disableSharing: false };
+const BRIDGE_ENV = [
+  "PLANNOTATOR_SESSION_BRIDGE_TOKEN",
+  "PLANNOTATOR_SESSION_BRIDGE_HOST",
+  "PLANNOTATOR_SESSION_BRIDGE_MODES",
+];
 const resultFile = `/data/claude-code-mod/${SESSION_ID}/result.json`;
 
 describe("session launch", () => {
@@ -31,7 +36,26 @@ describe("session launch", () => {
     expect(JSON.parse(launch.stdin!)).toMatchObject({ tool_input: { plan: "# Plan" } });
     expect(launch.resultFile).toBeNull();
     expect(launch.env).toEqual({});
-    expect(launch.deleteEnv).toEqual(["PLANNOTATOR_AGENT_TERMINAL_REMOTE"]);
+    expect(launch.deleteEnv).toEqual(["PLANNOTATOR_AGENT_TERMINAL_REMOTE", ...BRIDGE_ENV]);
+  });
+
+  it("configures the session bridge for every mode, and clears inherited bridge settings without it", () => {
+    const bridge = { token: "t".repeat(43), host: "claude-code" as const };
+    for (const request of [
+      { mode: "plan" as const, planMarkdown: "x" },
+      { mode: "review" as const },
+      { mode: "annotate" as const, path: "/a.md" },
+      { mode: "annotate-last" as const, markdown: "x" },
+    ]) {
+      const launch = buildSessionLaunch(request, { ...base, bridge });
+      expect(launch.env).toMatchObject({
+        PLANNOTATOR_SESSION_BRIDGE_TOKEN: bridge.token,
+        PLANNOTATOR_SESSION_BRIDGE_HOST: "claude-code",
+        PLANNOTATOR_SESSION_BRIDGE_MODES: "turn",
+      });
+      expect(launch.deleteEnv).not.toContain("PLANNOTATOR_SESSION_BRIDGE_TOKEN");
+      expect(buildSessionLaunch(request, base).deleteEnv).toEqual(expect.arrayContaining(BRIDGE_ENV));
+    }
   });
 
   it("starts review with no remote check, and diff options only when given", () => {
@@ -41,6 +65,7 @@ describe("session launch", () => {
       env: { PLANNOTATOR_HOST_RESULT_FILE: resultFile, PLANNOTATOR_SKIP_AGENT_TERMINAL_INSTALL: "1" },
       deleteEnv: [
         "PLANNOTATOR_AGENT_TERMINAL_REMOTE",
+        ...BRIDGE_ENV,
         "PLANNOTATOR_CWD",
         "PLANNOTATOR_HOST_MESSAGES_FILE",
       ],
@@ -66,12 +91,12 @@ describe("session launch", () => {
     expect(launch.stdin).toBe("Reply text");
   });
 
-  it("disables sharing only for remote sessions and needs a data dir for results", () => {
-    expect(buildSessionLaunch({ mode: "plan", planMarkdown: "x" }, { ...base, remote: true }).env).toEqual({
+  it("disables sharing when asked and needs a data dir for results", () => {
+    expect(buildSessionLaunch({ mode: "plan", planMarkdown: "x" }, { ...base, disableSharing: true }).env).toEqual({
       PLANNOTATOR_SHARE: "disabled",
     });
     expect(
-      buildSessionLaunch({ mode: "annotate", path: "/a.html" }, { ...base, remote: true }).env.PLANNOTATOR_SHARE,
+      buildSessionLaunch({ mode: "annotate", path: "/a.html" }, { ...base, disableSharing: true }).env.PLANNOTATOR_SHARE,
     ).toBe("disabled");
     expect(buildSessionLaunch({ mode: "review" }, base).env.PLANNOTATOR_SHARE).toBeUndefined();
     expect(() => buildSessionLaunch({ mode: "review" }, { ...base, dataDir: undefined })).toThrow(

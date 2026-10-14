@@ -477,6 +477,24 @@ export default async function plugin(bb: BbPluginApi) {
     });
   });
 
+  // Host reviews whose stop did not reach their machine. Retried until the
+  // host answers: stop the review if its worker survived, then reconcile so a
+  // fresh worker removes the orphan process and serve mapping.
+  const pendingHostCleanups = new Map<string, { hostId: string; sessionId: string }>();
+  const queueHostCleanup = (hostId: string, sessionId: string) =>
+    pendingHostCleanups.set(sessionId, { hostId, sessionId });
+  async function retryHostCleanups(): Promise<void> {
+    for (const { hostId, sessionId } of [...pendingHostCleanups.values()]) {
+      try {
+        await hostClient.call("stopReview", { sessionId }, { hostId });
+        await hostClient.call("reconcile", {}, { hostId });
+        pendingHostCleanups.delete(sessionId);
+      } catch {
+        // Still unreachable; try again on the next delivery pass.
+      }
+    }
+  }
+
   let latestVersion: { value: string | null; fetchedAt: number } | null = null;
   async function latestUpstreamVersion(): Promise<string | undefined> {
     if (!latestVersion || Date.now() - latestVersion.fetchedAt > LATEST_VERSION_TTL_MS) {
@@ -537,11 +555,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (record.status === "pending") {
         if (activeReviews.get(record.threadId)?.sessionId === record.id) continue;
-        if (record.hostId) {
-          await hostClient
-            .call("stopReview", { sessionId: record.id }, { hostId: record.hostId })
-            .catch(() => undefined);
-        }
+        if (record.hostId) queueHostCleanup(record.hostId, record.id);
         await closeReviewPanel(bb, record.threadId, record.id);
         record = {
           ...record,
@@ -565,6 +579,7 @@ export default async function plugin(bb: BbPluginApi) {
       while (!signal.aborted) {
         try {
           await recoverReviews();
+          await retryHostCleanups();
         } catch (error) {
           if (!signal.aborted) bb.log.warn(`Could not recover Plannotator reviews: ${String(error)}`);
         }
@@ -690,6 +705,7 @@ export default async function plugin(bb: BbPluginApi) {
             cwd: target.cwd,
             origin,
             signal: controller.signal,
+            onStopFailed: () => queueHostCleanup(target.hostId, sessionId),
           });
         } else {
           const configuredPath = await getConfiguredPath(settings);

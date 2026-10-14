@@ -680,6 +680,40 @@ describe("BB upstream Plannotator bridge", () => {
     expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
   });
 
+  it("retries cleanup on a host that was offline when its review was cancelled", async () => {
+    const remote = fakeRemoteHost();
+    let offline = false;
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: (call) => {
+        if (offline && call.method !== "startReview") throw new Error("host offline");
+        return remote.call(call);
+      },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      { threadId: "thread-1", projectId: "project-1" },
+    ))) as { reviewId: string };
+
+    offline = true;
+    await host.harness.callRpc("cancelReview", { threadId: "thread-1", sessionId: reviewId });
+    await sentReview(host);
+    offline = false;
+    const service = host.harness.behavior.runService("review-delivery");
+    await vi.waitFor(() =>
+      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method).slice(-2)).toEqual([
+        "stopReview",
+        "reconcile",
+      ]),
+    );
+    service.controller.abort();
+    await service.done;
+  });
+
   it("stops a host review left pending by a plugin restart", async () => {
     const remote = fakeRemoteHost();
     const host = createFakePluginHost({

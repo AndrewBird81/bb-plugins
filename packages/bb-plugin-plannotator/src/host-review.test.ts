@@ -96,6 +96,32 @@ describe("host plan review handle", () => {
     await expect(review.result).rejects.toThrow("The Plannotator worker on the thread's machine exited.");
   });
 
+  it("reports a stop that could not reach the host", async () => {
+    const { client } = fakeClient([{ status: "pending" }]);
+    let stopFailed = 0;
+    const review = await startHostPlanReview({
+      client: {
+        call: (method, input, options) =>
+          method === "stopReview" ? Promise.reject(new Error("host offline")) : client.call(method, input, options),
+      },
+      hostId: "host_mac",
+      sessionId: SESSION_ID,
+      planMarkdown: "# Plan",
+      cwd: "/Users/me/repo",
+      origin: "codex",
+      signal: new AbortController().signal,
+      pollIntervalMs: 60_000,
+      onStopFailed: () => {
+        stopFailed += 1;
+      },
+    });
+    void review.result.catch(() => undefined);
+
+    await review.stop();
+
+    expect(stopFailed).toBe(1);
+  });
+
   it("stops the host review and rejects the result as cancelled", async () => {
     const { client, calls } = fakeClient([{ status: "pending" }]);
     const review = await start(client, 60_000);

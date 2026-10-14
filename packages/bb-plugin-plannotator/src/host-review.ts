@@ -39,6 +39,8 @@ export async function startHostPlanReview(options: {
   origin: UpstreamOrigin;
   signal: AbortSignal;
   pollIntervalMs?: number;
+  /** The host could not be told to stop, for example because it is offline. */
+  onStopFailed?: () => void;
 }): Promise<HostPlanReview> {
   const { client, hostId, sessionId } = options;
   const pollIntervalMs = options.pollIntervalMs ?? HOST_POLL_INTERVAL_MS;
@@ -133,7 +135,9 @@ export async function startHostPlanReview(options: {
       try {
         await client.call("stopReview", { sessionId }, { hostId, timeoutMs: HOST_CALL_TIMEOUT_MS });
       } catch {
-        // The host may be offline. Its worker stops reviews nobody polls.
+        // The host may be offline. Its worker stops reviews nobody polls,
+        // and the caller retries the cleanup when the host is back.
+        options.onStopFailed?.();
       }
     },
   };

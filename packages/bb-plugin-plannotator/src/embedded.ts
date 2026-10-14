@@ -2,14 +2,28 @@
  * Small host-side seams for embedding the official Plannotator runtime.
  *
  * Plannotator keeps its one-time UI announcements in cookies. BB's browser
- * page can share those cookies with the iframe only when both use the same
- * loopback hostname; ports are intentionally ignored by cookie scoping.
+ * page shares those cookies with the iframe when both use the same hostname,
+ * or through a Domain cookie on a parent domain both hosts share. Ports are
+ * ignored by cookie scoping, so one cookie covers every review port.
  */
 import { PLANNOTATOR_RELAY_PATH } from "./constants";
 
-export const UPSTREAM_LOOK_AND_FEEL_COOKIE =
-  "plannotator-look-feel-announcement-seen";
-export const UPSTREAM_LOOK_AND_FEEL_VERSION = "2";
+/**
+ * Upstream v0.28 first-run gates, each dismissed by one cookie value: the
+ * plan look chooser (current and legacy keys), Claude Code permission-mode
+ * setup, and the terminal-tools, "Ask this session" and agent-tool
+ * announcements. None of them applies to a review BB opened.
+ */
+export const UPSTREAM_DISMISSED_COOKIES: ReadonlyArray<readonly [string, string]> = [
+  ["plannotator-look-feel-announcement-seen", "2"],
+  ["plannotator-plan-look-choice-resolved", "true"],
+  ["plannotator-permission-mode-configured", "true"],
+  ["plannotator-announce-tui-herdr-seen", "1"],
+  ["plannotator-announce-ask-session-seen", "1"],
+  ["plannotator-announce-agent-tool-seen", "1"],
+];
+/** Upstream hides its update toast when this names the latest release. */
+export const UPSTREAM_UPDATE_DISMISSED_COOKIE = "update-dismissed-version";
 export { PLANNOTATOR_RELAY_PATH } from "./constants";
 
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
@@ -98,6 +112,53 @@ export function embeddedSessionUrl(
   return normalizeEmbeddedSessionUrl(sessionUrl, browserLocation.hostname);
 }
 
-export function upstreamOnboardingCookie(): string {
-  return `${UPSTREAM_LOOK_AND_FEEL_COOKIE}=${UPSTREAM_LOOK_AND_FEEL_VERSION}; path=/; max-age=31536000; SameSite=Lax`;
+function isIpLiteral(hostname: string): boolean {
+  return hostname.includes(":") || /^[\d.]+$/u.test(hostname);
+}
+
+/**
+ * The parent domain shared by the BB page and a session on another host, for
+ * example `tail1b968e.ts.net` for two tailnet machines. Null for the same
+ * host, IP literals, or hosts that share only a top-level label. Browsers
+ * reject a Domain cookie on a public suffix, so a wrong guess is harmless.
+ */
+export function sharedCookieDomain(pageHostname: string, sessionUrl: string): string | null {
+  let sessionHostname: string;
+  try {
+    sessionHostname = new URL(sessionUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  const pageHost = pageHostname.trim().toLowerCase();
+  if (!pageHost || pageHost === sessionHostname) return null;
+  if (isIpLiteral(pageHost) || isIpLiteral(sessionHostname)) return null;
+  const pageLabels = pageHost.split(".").reverse();
+  const sessionLabels = sessionHostname.split(".").reverse();
+  const shared: string[] = [];
+  for (let index = 0; index < Math.min(pageLabels.length, sessionLabels.length); index += 1) {
+    if (pageLabels[index] !== sessionLabels[index]) break;
+    shared.push(pageLabels[index]!);
+  }
+  return shared.length >= 2 ? shared.reverse().join(".") : null;
+}
+
+/**
+ * Cookies that pre-dismiss upstream first-run dialogs and, when the latest
+ * release is known, its update toast. Each is written host-only and, when
+ * given, on `domain` so a session on another tailnet host reads it too.
+ */
+export function upstreamOnboardingCookies(
+  options: { domain?: string | null; dismissUpdateVersion?: string } = {},
+): string[] {
+  const values: Array<readonly [string, string]> = [...UPSTREAM_DISMISSED_COOKIES];
+  if (options.dismissUpdateVersion) {
+    values.push([UPSTREAM_UPDATE_DISMISSED_COOKIE, options.dismissUpdateVersion]);
+  }
+  const scopes = ["", ...(options.domain ? [`; domain=${options.domain}`] : [])];
+  return scopes.flatMap((scope) =>
+    values.map(
+      ([name, value]) =>
+        `${name}=${encodeURIComponent(value)}; path=/; max-age=31536000; SameSite=Lax${scope}`,
+    ),
+  );
 }

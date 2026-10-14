@@ -44,6 +44,34 @@ range between the Tailscale client and the BB machine. With the recommended
 Tailscale Serve setup, no additional Plannotator port mapping is required; this
 plugin does not modify the machine's Tailscale configuration.
 
+## Threads on other machines
+
+A review runs where the thread runs, in the thread's worktree, so linked
+documents, repository info, and plan history come from that checkout.
+
+- **Server machine:** the plugin starts Plannotator in the BB server process,
+  as above, with the worktree as its working directory.
+- **Any other bb host:** the plugin's `bb.host` entry starts `plannotator`
+  from that host's `PATH` (never the bundled download), bound to loopback on
+  a port in `19500-19509`. It publishes the port with
+  `tailscale serve --bg --https=<port> http://127.0.0.1:<port>` and the panel
+  iframes `https://<host MagicDNS name>:<port>` directly. The host needs the
+  `tailscale` CLI on `PATH` or at `/usr/local/bin/tailscale`, signed in with
+  MagicDNS and HTTPS certificates enabled. Without it, the tool returns an
+  error; it does not fall back to the server.
+
+The host entry removes the serve mapping and stops Plannotator when the
+review ends, is cancelled, or its worker stops. On worker start it removes
+mappings left by a crashed worker, but only mappings in `19500-19509` that
+proxy to `http://127.0.0.1:<same port>`. It never touches other serve
+mappings. It never uses `tailscale funnel`. Decisions arrive by host signal,
+backed by status polling; if the host disconnects or its worker dies, the
+thread receives a cancellation message. Plan history on each host lives in the
+plugin's host data directory.
+
+Anyone who can reach the host's tailnet name can use the review while it is
+open, as with BB itself on a tailnet.
+
 ## Boundary
 
 BB does not intercept arbitrary provider text or require a plan review before

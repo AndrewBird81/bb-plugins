@@ -3,6 +3,7 @@
 // annotations, history, and feedback formatting. BB supplies the agent tool,
 // embeds the upstream session, and delivers decisions in a later thread message.
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   defineRpcContract,
@@ -13,6 +14,7 @@ import {
   BUNDLED_BINARY,
   DEFAULT_BINARY,
   ensureBundledPlannotatorBinary,
+  fetchLatestUpstreamVersion,
   missingBinaryMessage,
   resolvePlannotatorBinary,
   startUpstreamPlanReview,
@@ -26,6 +28,8 @@ import {
   PLANNOTATOR_REALTIME_CHANNEL,
 } from "./src/constants";
 import { isLocalBindHostname } from "./src/embedded";
+import { hostContract, hostSignals } from "./src/host-contract";
+import { startHostPlanReview, type HostPlanReview } from "./src/host-review";
 import {
   registerPlannotatorRelayRoutes,
 } from "./src/relay";
@@ -46,6 +50,8 @@ const interactionPayloadSchema = z
     sessionUrl: z.string().url(),
     relayPath: z.literal(PLANNOTATOR_RELAY_PATH),
     title: z.string().min(1),
+    /** Latest upstream release, so the panel can pre-dismiss its update toast. */
+    dismissUpdateVersion: z.string().min(1).max(64).optional(),
   })
   .strict();
 type ReviewPanelPayload = z.infer<typeof interactionPayloadSchema>;
@@ -83,7 +89,7 @@ export const rpcContract = defineRpcContract({
 type ActiveReview = {
   sessionId: string;
   payload: ReviewPanelPayload;
-  review: RunningUpstreamReview;
+  review: RunningUpstreamReview | HostPlanReview;
   controller: AbortController;
   cancelledByUser: boolean;
   deleted: boolean;
@@ -103,6 +109,8 @@ type ReviewResult = {
 const storedReviewSchema = z.object({
   id: z.string().uuid(),
   threadId: z.string().min(1),
+  /** Set when the review runs on another bb host. */
+  hostId: z.string().min(1).optional(),
   status: z.enum(["pending", "ready", "delivered"]),
   result: z.object({
     reviewId: z.string().uuid(),
@@ -119,6 +127,7 @@ type StoredReview = z.infer<typeof storedReviewSchema>;
 const REVIEW_KEY_PREFIX = "review:";
 const DELIVERED_REVIEW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DELIVERY_RETRY_MS = 30_000;
+const LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Map BB's provider ids to the identities the upstream UI knows how to name.
@@ -151,19 +160,56 @@ export function upstreamOriginForProvider(
   return "codex";
 }
 
-async function resolveUpstreamOrigin(
+/** Where a thread's review runs: in the server process, or on its own host. */
+export type ReviewTarget =
+  | { kind: "server"; cwd?: string }
+  | { kind: "host"; hostId: string; cwd: string };
+
+/**
+ * A thread on the server machine keeps the in-process runtime, in its
+ * worktree when that path exists here. Any other machine runs Plannotator
+ * through this plugin's host entry, which needs the worktree path.
+ */
+export function reviewTargetFor(
+  environment: { hostId: string; path: string | null },
+  primaryHostId: string | null,
+  pathExists: (path: string) => boolean = existsSync,
+): ReviewTarget {
+  if (!primaryHostId || environment.hostId === primaryHostId) {
+    return environment.path && pathExists(environment.path)
+      ? { kind: "server", cwd: environment.path }
+      : { kind: "server" };
+  }
+  if (!environment.path) {
+    throw new Error("The thread's environment has no workspace path on its machine.");
+  }
+  return { kind: "host", hostId: environment.hostId, cwd: environment.path };
+}
+
+async function resolveReviewContext(
   bb: BbPluginApi,
   threadId: string,
   signal: AbortSignal,
-): Promise<UpstreamOrigin> {
+): Promise<{ origin: UpstreamOrigin; target: ReviewTarget }> {
+  let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
   try {
-    const thread = await bb.sdk.threads.get({ threadId, signal });
-    return upstreamOriginForProvider(thread.providerId);
+    thread = await bb.sdk.threads.get({ threadId, signal });
   } catch {
-    // The provider identity is presentation-only. A failed metadata lookup
-    // must not prevent the review gate from opening.
-    return "codex";
+    // Without thread metadata, keep the original in-process behavior. The
+    // provider identity is presentation-only.
+    return { origin: "codex", target: { kind: "server" } };
   }
+  const origin = upstreamOriginForProvider(thread.providerId);
+  if (!thread.environmentId) return { origin, target: { kind: "server" } };
+  const [environment, systemConfig] = await Promise.all([
+    bb.sdk.environments.get({ environmentId: thread.environmentId, signal }),
+    bb.sdk.system.config({ signal }),
+  ]);
+  return { origin, target: reviewTargetFor(environment, systemConfig.primaryHostId) };
+}
+
+function isHostReview(review: ActiveReview["review"]): review is HostPlanReview {
+  return "hostId" in review;
 }
 
 export function shouldUseRemotePlannotatorMode(
@@ -410,6 +456,35 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const hostClient = bb.hosts.experimental_client({
+    contract: hostContract,
+    experimental_signals: hostSignals,
+  });
+  const activeHostReviews = (hostId: string) =>
+    [...activeReviews.values()]
+      .map(({ review }) => review)
+      .filter((review): review is HostPlanReview => isHostReview(review) && review.hostId === hostId);
+  hostClient.experimental_onSignal("reviewChanged", ({ hostId, payload }) => {
+    for (const review of activeHostReviews(hostId)) {
+      if (review.sessionId === payload.sessionId) review.refresh();
+    }
+  });
+  hostClient.experimental_onWorkerExit(({ hostId }) => {
+    for (const review of activeHostReviews(hostId)) review.workerExited();
+    // The next call starts a fresh worker, which removes what the dead one left.
+    void hostClient.call("reconcile", {}, { hostId }).catch((error: unknown) => {
+      bb.log.warn(`Could not reconcile Plannotator on ${hostId}: ${String(error)}`);
+    });
+  });
+
+  let latestVersion: { value: string | null; fetchedAt: number } | null = null;
+  async function latestUpstreamVersion(): Promise<string | undefined> {
+    if (!latestVersion || Date.now() - latestVersion.fetchedAt > LATEST_VERSION_TTL_MS) {
+      latestVersion = { value: await fetchLatestUpstreamVersion(), fetchedAt: Date.now() };
+    }
+    return latestVersion.value ?? undefined;
+  }
+
   const activeReviews = new Map<string, ActiveReview>();
   const startingReviews = new Set<string>();
   const relaySessions = new Map<string, string>();
@@ -462,6 +537,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
       if (record.status === "pending") {
         if (activeReviews.get(record.threadId)?.sessionId === record.id) continue;
+        if (record.hostId) {
+          await hostClient
+            .call("stopReview", { sessionId: record.id }, { hostId: record.hostId })
+            .catch(() => undefined);
+        }
         await closeReviewPanel(bb, record.threadId, record.id);
         record = {
           ...record,
@@ -589,41 +669,44 @@ export default async function plugin(bb: BbPluginApi) {
       }
       startingReviews.add(context.threadId);
 
-      let configuredPath: string;
-      try {
-        configuredPath = await getConfiguredPath(settings);
-      } catch (error) {
-        startingReviews.delete(context.threadId);
-        return errorResponse(error instanceof Error ? error.message : String(error));
-      }
-      let binaryPath: string;
-      try {
-        binaryPath = await resolveRuntimeBinary(bb, configuredPath, context.signal);
-      } catch (error) {
-        startingReviews.delete(context.threadId);
-        return errorResponse(error instanceof Error ? error.message : String(error));
-      }
-
       const sessionId = randomUUID();
       const controller = new AbortController();
       const abortStartup = () => controller.abort();
       context.signal.addEventListener("abort", abortStartup, { once: true });
-      let upstream: RunningUpstreamReview;
+      const dismissUpdateVersion = latestUpstreamVersion();
+      let upstream: RunningUpstreamReview | HostPlanReview;
       try {
-        const [origin, runtimeConfig] = await Promise.all([
-          resolveUpstreamOrigin(bb, context.threadId, controller.signal),
-          resolveUpstreamRuntimeConfig(bb, controller.signal),
-        ]);
-        upstream = await startUpstreamPlanReview({
-          binaryPath,
-          planMarkdown: params.planMarkdown,
-          timeoutSeconds: null,
-          signal: controller.signal,
-          origin,
-          dataDir: runtimeConfig.dataDir,
-          remote: runtimeConfig.remote,
-          embedHost: resolveEmbedHost(bb),
-        });
+        const { origin, target } = await resolveReviewContext(
+          bb,
+          context.threadId,
+          controller.signal,
+        );
+        if (target.kind === "host") {
+          upstream = await startHostPlanReview({
+            client: hostClient,
+            hostId: target.hostId,
+            sessionId,
+            planMarkdown: params.planMarkdown,
+            cwd: target.cwd,
+            origin,
+            signal: controller.signal,
+          });
+        } else {
+          const configuredPath = await getConfiguredPath(settings);
+          const binaryPath = await resolveRuntimeBinary(bb, configuredPath, controller.signal);
+          const runtimeConfig = await resolveUpstreamRuntimeConfig(bb, controller.signal);
+          upstream = await startUpstreamPlanReview({
+            binaryPath,
+            planMarkdown: params.planMarkdown,
+            timeoutSeconds: null,
+            signal: controller.signal,
+            origin,
+            dataDir: runtimeConfig.dataDir,
+            remote: runtimeConfig.remote,
+            embedHost: resolveEmbedHost(bb),
+            cwd: target.cwd,
+          });
+        }
       } catch (error) {
         context.signal.removeEventListener("abort", abortStartup);
         startingReviews.delete(context.threadId);
@@ -641,8 +724,11 @@ export default async function plugin(bb: BbPluginApi) {
         sessionUrl: upstream.url,
         relayPath: PLANNOTATOR_RELAY_PATH,
         title,
+        dismissUpdateVersion: await dismissUpdateVersion,
       });
-      relaySessions.set(sessionId, upstream.url);
+      // Host reviews are published on their own machine; only in-process
+      // listeners go through BB's relay.
+      if (!isHostReview(upstream)) relaySessions.set(sessionId, upstream.url);
       const active: ActiveReview = {
         sessionId, payload, review: upstream, controller,
         cancelledByUser: false, deleted: false,
@@ -658,6 +744,7 @@ export default async function plugin(bb: BbPluginApi) {
         await bb.storage.kv.set(reviewKey(sessionId), {
           id: sessionId,
           threadId: context.threadId,
+          ...(isHostReview(upstream) ? { hostId: upstream.hostId } : {}),
           status: "pending",
           updatedAt: Date.now(),
         } satisfies StoredReview);

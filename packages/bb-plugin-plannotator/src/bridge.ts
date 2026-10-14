@@ -113,7 +113,7 @@ export type UpstreamOrigin =
   | "gemini-cli"
   | "pi";
 
-type BridgeOptions = {
+export type BridgeOptions = {
   binaryPath: string;
   planMarkdown: string;
   timeoutSeconds: number | null;
@@ -126,12 +126,16 @@ type BridgeOptions = {
   embedHost?: string;
   /** Bind beyond loopback when BB itself is configured for remote access. */
   remote?: boolean;
+  /** `PLANNOTATOR_PORT` value; defaults to the remote range in remote mode. */
+  portRange?: string;
   cwd?: string;
   readyTimeoutMs?: number;
 };
 
 export type RunningUpstreamReview = {
   url: string;
+  port: number;
+  pid: number | undefined;
   result: Promise<UpstreamDecision>;
   stop(): Promise<void>;
 };
@@ -537,19 +541,25 @@ export async function startUpstreamPlanReview(
     resolveExit = resolvePromise;
   });
 
+  const portRange = options.portRange ?? (options.remote ? REMOTE_PORT_RANGE : undefined);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PLANNOTATOR_REMOTE: options.remote ? "1" : "0",
+    PLANNOTATOR_SKIP_BROWSER_OPEN: "1",
+    PLANNOTATOR_READY_FILE: readyFile,
+    ...(portRange ? { PLANNOTATOR_PORT: portRange } : {}),
+    ...(options.origin ? { PLANNOTATOR_ORIGIN: options.origin } : {}),
+    ...(options.dataDir ? { PLANNOTATOR_DATA_DIR: options.dataDir } : {}),
+  };
+  // The agent terminal is a shell in the browser. Never inherit a setting that
+  // exposes it beyond loopback.
+  delete env.PLANNOTATOR_AGENT_TERMINAL_REMOTE;
+
   let child: ChildProcess;
   try {
     child = spawn(options.binaryPath, [], {
       cwd: options.cwd ?? process.cwd(),
-      env: {
-        ...process.env,
-        PLANNOTATOR_REMOTE: options.remote ? "1" : "0",
-        PLANNOTATOR_SKIP_BROWSER_OPEN: "1",
-        PLANNOTATOR_READY_FILE: readyFile,
-        ...(options.remote ? { PLANNOTATOR_PORT: REMOTE_PORT_RANGE } : {}),
-        ...(options.origin ? { PLANNOTATOR_ORIGIN: options.origin } : {}),
-        ...(options.dataDir ? { PLANNOTATOR_DATA_DIR: options.dataDir } : {}),
-      },
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (error) {
@@ -635,6 +645,8 @@ export async function startUpstreamPlanReview(
 
     return {
       url: rehostUpstreamUrl(ready.url, options.embedHost),
+      port: ready.port,
+      pid: child.pid,
       result,
       async stop() {
         options.signal.removeEventListener("abort", onAbort);
@@ -647,6 +659,33 @@ export async function startUpstreamPlanReview(
     await terminateChild(child, exited);
     await rm(tempDir, { recursive: true, force: true });
     throw error;
+  }
+}
+
+const LATEST_RELEASE_API =
+  "https://api.github.com/repos/backnotprop/plannotator/releases/latest";
+const LATEST_RELEASE_TIMEOUT_MS = 3_000;
+
+/**
+ * The latest upstream release, as the upstream UI's update check compares it.
+ * BB pre-dismisses that "new version" toast because updates arrive through the
+ * runtime's package, not the UI. Null when GitHub is unreachable.
+ */
+export async function fetchLatestUpstreamVersion(
+  fetchImpl: FetchLike = fetch,
+): Promise<string | null> {
+  try {
+    const response = await fetchImpl(LATEST_RELEASE_API, {
+      headers: { accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(LATEST_RELEASE_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const release = (await response.json()) as { tag_name?: unknown };
+    if (typeof release.tag_name !== "string") return null;
+    const version = release.tag_name.trim().replace(/^v/u, "");
+    return /^[0-9A-Za-z.+-]{1,64}$/u.test(version) ? version : null;
+  } catch {
+    return null;
   }
 }
 

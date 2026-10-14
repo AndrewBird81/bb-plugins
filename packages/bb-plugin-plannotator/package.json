@@ -1,10 +1,10 @@
 {
   "name": "bb-plugin-plannotator",
-  "version": "0.6.1",
+  "version": "0.6.3",
   "type": "module",
   "engines": {
-    "bb": ">=0.46",
-    "bbPluginSdk": ">=0.6.37"
+    "bb": ">=0.43.4",
+    "bbPluginSdk": ">=0.5.9"
   },
   "bb": {
     "name": "Plannotator",

@@ -583,6 +583,22 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
         return { stopped: true };
       },
 
+      async probe() {
+        const tailscalePath = resolveTailscale();
+        if (!tailscalePath) {
+          return { publishable: false, reason: `the tailscale CLI is not on PATH or at ${TAILSCALE_FALLBACK_PATH}` };
+        }
+        try {
+          await readDnsName(tailscalePath);
+        } catch (error) {
+          return { publishable: false, reason: errorMessage(error).slice(0, 500) };
+        }
+        if (!deps.findExecutable("plannotator")) {
+          return { publishable: false, reason: "plannotator is not on PATH for the bb host daemon" };
+        }
+        return { publishable: true };
+      },
+
       async bridgeFetch({ sessionId, path, body, waitMs }, context) {
         await ensureStartup(context.experimental_paths.dataDir).catch(() => undefined);
         const entry = reviews.get(sessionId);

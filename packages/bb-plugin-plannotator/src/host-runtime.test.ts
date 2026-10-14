@@ -537,6 +537,27 @@ describe("Plannotator host entry", () => {
     await harness.experimental_dispose();
   });
 
+  it("says whether it can publish a review, without changing anything", async () => {
+    const ready = fakeHost();
+    const readyHarness = (await harnessFor(ready)).harness;
+    await expect(readyHarness.experimental_call("probe", {})).resolves.toEqual({ publishable: true });
+    expect(ready.commands.map(({ args }) => args.join(" "))).toEqual(["status --json"]);
+    await readyHarness.experimental_dispose();
+
+    for (const [options, reason] of [
+      [{ tailscale: null }, /tailscale CLI is not on PATH/u],
+      [{ plannotator: null }, /plannotator is not on PATH/u],
+    ] as const) {
+      const fake = fakeHost(options);
+      const { harness } = await harnessFor(fake);
+      const answer = await harness.experimental_call("probe", {});
+      expect(answer.publishable).toBe(false);
+      expect(answer.reason).toMatch(reason);
+      expect(fake.started).toHaveLength(0);
+      await harness.experimental_dispose();
+    }
+  });
+
   it("fails clearly without tailscale and does not start Plannotator", async () => {
     const fake = fakeHost({ tailscale: null });
     const { harness, start } = await harnessFor(fake);

@@ -79,6 +79,13 @@ describe("host plan review handle", () => {
     });
   });
 
+  it("carries what Plannotator printed with a failure", async () => {
+    const { client } = fakeClient([{ status: "failed", error: "too old", output: "# Markdown Annotations" }]);
+    const review = await start(client);
+
+    await expect(review.result).rejects.toMatchObject({ message: "too old", output: "# Markdown Annotations" });
+  });
+
   it("polls immediately when a host signal arrives", async () => {
     const { client, calls } = fakeClient([{ status: "decided", decision: { approved: true } }]);
     const review = await start(client, 60_000);

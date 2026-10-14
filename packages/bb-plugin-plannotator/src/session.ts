@@ -102,14 +102,38 @@ export function buildSessionLaunch(
   }
 }
 
+/** At most this much of what Plannotator printed travels with an error. */
+export const MAX_SESSION_OUTPUT_CHARS = 8_000;
+
+/**
+ * A session that ended without a result BB can read. `output` is what
+ * Plannotator printed to stdout, which holds the user's feedback when an
+ * older plannotator ignored the result file.
+ */
+export class SessionOutputError extends Error {
+  readonly output: string;
+  constructor(message: string, output: string) {
+    super(message);
+    this.name = "SessionOutputError";
+    this.output = output.trim().slice(-MAX_SESSION_OUTPUT_CHARS);
+  }
+}
+
+/** What a failed session printed, when the error carries it. */
+export function sessionErrorOutput(error: unknown): string | undefined {
+  const output = (error as { output?: unknown } | null)?.output;
+  return typeof output === "string" && output.trim() ? output : undefined;
+}
+
 /** Read the result record of a session that exited with code 0. */
-export async function readSessionResult(path: string): Promise<SessionResult> {
+export async function readSessionResult(path: string, stdout = ""): Promise<SessionResult> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch {
-    throw new Error(
+    throw new SessionOutputError(
       "Plannotator exited without a result. The plannotator on this machine is too old or ignored the result file; code review and annotation need 0.28.6 or later.",
+      stdout,
     );
   }
   let record: unknown;

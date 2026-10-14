@@ -4,6 +4,7 @@
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type { RunningUpstreamReview, SessionDecision, UpstreamOrigin } from "./bridge";
 import type { HostReviewState, SessionRequest, hostContract, hostSignals } from "./host-contract";
+import { SessionOutputError } from "./session";
 
 export type PlannotatorHostClient = Pick<
   ExperimentalHostClient<typeof hostContract, typeof hostSignals>,
@@ -81,11 +82,11 @@ export async function startHostSession(options: {
   let failingSince: number | null = null;
   let stopping: Promise<void> | undefined;
 
-  const fail = (message: string) => {
+  const fail = (message: string, output?: string) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    rejectResult(new Error(message));
+    rejectResult(output ? new SessionOutputError(message, output) : new Error(message));
   };
 
   const apply = (state: HostReviewState) => {
@@ -95,7 +96,7 @@ export async function startHostSession(options: {
       clearTimeout(timer);
       resolveResult(state.decision);
     } else if (state.status === "failed") {
-      fail(state.error);
+      fail(state.error, state.output);
     } else {
       fail("The Plannotator worker on the thread's machine restarted, so the review ended.");
     }

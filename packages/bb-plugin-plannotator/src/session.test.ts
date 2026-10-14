@@ -124,6 +124,11 @@ describe("session result", () => {
   it("explains a missing result as an old plannotator, and rejects plan decisions", async () => {
     const directory = await tempDir("bb-plannotator-result-");
     await expect(readSessionResult(join(directory, "missing.json"))).rejects.toThrow("too old");
+    // What an older plannotator printed travels with the error: it may be the user's feedback.
+    await expect(readSessionResult(join(directory, "missing.json"), "  # Message Annotations\n\nShorter.  ")).rejects.toMatchObject({
+      name: "SessionOutputError",
+      output: "# Message Annotations\n\nShorter.",
+    });
     await writeFile(join(directory, "plan.json"), JSON.stringify({ surface: "plan", decision: "denied", message: "", noop: false }));
     await expect(readSessionResult(join(directory, "plan.json"))).rejects.toThrow("does not understand");
   });

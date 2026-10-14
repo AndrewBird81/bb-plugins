@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { PLANNOTATOR_RELAY_PATH } from "./embedded";
 import { PLANNOTATOR_REALTIME_CHANNEL } from "./constants";
@@ -228,7 +229,7 @@ describe("Plannotator BB shell", () => {
       method: "getActiveReview",
       input: { threadId: "thread-1" },
     });
-    expect(slot.queryByText("Annotate last reply", { selector: "div" })).toBeNull();
+    expect(slot.queryByText("Annotate last finished reply", { selector: "div" })).toBeNull();
 
     fireEvent.click(slot.getByRole("button", { name: "Cancel review" }));
     await waitFor(() =>
@@ -288,7 +289,7 @@ describe("Plannotator BB shell", () => {
     fireEvent.change(await slot.findByLabelText("Diff type"), { target: { value: "uncommitted" } });
     fireEvent.click(slot.getByRole("button", { name: "Review changes" }));
     await idle();
-    fireEvent.click(slot.getByRole("button", { name: "Annotate last reply" }));
+    fireEvent.click(slot.getByRole("button", { name: "Annotate last finished reply" }));
     await idle();
     fireEvent.click(await slot.findByRole("button", { name: "site/index.html" }));
 
@@ -321,18 +322,21 @@ describe("Plannotator BB shell", () => {
     void action.run(context("Just this"));
     expect(opened).toEqual([{ actionId: "plannotator-review", title: "Plannotator" }]);
 
+    // A session is already showing, so the server refuses another one; the
+    // panel says so above the session.
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thread-1", params: null },
       {
         rpc: {
-          getActiveReview: () => null,
-          startSession: () => ({ status: "already_active", reviewId: "r-0" }),
+          getActiveReview: () => payload,
+          startSession: () => ({ status: "already_active", reviewId: payload.sessionId }),
         },
         sdk: launcherSdk().sdk,
       },
     );
-    await slot.findByText("A Plannotator session is already open in this thread.");
+    await slot.findByTitle("Plannotator review");
+    expect((await slot.findByRole("status")).textContent).toBe("A Plannotator session is already open in this thread.");
 
     // A panel that is already open takes the next request too.
     void action.run(context());
@@ -342,6 +346,46 @@ describe("Plannotator BB shell", () => {
         { threadId: "thread-1", request: { mode: "annotate-last", markdown: "Full reply" } },
       ]),
     );
+  });
+
+  it("drops a request whose panel did not open and says so", async () => {
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => 0 as never);
+    const action = app.messageActions.find(({ id }) => id === "plannotator-annotate-message")!;
+    void action.run({
+      threadId: "thread-1",
+      message: { id: "m-1", threadId: "thread-1", role: "assistant", text: "Reply", sourceSeqEnd: 1, experimental_messageSeq: 1 },
+      openPanel: () => false,
+    } as never);
+    expect(toastError).toHaveBeenCalledWith(expect.stringContaining("could not open its panel"));
+
+    // Opening the panel later starts nothing.
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => null, startSession: () => ({ status: "pending", reviewId: "r" }) }, sdk: launcherSdk().sdk },
+    );
+    await slot.findByRole("button", { name: "Review changes" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(slot.rpcCalls.filter(({ method }) => method === "startSession")).toHaveLength(0);
+    toastError.mockRestore();
+  });
+
+  it("shows why a session the user started ended without a result", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => null }, sdk: launcherSdk().sdk },
+    );
+    await slot.findByRole("button", { name: "Review changes" });
+
+    await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, {
+      kind: "review-failed",
+      threadId: "thread-1",
+      sessionId: "session-1",
+      message: "Plannotator exited without a result.",
+    });
+
+    await slot.findByText("Plannotator exited without a result.");
   });
 
   it("exposes explicit cancellation without a host interaction deadline", async () => {

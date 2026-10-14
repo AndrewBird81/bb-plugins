@@ -26,8 +26,10 @@ import {
   sharedCookieDomain,
   upstreamOnboardingCookies,
 } from "./src/embedded";
+import { toast } from "sonner";
 import {
   SessionLauncher,
+  cancelPanelRequest,
   requestPanel,
   usePanelRequests,
   useSessionStarter,
@@ -83,6 +85,18 @@ function parsePayload(value: unknown): PlannotatorPayload | null {
 function parseReviewOpened(value: unknown): PlannotatorPayload | null {
   if (!isRecord(value) || value.kind !== "review-opened") return null;
   return parsePayload(value.payload);
+}
+
+function parseReviewFailed(value: unknown): { threadId: string; message: string } | null {
+  if (
+    !isRecord(value) ||
+    value.kind !== "review-failed" ||
+    typeof value.threadId !== "string" ||
+    typeof value.message !== "string"
+  ) {
+    return null;
+  }
+  return { threadId: value.threadId, message: value.message };
 }
 
 function parseReviewClosed(
@@ -202,6 +216,10 @@ function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
     if (request.kind === "launch") starter.start(request.request);
     else setFocusFilePicker(true);
   });
+  useRealtime(PLANNOTATOR_REALTIME_CHANNEL, (value) => {
+    const failed = parseReviewFailed(value);
+    if (failed && failed.threadId === threadId) starter.notify(failed.message);
+  });
   const [reloadKey, setReloadKey] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
@@ -303,6 +321,11 @@ function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
           </button>
         </div>
       </div>
+      {starter.message ? (
+        <div role="status" className="shrink-0 border-b border-border px-3 py-1 text-xs text-destructive">
+          {starter.message}
+        </div>
+      ) : null}
       <div className="relative min-h-0 flex-1">
         {!loaded && !loadError ? (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-background text-xs text-muted-foreground">
@@ -357,7 +380,10 @@ export default definePluginApp((app) => {
   ) => {
     if (!context.threadId) return;
     requestPanel(context.threadId, request);
-    context.openPanel({ actionId: PANEL_ACTION_ID, title: "Plannotator" });
+    if (!context.openPanel({ actionId: PANEL_ACTION_ID, title: "Plannotator" })) {
+      cancelPanelRequest(context.threadId, request);
+      toast.error("Plannotator could not open its panel here. Open the thread's side panel and try again.");
+    }
   };
   app.slots.messageAction({
     id: "plannotator-annotate-message",
@@ -377,7 +403,7 @@ export default definePluginApp((app) => {
   });
   app.commands.register({
     id: "plannotator-annotate-last-reply",
-    title: "Plannotator: Annotate last reply",
+    title: "Plannotator: Annotate last finished reply",
     isAvailable: inThread,
     run: (context) => openWith(context, { kind: "launch", request: { mode: "annotate-last" } }),
   });

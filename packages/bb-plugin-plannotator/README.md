@@ -57,7 +57,9 @@ Plannotator in its supported remote mode. The upstream listener binds beyond
 loopback and selects a port from `19432-19441`. The embedded panel uses a
 session-scoped same-origin relay for local child listeners over both HTTP and
 HTTPS, so a one-port Tailscale Serve endpoint is enough and the browser never
-has to reach the upstream port directly. Local-only BB sessions use the same
+has to reach the upstream port directly. The relay accepts writes only from
+the bb page's own origin, and never forwards a browser's `Authorization`
+header or cookies. Local-only BB sessions use the same
 relay while the review is open; **Open externally** can still use the direct
 upstream port when the network allows it.
 
@@ -103,7 +105,10 @@ upstream endpoints a review never needs from another device (host control,
 editor and note-app integrations, open-in-app, PR actions, the call-flow
 runtime installer, file reads outside the worktree, custom save paths).
 Plannotator's own random loopback port is not published, but, as with stock
-local Plannotator, a web page in a browser on that host could still reach it.
+local Plannotator, a web page in a browser on that host could still reach it
+and use endpoints the proxy denies, such as open-in-app (which opens a repo
+file with its default handler) and agent jobs. Browsers that block public
+pages from reaching localhost, such as Brave by default, stop this.
 
 ## Boundary
 

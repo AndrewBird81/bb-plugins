@@ -41,6 +41,7 @@ function fakeHost(options: {
   const reviews: Array<{
     stopped: boolean;
     decide(decision: UpstreamDecision): void;
+    fail(error: Error): void;
   }> = [];
   const proxies = new Map<number, ReviewProxyOptions & { closed: boolean }>();
   let now = 1_000;
@@ -99,6 +100,10 @@ function fakeHost(options: {
         decide: (decision: UpstreamDecision) => {
           processes.delete(pid);
           resolve(decision);
+        },
+        fail: (error: Error) => {
+          processes.delete(pid);
+          reject(error);
         },
       };
       reviews.push(record);
@@ -290,6 +295,22 @@ describe("Plannotator host entry", () => {
     expect(await owned()).toEqual({ processes: [], mappings: [] });
     await expect(harness.experimental_call("getReview", { sessionId: SESSION_ID })).resolves.toEqual({
       status: "unknown",
+    });
+    await harness.experimental_dispose();
+  });
+
+  it("reports a failure with what Plannotator printed", async () => {
+    const fake = fakeHost();
+    const { harness, start } = await harnessFor(fake);
+    await start();
+
+    fake.reviews[0]!.fail(Object.assign(new Error("Plannotator exited without a result."), { output: "Shorter." }));
+    await vi.waitFor(() => expect(harness.experimental_getSignals()).toHaveLength(1));
+
+    await expect(harness.experimental_call("getReview", { sessionId: SESSION_ID })).resolves.toEqual({
+      status: "failed",
+      error: "Plannotator exited without a result.",
+      output: "Shorter.",
     });
     await harness.experimental_dispose();
   });

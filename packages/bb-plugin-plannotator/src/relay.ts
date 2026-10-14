@@ -226,10 +226,28 @@ export function injectRelayBootstrap(
   return `${html.slice(0, insertAt)}${script}${html.slice(insertAt)}`;
 }
 
+/**
+ * Whether a request may write through the relay. Only the bb page may: its
+ * origin, or no Origin with `Sec-Fetch-Site: same-origin`. A sandboxed
+ * document inside the review (an annotated HTML file) sends `Origin: null`.
+ */
+export function isRelayWriteAllowed(
+  request: Request,
+  bbOrigin: string | undefined,
+): boolean {
+  if (request.method === "GET" || request.method === "HEAD") return true;
+  const origin = request.headers.get("origin");
+  if (origin === null) return request.headers.get("sec-fetch-site") === "same-origin";
+  const host = request.headers.get("host");
+  const allowed = [bbOrigin, host ? `https://${host}` : undefined, host ? `http://${host}` : undefined];
+  return allowed.some((candidate) => candidate !== undefined && candidate.toLowerCase() === origin.toLowerCase());
+}
+
 export function createPlannotatorRelayHandler(
   sessions: RelaySessionMap,
   relayPath = PLANNOTATOR_RELAY_PATH,
   fetchImpl: FetchLike = fetch,
+  bbOrigin: () => string | undefined = () => undefined,
 ): PluginHttpHandler {
   return async (context: RelayContext) => {
     const sessionId = context.req.query("sessionId")?.trim() ?? "";
@@ -243,8 +261,15 @@ export function createPlannotatorRelayHandler(
     if (!targetUrl) return errorResponse("Invalid Plannotator path", 400);
 
     const request = context.req.raw;
+    // Before the Origin header is removed for upstream.
+    if (!isRelayWriteAllowed(request, bbOrigin())) {
+      return errorResponse("Cross-origin requests are not allowed.", 403);
+    }
     const requestHeaders = new Headers(request.headers);
     for (const header of [
+      // Never pass a browser's credentials on to Plannotator.
+      "authorization",
+      "cookie",
       "connection",
       "content-length",
       "host",
@@ -309,8 +334,9 @@ export function createPlannotatorRelayHandler(
 export function registerPlannotatorRelayRoutes(
   bb: BbPluginApi,
   sessions: RelaySessionMap,
+  bbOrigin: () => string | undefined = () => undefined,
 ): void {
-  const handler = createPlannotatorRelayHandler(sessions);
+  const handler = createPlannotatorRelayHandler(sessions, PLANNOTATOR_RELAY_PATH, fetch, bbOrigin);
   for (const method of [
     "GET",
     "POST",

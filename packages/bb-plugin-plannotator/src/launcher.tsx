@@ -51,6 +51,11 @@ export function requestPanel(threadId: string, request: PanelRequest): void {
   for (const listener of panelRequestListeners) listener();
 }
 
+/** Drop a request whose panel did not open, so a later panel cannot start it. */
+export function cancelPanelRequest(threadId: string, request: PanelRequest): void {
+  if (pendingPanelRequests.get(threadId)?.request === request) pendingPanelRequests.delete(threadId);
+}
+
 function takePanelRequest(threadId: string): PanelRequest | null {
   const pending = pendingPanelRequests.get(threadId);
   pendingPanelRequests.delete(threadId);
@@ -173,7 +178,9 @@ function AnnotateFilePicker({
 export type SessionStarter = {
   start(request: LaunchRequest): void;
   busy: boolean;
+  /** Why the last start did nothing, or what happened to a session. */
   message: string | null;
+  notify(message: string | null): void;
 };
 
 /** Start sessions through the server; shared by the launcher and panel requests. */
@@ -196,7 +203,7 @@ export function useSessionStarter(threadId: string): SessionStarter {
       .catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)))
       .finally(() => setBusy(false));
   };
-  return { start, busy, message };
+  return { start, busy, message, notify: setMessage };
 }
 
 export function SessionLauncher({
@@ -245,7 +252,10 @@ export function SessionLauncher({
         </div>
       </section>
       <section className="flex flex-col gap-2">
-        <div className="font-medium text-foreground">Annotate last reply</div>
+        <div className="font-medium text-foreground">Annotate last finished reply</div>
+        <div className="text-xs text-muted-foreground">
+          The agent's last finished reply; a turn still running is never used.
+        </div>
         <div>
           <button
             type="button"
@@ -253,7 +263,7 @@ export function SessionLauncher({
             disabled={busy}
             onClick={() => start({ mode: "annotate-last" })}
           >
-            Annotate last reply
+            Annotate last finished reply
           </button>
         </div>
       </section>

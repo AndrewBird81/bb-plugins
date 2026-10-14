@@ -689,6 +689,7 @@ describe("BB upstream Plannotator bridge", () => {
     ] as const) {
       const { host } = await hostPlugin();
       host.harness.sdk.stub("threads.output", () => ({ output: "Last reply" }));
+      host.harness.sdk.stub("threads.events.list", () => []);
       const result = JSON.parse(String(await host.harness.behavior.callAgentTool(tool, params, threadContext))) as {
         status: string;
       };
@@ -700,6 +701,7 @@ describe("BB upstream Plannotator bridge", () => {
   it("explains that there is no reply to annotate", async () => {
     const { host } = await hostPlugin();
     host.harness.sdk.stub("threads.output", () => ({ output: null }));
+    host.harness.sdk.stub("threads.events.list", () => []);
 
     const result = await host.harness.behavior.callAgentTool("plannotator_annotate_reply", {}, threadContext);
 
@@ -758,6 +760,84 @@ describe("BB upstream Plannotator bridge", () => {
     );
   });
 
+  it("tells the panel when a user-started session ends without a result, and keeps printed feedback", async () => {
+    for (const [output, delivered] of [
+      [undefined, false],
+      ["# Message Annotations\n\nShorter please.", true],
+    ] as const) {
+      const { host, remote } = await hostPlugin();
+      host.harness.sdk.stub("threads.output", () => ({ output: "Last reply" }));
+      host.harness.sdk.stub("threads.events.list", () => []);
+      const started = (await host.harness.callRpc("startSession", {
+        threadId: "thread-1",
+        request: { mode: "annotate-last" },
+      })) as { reviewId: string };
+
+      remote.state = {
+        status: "failed",
+        error: "Plannotator exited without a result. The plannotator on this machine is too old.",
+        ...(output ? { output } : {}),
+      };
+      await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: started.reviewId });
+
+      await vi.waitFor(() =>
+        expect(host.harness.realtimeSignals).toContainEqual({
+          channel: PLANNOTATOR_REALTIME_CHANNEL,
+          payload: expect.objectContaining({ kind: "review-failed", threadId: "thread-1", sessionId: started.reviewId }),
+        }),
+      );
+      await vi.waitFor(async () =>
+        expect(await host.bb.storage.kv.get(`review:${started.reviewId}`)).toMatchObject({
+          status: delivered ? "delivered" : "closed",
+        }),
+      );
+      expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(delivered ? 1 : 0);
+      if (delivered) {
+        const text = messageText(host.harness.sdk.callsTo("threads.send")[0]!);
+        expect(text).toContain("Feedback the user submitted may have been lost");
+        expect(text).toContain("What Plannotator printed:\n\n# Message Annotations\n\nShorter please.");
+      }
+    }
+  });
+
+  it("refuses to annotate the last reply while the only agent text is a turn still running", async () => {
+    const { host } = await hostPlugin();
+    host.harness.sdk.stub("threads.output", () => ({ output: "Starting on it…" }));
+    host.harness.sdk.stub("threads.events.list", (args) => {
+      const types = (args as unknown as { types: string[] }).types;
+      if (types[0] === "turn/started") {
+        return [{ seq: 5, type: "turn/started", scope: { kind: "turn", turnId: "turn-1" }, data: {} }] as never;
+      }
+      return [] as never;
+    });
+
+    const result = await host.harness.behavior.callAgentTool("plannotator_annotate_reply", {}, threadContext);
+
+    expect(result).toMatchObject({ isError: true });
+    expect(JSON.stringify(result)).toContain("still working and has no finished reply yet");
+    expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
+  });
+
+  it("forgets closed records after the delivered-record retention", async () => {
+    const { host } = await hostPlugin();
+    const old = Date.now() - 31 * 24 * 60 * 60 * 1000;
+    const record = (id: string, status: string) => ({
+      id,
+      threadId: "thread-1",
+      kind: "code-review",
+      initiator: "user",
+      status,
+      updatedAt: old,
+    });
+    await host.bb.storage.kv.set("review:bb883ad4-4ff7-4183-96eb-6250ae380c3a", record("bb883ad4-4ff7-4183-96eb-6250ae380c3a", "closed"));
+    await host.bb.storage.kv.set("review:1b4e28ba-2fa1-41d2-883f-0016d3cca427", record("1b4e28ba-2fa1-41d2-883f-0016d3cca427", "delivered"));
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await vi.waitFor(async () => expect(await host.bb.storage.kv.list("review:")).toEqual([]));
+    service.controller.abort();
+    await service.done;
+  });
+
   it("sends a user-started session's result only when it carries feedback", async () => {
     for (const [decision, delivered] of [
       [{ surface: "annotate-last", decision: "dismissed", message: "", noop: true }, false],
@@ -765,6 +845,7 @@ describe("BB upstream Plannotator bridge", () => {
     ] as const) {
       const { host, remote } = await hostPlugin();
       host.harness.sdk.stub("threads.output", () => ({ output: "Last reply" }));
+      host.harness.sdk.stub("threads.events.list", () => []);
       const started = (await host.harness.callRpc("startSession", {
         threadId: "thread-1",
         request: { mode: "annotate-last" },

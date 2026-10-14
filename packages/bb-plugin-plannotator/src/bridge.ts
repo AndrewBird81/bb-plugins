@@ -639,7 +639,7 @@ export async function startUpstreamSession(
       }
       if (!launch.resultFile) return parseUpstreamDecision(stdout, stderr);
       try {
-        return await readSessionResult(launch.resultFile);
+        return await readSessionResult(launch.resultFile, stdout);
       } finally {
         if (resultDir) await rm(resultDir, { recursive: true, force: true });
       }

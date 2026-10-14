@@ -94,7 +94,14 @@ export const hostReviewStateSchema = z.discriminatedUnion("status", [
       decision: z.union([upstreamDecisionSchema, sessionResultSchema]),
     })
     .strict(),
-  z.object({ status: z.literal("failed"), error: z.string() }).strict(),
+  z
+    .object({
+      status: z.literal("failed"),
+      error: z.string(),
+      /** What Plannotator printed, when it ended without a readable result. */
+      output: z.string().max(8_000).optional(),
+    })
+    .strict(),
   // The worker has no record of the review: it restarted or already cleaned up.
   z.object({ status: z.literal("unknown") }).strict(),
 ]);

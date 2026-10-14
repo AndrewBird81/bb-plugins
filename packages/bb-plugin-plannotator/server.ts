@@ -39,7 +39,8 @@ import {
   type SessionResult,
 } from "./src/host-contract";
 import { startHostSession, type HostSession } from "./src/host-review";
-import { SESSION_KINDS, resolveAnnotateTarget, type SessionKind } from "./src/session";
+import { lastFinishedReply } from "./src/last-reply";
+import { SESSION_KINDS, resolveAnnotateTarget, sessionErrorOutput, type SessionKind } from "./src/session";
 import {
   registerPlannotatorRelayRoutes,
 } from "./src/relay";
@@ -164,6 +165,8 @@ const reviewResultSchema = z.object({
   annotationCount: z.number().int().optional(),
   /** Review and annotate: nothing for the agent (bare approval or close). */
   noop: z.boolean().optional(),
+  /** What Plannotator printed when its result could not be read. */
+  printedOutput: z.string().max(8_000).optional(),
 });
 type ReviewResult = z.infer<typeof reviewResultSchema>;
 
@@ -470,18 +473,23 @@ export function reviewMessage(
   kind: SessionKind = "plan",
   initiator: SessionInitiator = "agent",
 ): string {
-  const { message, noop: _noop, ...summary } = result;
+  const { message, noop: _noop, printedOutput, ...summary } = result;
   return [
     `Plannotator ${KIND_NOUN[kind]} ${result.reviewId} has finished.`,
     JSON.stringify(summary),
     ...(message ? [message] : []),
+    ...(printedOutput ? [`What Plannotator printed:\n\n${printedOutput}`] : []),
     closingSentence(kind, initiator),
   ].join("\n\n");
 }
 
-/** User-initiated sessions message the thread only when there is feedback. */
+/**
+ * User-initiated sessions message the thread only when there is feedback, or
+ * when feedback may have been lost (Plannotator printed something but BB
+ * could not read its result).
+ */
 function shouldDeliver(initiator: SessionInitiator, result: ReviewResult): boolean {
-  return initiator === "agent" || result.noop === false;
+  return initiator === "agent" || result.noop === false || result.printedOutput !== undefined;
 }
 
 const DEFAULT_TITLES: Record<SessionKind, string> = {
@@ -697,7 +705,7 @@ export default async function plugin(bb: BbPluginApi) {
         continue;
       }
       let record = parsed.data;
-      if (record.status === "delivered") {
+      if (record.status === "delivered" || record.status === "closed") {
         if (Date.now() - record.updatedAt > DELIVERED_REVIEW_RETENTION_MS) {
           await bb.storage.kv.delete(key);
         }
@@ -751,15 +759,34 @@ export default async function plugin(bb: BbPluginApi) {
         ? sessionReviewResult(active.sessionId, active.kind, decision)
         : reviewResult(active.sessionId, decision);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const printedOutput = active.cancelledByUser ? undefined : sessionErrorOutput(error);
       result = {
         reviewId: active.sessionId,
         source: "plannotator",
         kind: active.kind,
         decision: "cancelled",
         ...(!active.cancelledByUser
-          ? { error: error instanceof Error ? error.message : String(error) }
+          ? {
+              error: printedOutput
+                ? `${message} Feedback the user submitted may have been lost; what Plannotator printed follows.`
+                : message,
+            }
           : {}),
+        ...(printedOutput ? { printedOutput } : {}),
       };
+      // The user started this session and sees no thread message unless
+      // feedback may be lost: tell the panel what happened.
+      if (active.initiator === "user" && !active.cancelledByUser) {
+        bb.realtime.publish(PLANNOTATOR_REALTIME_CHANNEL, {
+          kind: "review-failed",
+          threadId,
+          sessionId: active.sessionId,
+          message: printedOutput
+            ? `${message} Your feedback may have been lost; what Plannotator printed was sent to the thread.`
+            : `Plannotator ended without a result: ${message}`,
+        });
+      }
     }
     relaySessions.delete(active.sessionId);
     await closeReviewPanel(bb, threadId, active.sessionId);
@@ -796,7 +823,9 @@ export default async function plugin(bb: BbPluginApi) {
     await deliverReview(record);
   }
 
-  registerPlannotatorRelayRoutes(bb, relaySessions);
+  registerPlannotatorRelayRoutes(bb, relaySessions, () =>
+    bbPageOrigin(bb.server.experimental_appUrl, undefined),
+  );
 
   bb.rpc.register(rpcContract, {
     async status() {
@@ -840,8 +869,20 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<SessionRequest> {
     if (input.mode === "plan" || input.mode === "annotate-last") {
       if (input.mode === "plan") return input;
-      const markdown =
-        input.markdown ?? (await bb.sdk.threads.output({ threadId, signal })).output ?? "";
+      let markdown = input.markdown;
+      if (markdown === undefined) {
+        // Never the text of a turn still running: an agent calling the tool
+        // mid-turn means its previous reply.
+        const last = await lastFinishedReply(bb.sdk.threads, threadId, signal);
+        if (!last.reply?.trim()) {
+          throw new Error(
+            last.running
+              ? "The thread's agent is still working and has no finished reply yet. Try again when its turn ends."
+              : "This thread has no assistant reply to annotate yet.",
+          );
+        }
+        markdown = last.reply;
+      }
       if (!markdown.trim()) throw new Error("This thread has no assistant reply to annotate yet.");
       if (markdown.length > MAX_ANNOTATE_MARKDOWN) {
         throw new Error("The reply is longer than Plannotator's 2 MiB annotation limit.");
@@ -1063,7 +1104,7 @@ export default async function plugin(bb: BbPluginApi) {
     name: "plannotator_annotate_reply",
     description:
       "Optionally open an assistant reply in Plannotator for the user to annotate. The annotations arrive in a later thread message.",
-    instructions: `Use this optional tool only when the user asks to annotate a reply in Plannotator. Without markdown it opens this thread's last completed assistant reply; pass markdown to annotate other text, including text from the current turn. ${sessionToolNote}`,
+    instructions: `Use this optional tool only when the user asks to annotate a reply in Plannotator. Without markdown it opens this thread's last finished assistant reply, never the text of a turn still running (so mid-turn it is your previous reply); pass markdown to annotate other text, including text from the current turn. ${sessionToolNote}`,
     presentation: { label: { pending: "Opening Plannotator annotation", completed: "Plannotator annotation opened" } },
     parameters: annotateReplyParametersSchema,
     async execute(params, context) {

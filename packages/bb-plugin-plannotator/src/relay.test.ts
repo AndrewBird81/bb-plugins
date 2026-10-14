@@ -114,7 +114,7 @@ describe("Plannotator same-origin relay", () => {
       "POST",
       `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=%2Fapi%2Fplan`,
       {
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "sec-fetch-site": "same-origin", authorization: "Bearer x", cookie: "a=1" },
         body: JSON.stringify({ approved: true }),
       },
     );
@@ -151,5 +151,31 @@ describe("Plannotator same-origin relay", () => {
 
     const handler = createPlannotatorRelayHandler(new Map());
     expect(handler).toBeTypeOf("function");
+  });
+
+  it("accepts writes only from the bb page, never from a sandboxed document or another site", async () => {
+    const upstreamBaseUrl = await startUpstreamServer();
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    registerPlannotatorRelayRoutes(host.bb, new Map([["session-1", upstreamBaseUrl]]), () => "https://bb.example.ts.net");
+    const post = async (headers: Record<string, string>) =>
+      (
+        await host.harness.fetchHttp("POST", `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=%2Fapi%2Fplan`, {
+          headers: { "content-type": "text/plain", ...headers },
+          body: '{"approved":true}',
+        })
+      ).status;
+
+    // An annotated HTML file runs in a sandboxed srcdoc frame: Origin null.
+    expect(await post({ origin: "null" })).toBe(403);
+    expect(await post({ origin: "https://evil.example" })).toBe(403);
+    expect(await post({})).toBe(403);
+    expect(await post({ "sec-fetch-site": "cross-site" })).toBe(403);
+    expect(await post({ origin: "https://bb.example.ts.net" })).toBe(200);
+    expect(await post({ "sec-fetch-site": "same-origin" })).toBe(200);
+    const read = await host.harness.fetchHttp("GET", `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=%2F`, {
+      headers: { origin: "null" },
+    });
+    expect(read.status).toBe(200);
   });
 });

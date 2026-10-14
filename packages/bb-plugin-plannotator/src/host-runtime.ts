@@ -11,7 +11,7 @@ import {
   type ExperimentalHostWorkerLease,
 } from "@get-bb/plugin-sdk";
 import type { RunningUpstreamReview, SessionOptions } from "./bridge";
-import { resolveAnnotateTarget } from "./session";
+import { resolveAnnotateTarget, sessionErrorOutput } from "./session";
 import type { ReviewProxyOptions, RunningReviewProxy } from "./review-proxy";
 import {
   HOST_PORT_RANGE,
@@ -527,7 +527,10 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     startWatchdog();
     void review.result.then(
       (decision) => settle(entry, { status: "decided", decision }, context),
-      (error: unknown) => settle(entry, { status: "failed", error: errorMessage(error) }, context),
+      (error: unknown) => {
+        const output = sessionErrorOutput(error);
+        settle(entry, { status: "failed", error: errorMessage(error), ...(output ? { output } : {}) }, context);
+      },
     );
     return { url: `https://${dnsName}:${entry.port}`, port: entry.port };
   }

@@ -15,6 +15,7 @@ import {
 import type { HostReviewState } from "./host-contract";
 import plugin, {
   bbPageOrigin,
+  placeReview,
   bridgeHostForProvider,
   feedbackForBbAgent,
   reviewTargetFor,
@@ -138,12 +139,19 @@ function wireThreadOnHost(
   );
 }
 
+/** Host calls other than the placement probe, which `auto` sends first. */
+function hostCalls(host: FakePluginHost) {
+  return host.harness.inspection.experimental_hostRpcCalls.filter(({ method }) => method !== "probe");
+}
+
 /** A host entry stand-in whose review state the test controls. */
 function fakeRemoteHost(options: { startError?: string } = {}) {
   const remote = {
     state: { status: "pending" } as HostReviewState,
     /** Whether the host worker still knows the review when it is stopped. */
     stopped: true,
+    /** What the host answers when asked whether it can publish a review. */
+    probe: { publishable: true } as { publishable: boolean; reason?: string },
     async call({ method }: { method: string }) {
       if (method === "startReview") {
         if (options.startError) throw new Error(options.startError);
@@ -152,6 +160,7 @@ function fakeRemoteHost(options: { startError?: string } = {}) {
       if (method === "getReview") return remote.state;
       if (method === "stopReview") return { stopped: remote.stopped };
       if (method === "reconcile") return { removedPorts: [], killedPids: [] };
+      if (method === "probe") return remote.probe;
       // No session bridge unless a test sets one up.
       if (method === "bridgeFetch") return { status: 404, body: "" };
       throw new Error(`unexpected host method ${method}`);
@@ -530,6 +539,88 @@ describe("BB upstream Plannotator bridge", () => {
     expect(result).toMatchObject({ isError: true });
     expect(JSON.stringify(result)).toContain("bundled");
   });
+  it("places a host thread's review by the Run reviews on setting", async () => {
+    const host = { kind: "host" as const, hostId: "host_mac", cwd: "/Users/me/repo" };
+    const nowhere = () => false;
+    const ok = async () => ({ publishable: true });
+    const noTailscale = async () => ({ publishable: false, reason: "the tailscale CLI is not on PATH" });
+    let probes = 0;
+    const counted = async () => {
+      probes += 1;
+      return { publishable: true };
+    };
+
+    expect(await placeReview(host, "auto", ok, nowhere)).toEqual({
+      target: host,
+      placement: { runsOn: "thread-host", reason: "the thread's machine can publish the review with tailscale serve" },
+    });
+    const fallback = await placeReview(host, "auto", noTailscale, nowhere);
+    expect(fallback.target).toEqual({ kind: "server" });
+    expect(fallback.placement.runsOn).toBe("server");
+    expect(fallback.placement.reason).toContain("the tailscale CLI is not on PATH");
+    const offline = await placeReview(host, "auto", async () => {
+      throw new Error("Host is not connected");
+    }, nowhere);
+    expect(offline.placement).toMatchObject({ runsOn: "server", reason: expect.stringContaining("Host is not connected") });
+
+    expect((await placeReview(host, "thread", counted, nowhere)).target).toBe(host);
+    expect((await placeReview(host, "server", counted, () => true)).target).toEqual({ kind: "server", cwd: "/Users/me/repo" });
+    expect(probes).toBe(0);
+    const serverThread = { kind: "server" as const, cwd: "/srv/repo" };
+    expect((await placeReview(serverThread, "thread", counted)).target).toBe(serverThread);
+  });
+
+  it("falls back to the BB server when the thread's machine cannot publish, and says why", async () => {
+    const binary = await fakePlannotatorBinary({ approveAfterMs: null });
+    const remote = fakeRemoteHost();
+    remote.probe = { publishable: false, reason: "the tailscale CLI is not on PATH or at /usr/local/bin/tailscale" };
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      settings: { binaryPath: binary, askAiSource: "local" },
+      experimental_callHostRpc: remote.call,
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+    const result = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as Record<string, string>;
+
+    expect(result).toMatchObject({ status: "pending", runsOn: "server" });
+    expect(result.runsOnReason).toContain("the tailscale CLI is not on PATH");
+    expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toEqual(["probe"]);
+    expect(await activeReviewPayload(host)).toMatchObject({ sessionUrl: "http://127.0.0.1:43210" });
+  });
+
+  it("keeps the strict thread placement and never probes, or always uses the server", async () => {
+    for (const [runReviewsOn, methods, runsOn] of [
+      ["thread", ["startReview"], "thread-host"],
+      ["server", [], "server"],
+    ] as const) {
+      const remote = fakeRemoteHost();
+      const host = createFakePluginHost({
+        pluginId: "plannotator",
+        settings: { binaryPath: await fakePlannotatorBinary({ approveAfterMs: null }), askAiSource: "local", runReviewsOn },
+        experimental_callHostRpc: remote.call,
+      });
+      hosts.push(host);
+      await plugin(host.bb);
+      wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+      const result = JSON.parse(String(await host.harness.behavior.callAgentTool(
+        "plannotator_review_plan",
+        { planMarkdown: "# Plan" },
+        threadContext,
+      ))) as Record<string, string>;
+
+      expect(result).toMatchObject({ status: "pending", runsOn });
+      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toEqual(methods);
+    }
+  });
+
   it("routes a review to the server or to the thread's own host", () => {
     const exists = (path: string) => path === "/home/node/worktree";
     expect(reviewTargetFor({ hostId: "host_server", path: "/home/node/worktree" }, "host_server", exists))
@@ -564,7 +655,7 @@ describe("BB upstream Plannotator bridge", () => {
 
     expect(result.status).toBe("pending");
     expect(await readFile(cwdFile, "utf8")).toBe(worktree);
-    expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
+    expect(hostCalls(host)).toHaveLength(0);
   });
 
   it("runs a remote BB's own sessions on loopback with the session bridge and sharing off", async () => {
@@ -610,9 +701,12 @@ describe("BB upstream Plannotator bridge", () => {
       "plannotator_review_plan",
       { planMarkdown: "# Plan\n\n- On the Mac" },
       { threadId: "thread-1", projectId: "project-1" },
-    ))) as { status: string; reviewId: string };
+    ))) as { status: string; reviewId: string; runsOn: string };
     expect(result.status).toBe("pending");
-    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+    // auto: the thread's machine can publish, so the review runs there.
+    expect(result.runsOn).toBe("thread-host");
+    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({ method: "probe", hostId: "host_mac" });
+    expect(hostCalls(host)[0]).toMatchObject({
       method: "startReview",
       hostId: "host_mac",
       input: {
@@ -648,7 +742,7 @@ describe("BB upstream Plannotator bridge", () => {
       '"decision":"changes_requested"',
     );
     await vi.waitFor(() =>
-      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain(
+      expect(hostCalls(host).map(({ method }) => method)).toContain(
         "stopReview",
       ),
     );
@@ -673,7 +767,7 @@ describe("BB upstream Plannotator bridge", () => {
       threadContext,
     ))) as { status: string; kind: string; reviewId: string };
     expect(review).toMatchObject({ status: "pending", kind: "code-review" });
-    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+    expect(hostCalls(host)[0]).toMatchObject({
       method: "startReview",
       input: { cwd: "/Users/me/repo", session: { mode: "review", diffType: "uncommitted", base: "origin/main" } },
     });
@@ -708,7 +802,7 @@ describe("BB upstream Plannotator bridge", () => {
 
     await host.harness.behavior.callAgentTool("plannotator_review_changes", {}, threadContext);
 
-    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+    expect(hostCalls(host)[0]).toMatchObject({
       input: { frameAncestor: "https://bb-server.tail1b968e.ts.net" },
     });
     expect(bbPageOrigin(null, "http://127.0.0.1:38886")).toBeUndefined();
@@ -727,7 +821,7 @@ describe("BB upstream Plannotator bridge", () => {
         status: string;
       };
       expect(result.status).toBe("pending");
-      expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({ input: { session } });
+      expect(hostCalls(host)[0]).toMatchObject({ input: { session } });
     }
   });
 
@@ -740,7 +834,7 @@ describe("BB upstream Plannotator bridge", () => {
 
     expect(result).toMatchObject({ isError: true });
     expect(JSON.stringify(result)).toContain("no assistant reply to annotate");
-    expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
+    expect(hostCalls(host)).toHaveLength(0);
   });
 
   it("checks an annotated file on the server machine before starting", async () => {
@@ -818,7 +912,7 @@ describe("BB upstream Plannotator bridge", () => {
     remote.state = { status: "decided", decision: { surface: "review", decision: "approved", message: "", noop: true } };
     await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: first.reviewId });
     await vi.waitFor(() =>
-      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain("stopReview"),
+      expect(hostCalls(host).map(({ method }) => method)).toContain("stopReview"),
     );
 
     remote.state = { status: "pending" };
@@ -904,7 +998,7 @@ describe("BB upstream Plannotator bridge", () => {
 
     expect(result).toMatchObject({ isError: true });
     expect(JSON.stringify(result)).toContain("still working and has no finished reply yet");
-    expect(host.harness.inspection.experimental_hostRpcCalls).toHaveLength(0);
+    expect(hostCalls(host)).toHaveLength(0);
   });
 
   it("stops retrying a result whose thread was archived before delivery", async () => {
@@ -1024,7 +1118,7 @@ describe("BB upstream Plannotator bridge", () => {
       thread: makeThreadResponse({ id: "thread-1", archivedAt: Date.now() }),
     });
 
-    expect(host.harness.inspection.experimental_hostRpcCalls).toContainEqual(
+    expect(hostCalls(host)).toContainEqual(
       expect.objectContaining({ method: "stopReview", hostId: "host_mac", input: { sessionId: reviewId } }),
     );
     expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
@@ -1159,7 +1253,7 @@ describe("BB upstream Plannotator bridge", () => {
       { planMarkdown: "# Plan" },
       { threadId: "thread-1", projectId: "project-1" },
     ))) as { reviewId: string };
-    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+    expect(hostCalls(host)[0]).toMatchObject({
       method: "startReview",
       input: { bridgeHost: "claude-code" },
     });
@@ -1177,7 +1271,7 @@ describe("BB upstream Plannotator bridge", () => {
       sourceSeqEnd: 41,
     });
     // The bridge's polls go through the host with room for a 25 s long-poll.
-    const poll = host.harness.inspection.experimental_hostRpcCalls.find(
+    const poll = hostCalls(host).find(
       ({ method, input }) => method === "bridgeFetch" && (input as { path: string }).path === "/api/ai/bridge/poll",
     );
     expect(poll).toMatchObject({ hostId: "host_mac", input: { sessionId: reviewId, waitMs: 25_000 } });
@@ -1214,8 +1308,8 @@ describe("BB upstream Plannotator bridge", () => {
     await host.harness.behavior.callAgentTool("plannotator_review_plan", { planMarkdown: "# Plan" }, threadContext);
     await new Promise((resolve) => setTimeout(resolve, 30));
 
-    expect(host.harness.inspection.experimental_hostRpcCalls[0]!.input).not.toHaveProperty("bridgeHost");
-    expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).not.toContain("bridgeFetch");
+    expect(hostCalls(host)[0]!.input).not.toHaveProperty("bridgeHost");
+    expect(hostCalls(host).map(({ method }) => method)).not.toContain("bridgeFetch");
   });
 
   it("archives Ask AI forks left by an earlier plugin when it starts", async () => {
@@ -1258,7 +1352,7 @@ describe("BB upstream Plannotator bridge", () => {
 
     await host.harness.behavior.callAgentTool("plannotator_annotate_reply", {}, threadContext);
 
-    expect(host.harness.inspection.experimental_hostRpcCalls[0]).toMatchObject({
+    expect(hostCalls(host)[0]).toMatchObject({
       input: { session: { mode: "annotate-last", markdown: "The finished reply." } },
     });
     expect(host.harness.sdk.callsTo("threads.events.list")[2]![0]).toMatchObject({ beforeSeq: "90", order: "desc" });
@@ -1297,7 +1391,7 @@ describe("BB upstream Plannotator bridge", () => {
     const text = String((sent[0] as { input: Array<{ text: string }> }).input[0]!.text);
     expect(text).toContain('"decision":"cancelled"');
     expect(text).toContain("worker on the thread's machine exited");
-    expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain(
+    expect(hostCalls(host).map(({ method }) => method)).toContain(
       "reconcile",
     );
   });
@@ -1357,7 +1451,7 @@ describe("BB upstream Plannotator bridge", () => {
     await vi.waitFor(async () =>
       expect(await reloaded.bb.storage.kv.list("host-cleanup:")).toEqual([]),
     );
-    expect(reloaded.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method).slice(-2)).toEqual([
+    expect(hostCalls(reloaded).map(({ method }) => method).slice(-2)).toEqual([
       "stopReview",
       "reconcile",
     ]);
@@ -1391,7 +1485,7 @@ describe("BB upstream Plannotator bridge", () => {
       '"decision":"cancelled"',
     );
     await vi.waitFor(() =>
-      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain(
+      expect(hostCalls(host).map(({ method }) => method)).toContain(
         "reconcile",
       ),
     );
@@ -1415,9 +1509,9 @@ describe("BB upstream Plannotator bridge", () => {
     );
 
     expect(result).toMatchObject({ isError: true });
-    const startCall = host.harness.inspection.experimental_hostRpcCalls[0]!;
+    const startCall = hostCalls(host)[0]!;
     await vi.waitFor(() =>
-      expect(host.harness.inspection.experimental_hostRpcCalls.slice(1)).toEqual([
+      expect(hostCalls(host).slice(1)).toEqual([
         expect.objectContaining({ method: "stopReview", input: { sessionId: (startCall.input as { sessionId: string }).sessionId } }),
         expect.objectContaining({ method: "reconcile" }),
       ]),
@@ -1482,7 +1576,7 @@ describe("BB upstream Plannotator bridge", () => {
     service.controller.abort();
     await service.done;
 
-    expect(host.harness.inspection.experimental_hostRpcCalls).toContainEqual(
+    expect(hostCalls(host)).toContainEqual(
       expect.objectContaining({ method: "stopReview", hostId: "host_mac", input: { sessionId: reviewId } }),
     );
   });

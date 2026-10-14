@@ -80,8 +80,20 @@ documents, repository info, and plan history come from that checkout.
   `tailscale serve --bg --https=<port> http://127.0.0.1:<port>` and the panel
   iframes `https://<host MagicDNS name>:<port>` directly. The host needs the
   `tailscale` CLI on `PATH` or at `/usr/local/bin/tailscale`, signed in with
-  MagicDNS and HTTPS certificates enabled. Without it, the tool returns an
-  error; it does not fall back to the server.
+  MagicDNS and HTTPS certificates enabled.
+
+The setting **Run reviews on** chooses where a session runs:
+
+- `auto` (default): on the thread's machine when it is not the BB server and
+  can publish with tailscale serve (plannotator on `PATH`, tailscale signed
+  in); otherwise on the BB server, as before this feature.
+- `thread`: always on the thread's machine; an error if it cannot publish.
+- `server`: always on the BB server.
+
+The tool result reports where the session runs (`runsOn`) and why
+(`runsOnReason`). On the BB server, a session for a thread on another machine
+cannot read that thread's worktree, so code review and file annotation need
+the thread's machine.
 
 The host entry removes the serve mapping and stops Plannotator when the
 review ends, is cancelled, or its worker stops. It records every process and

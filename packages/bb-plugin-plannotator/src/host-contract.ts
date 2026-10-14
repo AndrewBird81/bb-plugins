@@ -156,6 +156,16 @@ export const hostContract = defineRpcContract({
       .strict(),
     output: z.object({ status: z.number().int(), body: z.string() }).strict(),
   },
+  /**
+   * Whether this host can run and publish a review: plannotator on PATH and
+   * the tailscale CLI signed in with a MagicDNS name. Changes nothing.
+   */
+  probe: {
+    input: z.object({}).strict(),
+    output: z
+      .object({ publishable: z.boolean(), reason: z.string().max(500).optional() })
+      .strict(),
+  },
   /** Remove stale serve mappings and orphan processes from a dead worker. */
   reconcile: {
     input: z.object({}).strict(),

@@ -203,6 +203,8 @@ const REVIEW_KEY_PREFIX = "review:";
 const DELIVERED_REVIEW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DELIVERY_RETRY_MS = 30_000;
 const LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
+/** How long the thread's machine has to say whether it can publish a review. */
+const PROBE_TIMEOUT_MS = 15_000;
 /** A failed release lookup is retried soon, so one timeout does not show the toast for hours. */
 const LATEST_VERSION_FAILURE_TTL_MS = 5 * 60 * 1000;
 const HOST_CLEANUP_KEY_PREFIX = "host-cleanup:";
@@ -268,6 +270,55 @@ export function reviewTargetFor(
     throw new Error("The thread's environment has no workspace path on its machine.");
   }
   return { kind: "host", hostId: environment.hostId, cwd: environment.path };
+}
+
+/** Where reviews run, from the "Run reviews on" setting. */
+export type RunReviewsOn = "auto" | "thread" | "server";
+export type ReviewPlacement = { runsOn: "thread-host" | "server"; reason: string };
+type ProbeResult = { publishable: boolean; reason?: string };
+
+/**
+ * Pick where a thread's session runs. `auto` uses the thread's own machine
+ * when it can publish the review with tailscale serve, and otherwise the BB
+ * server (Plannotator's original behaviour, which cannot see a worktree on
+ * another machine). `thread` always uses the thread's machine and fails if it
+ * cannot publish; `server` always uses the BB server.
+ */
+export async function placeReview(
+  target: ReviewTarget,
+  runOn: RunReviewsOn,
+  probe: () => Promise<ProbeResult>,
+  pathExists: (path: string) => boolean = existsSync,
+): Promise<{ target: ReviewTarget; placement: ReviewPlacement }> {
+  if (target.kind === "server") {
+    return { target, placement: { runsOn: "server", reason: "the thread runs on the BB server machine" } };
+  }
+  const onServer: ReviewTarget = pathExists(target.cwd) ? { kind: "server", cwd: target.cwd } : { kind: "server" };
+  if (runOn === "server") {
+    return { target: onServer, placement: { runsOn: "server", reason: 'the "Run reviews on" setting is server' } };
+  }
+  if (runOn === "thread") {
+    return { target, placement: { runsOn: "thread-host", reason: 'the "Run reviews on" setting is thread' } };
+  }
+  let probed: ProbeResult;
+  try {
+    probed = await probe();
+  } catch (error) {
+    probed = { publishable: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  if (probed.publishable) {
+    return {
+      target,
+      placement: { runsOn: "thread-host", reason: "the thread's machine can publish the review with tailscale serve" },
+    };
+  }
+  return {
+    target: onServer,
+    placement: {
+      runsOn: "server",
+      reason: `the thread's machine cannot publish the review (${probed.reason ?? "unknown reason"}), so it runs on the BB server, which cannot read files in the thread's worktree`,
+    },
+  };
 }
 
 async function resolveReviewContext(
@@ -572,7 +623,7 @@ function alreadyActiveResponse(reviewId: string | undefined) {
 }
 
 type StartOutcome =
-  | { status: "pending"; reviewId: string; kind: SessionKind }
+  | { status: "pending"; reviewId: string; kind: SessionKind; placement?: ReviewPlacement }
   | { status: "already_active"; reviewId?: string }
   | { status: "error"; error: string };
 
@@ -584,6 +635,7 @@ function toolResponse(outcome: StartOutcome) {
     reviewId: outcome.reviewId,
     kind: outcome.kind,
     source: "plannotator",
+    ...(outcome.placement ? { runsOn: outcome.placement.runsOn, runsOnReason: outcome.placement.reason } : {}),
     message: `End this turn. The ${KIND_NOUN[outcome.kind]} result will arrive as a new message in this thread.`,
   });
 }
@@ -649,6 +701,14 @@ export default async function plugin(bb: BbPluginApi) {
         "thread: Plannotator's Ask AI is answered by the thread's own agent, in a hidden fork that knows the conversation. local: the AI tools installed on the thread's machine (Claude, Codex, Pi, OpenCode), which start without the conversation.",
       options: ["thread", "local"],
       default: "thread",
+    },
+    runReviewsOn: {
+      type: "select",
+      label: "Run reviews on",
+      description:
+        "auto: the thread's own machine when it is not the BB server and can publish the review with tailscale serve, otherwise the BB server. thread: always the thread's machine (an error if it cannot publish). server: always the BB server, which cannot read files in a worktree on another machine.",
+      options: ["auto", "thread", "server"],
+      default: "auto",
     },
   });
 
@@ -1040,8 +1100,19 @@ export default async function plugin(bb: BbPluginApi) {
     let transport: BridgeTransport | undefined;
     let relaySession: RelaySession | undefined;
     let sourceSeqEnd: number | undefined;
+    let placement: ReviewPlacement | undefined;
     try {
-      const { origin, providerId, target } = await resolveReviewContext(bb, threadId, controller.signal);
+      const context = await resolveReviewContext(bb, threadId, controller.signal);
+      const { origin, providerId } = context;
+      const { runReviewsOn } = await settings.get();
+      const runOn: RunReviewsOn = runReviewsOn === "thread" || runReviewsOn === "server" ? runReviewsOn : "auto";
+      const placed = await placeReview(context.target, runOn, () =>
+        context.target.kind === "host"
+          ? hostClient.call("probe", {}, { hostId: context.target.hostId, signal: controller.signal, timeoutMs: PROBE_TIMEOUT_MS })
+          : Promise.resolve({ publishable: false }),
+      );
+      const target = placed.target;
+      placement = placed.placement;
       const session = await resolveSessionRequest(threadId, input, target, controller.signal);
       if (session.mode === "annotate") annotatedPath = session.path;
       if (session.mode === "annotate-last") annotatedReply = replyExcerpt(session.markdown);
@@ -1175,7 +1246,7 @@ export default async function plugin(bb: BbPluginApi) {
       active.settled = settleReview(threadId, active).catch((error) => {
         bb.log.error(`Could not settle Plannotator review ${sessionId}: ${String(error)}`);
       });
-      return { status: "pending", reviewId: sessionId, kind };
+      return { status: "pending", reviewId: sessionId, kind, ...(placement ? { placement } : {}) };
     } catch (error) {
       options.signal?.removeEventListener("abort", abortStartup);
       activeReviews.delete(threadId);

@@ -19,4 +19,4 @@ If the agent misses a result, it can check `plannotator_review_status` with the 
 
 ## Requirements
 
-On the BB server machine, the plugin downloads a pinned official Plannotator binary on first use and caches it locally. You can configure another binary in the plugin settings. Threads on other machines run `plannotator` from that machine's `PATH` in the thread's worktree, published with Tailscale Serve, so those machines need Plannotator and the Tailscale CLI installed. Reviews are optional and remain separate from an agent provider's native Plan mode.
+On the BB server machine, the plugin downloads a pinned official Plannotator binary on first use and caches it locally. You can configure another binary in the plugin settings. Threads on other machines run `plannotator` from that machine's `PATH` in the thread's worktree, published with Tailscale Serve, so those machines need Plannotator and the Tailscale CLI installed. Without them, reviews fall back to the BB server (setting **Run reviews on**). Reviews are optional and remain separate from an agent provider's native Plan mode.

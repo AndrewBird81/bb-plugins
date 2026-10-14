@@ -190,15 +190,20 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer | null> {
   return new Promise((resolveBody, rejectBody) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    req.on("data", (chunk: Buffer) => {
+    const collect = (chunk: Buffer) => {
       size += chunk.length;
-      if (size > limit) {
-        resolveBody(null);
-        req.destroy();
+      if (size <= limit) {
+        chunks.push(chunk);
         return;
       }
-      chunks.push(chunk);
-    });
+      // Discard the rest without buffering it, and let the caller answer 413.
+      // Destroying the socket instead would reach the browser as a 502.
+      chunks.length = 0;
+      req.off("data", collect);
+      req.resume();
+      resolveBody(null);
+    };
+    req.on("data", collect);
     req.on("end", () => resolveBody(Buffer.concat(chunks)));
     req.on("error", rejectBody);
   });
@@ -272,6 +277,7 @@ export async function startReviewProxy(
     if (DECISION_PATHS.has(url.pathname) && method !== "GET" && method !== "HEAD") {
       const raw = await readBody(req, MAX_DECISION_BODY_BYTES);
       if (raw === null) {
+        res.setHeader("connection", "close");
         reply(res, 413, "Request body too large.");
         return;
       }

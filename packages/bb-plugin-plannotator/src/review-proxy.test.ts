@@ -249,7 +249,8 @@ describe("review proxy", () => {
     const { send, seen, origin } = await setup();
     const body = JSON.stringify({ feedback: "x".repeat(1024 * 1024) });
 
-    const response = await send("POST", "/api/deny", { headers: { origin }, body }).catch(() => ({ status: 413 }));
+    // The browser must see the 413 itself, not a reset connection.
+    const response = await send("POST", "/api/deny", { headers: { origin }, body });
 
     expect(response.status).toBe(413);
     expect(seen).toHaveLength(0);

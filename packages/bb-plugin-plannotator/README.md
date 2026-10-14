@@ -60,7 +60,10 @@ applies the same request filter as the proxy on other hosts (below): writes
 only from the bb page's origin, the same endpoint denylist and worktree path
 checks, no WebSocket upgrades, and it never forwards a browser's
 `Authorization` header or cookies. Sessions on the BB server also run with
-Plannotator's sharing (paste service uploads) disabled. The plugin changes
+Plannotator's sharing (paste service uploads) disabled. Known limitation: an
+annotated HTML file's relative assets (images, stylesheets) do not load
+through the relay, because its `<base>` points at BB's own origin and BB's
+plugin routes are exact-match. The plugin changes
 Tailscale configuration only on other hosts, as described below.
 
 ## Threads on other machines

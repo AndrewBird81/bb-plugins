@@ -793,6 +793,62 @@ describe("BB upstream Plannotator bridge", () => {
     );
   });
 
+  it("frees the thread for the next session as soon as one has its decision", async () => {
+    const remote = fakeRemoteHost();
+    let releaseStop!: () => void;
+    const stopHeld = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: async (call) => {
+        // The host is slow to tear the first session down.
+        if (call.method === "stopReview") await stopHeld;
+        return remote.call(call);
+      },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const first = (await host.harness.callRpc("startSession", {
+      threadId: "thread-1",
+      request: { mode: "review" },
+    })) as { reviewId: string };
+
+    remote.state = { status: "decided", decision: { surface: "review", decision: "approved", message: "", noop: true } };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: first.reviewId });
+    await vi.waitFor(() =>
+      expect(host.harness.inspection.experimental_hostRpcCalls.map(({ method }) => method)).toContain("stopReview"),
+    );
+
+    remote.state = { status: "pending" };
+    const second = (await host.harness.callRpc("startSession", {
+      threadId: "thread-1",
+      request: { mode: "review" },
+    })) as { status: string };
+    expect(second.status).toBe("pending");
+    releaseStop();
+  });
+
+  it("says which reply an annotation is about", async () => {
+    const { host, remote } = await hostPlugin();
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_annotate_reply",
+      { markdown: "## Plan for the cache layer\n\nDetails follow." },
+      threadContext,
+    ))) as { reviewId: string };
+
+    remote.state = {
+      status: "decided",
+      decision: { surface: "annotate-last", decision: "annotated", message: "# Message Annotations\n\nShorter.", noop: false },
+    };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+
+    const text = messageText(await sentReview(host));
+    expect(text).toContain('"annotatedReply":"Plan for the cache layer"');
+    expect(text).toContain('your earlier reply that starts "Plan for the cache layer"');
+  });
+
   it("tells the panel when a user-started session ends without a result, and keeps printed feedback", async () => {
     for (const [output, delivered] of [
       [undefined, false],

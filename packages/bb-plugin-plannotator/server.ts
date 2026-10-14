@@ -157,6 +157,8 @@ type ActiveReview = {
   settled?: Promise<void>;
   /** Ask AI answered by the thread's agent: the bridge client and its forks. */
   askAi?: { controller: AbortController; asker: ForkAsker };
+  /** Annotate reply: how the annotated reply starts. */
+  annotatedReply?: string;
 };
 
 const reviewResultSchema = z.object({
@@ -178,6 +180,8 @@ const reviewResultSchema = z.object({
   printedOutput: z.string().max(8_000).optional(),
   /** Ask AI questions and answers during the session, for the agent. */
   askAiSummary: z.string().max(8_000).optional(),
+  /** Annotate reply: how the annotated reply starts, so the agent knows which. */
+  annotatedReply: z.string().max(200).optional(),
 });
 type ReviewResult = z.infer<typeof reviewResultSchema>;
 
@@ -488,14 +492,20 @@ const KIND_NOUN: Record<SessionKind, string> = {
   "annotate-reply": "annotation",
 };
 
-function closingSentence(kind: SessionKind, initiator: SessionInitiator): string {
+/** The first line of an annotated reply, short enough to quote. */
+export function replyExcerpt(markdown: string): string {
+  const line = markdown.split(/\r?\n/u).map((text) => text.replace(/^[#>*\-\s]+/u, "").trim()).find(Boolean) ?? "";
+  return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+}
+
+function closingSentence(kind: SessionKind, initiator: SessionInitiator, annotatedReply?: string): string {
   if (kind === "plan") {
     return "This answers the earlier plannotator_review_plan call. Continue the original task if approved; revise the plan if changes were requested. Cancellation is not approval. Do not repeat this review unless asked.";
   }
   const subject = {
     "code-review": "the worktree changes",
     annotate: "the annotated file",
-    "annotate-reply": "your earlier reply",
+    "annotate-reply": annotatedReply ? `your earlier reply that starts "${annotatedReply}"` : "your earlier reply",
   }[kind];
   const opening =
     initiator === "agent"
@@ -516,7 +526,7 @@ export function reviewMessage(
     ...(message ? [message] : []),
     ...(printedOutput ? [`What Plannotator printed:\n\n${printedOutput}`] : []),
     ...(askAiSummary ? [askAiSummary] : []),
-    closingSentence(kind, initiator),
+    closingSentence(kind, initiator, result.annotatedReply),
   ].join("\n\n");
 }
 
@@ -844,24 +854,25 @@ export default async function plugin(bb: BbPluginApi) {
       ? summarizeExchanges(active.askAi.asker.exchanges(), KIND_NOUN[active.kind])
       : null;
     if (askAiSummary) result = { ...result, askAiSummary };
+    if (active.annotatedReply) result = { ...result, annotatedReply: active.annotatedReply };
+    // The session has its decision: free the thread now, so a new session can
+    // start while this one's cleanup (stopping the process, the host's serve
+    // mapping) and its message delivery are still running.
+    if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
     void stopAskAi(active);
     relaySessions.delete(active.sessionId);
-    await closeReviewPanel(bb, threadId, active.sessionId);
-    // Panels opened manually from the thread action carry no session params,
-    // so closeReviewPanel cannot find them. Tell them the review ended.
+    // Open panels switch to the launcher.
     bb.realtime.publish(PLANNOTATOR_REALTIME_CHANNEL, {
       kind: "review-closed",
       threadId,
       sessionId: active.sessionId,
     });
+    await closeReviewPanel(bb, threadId, active.sessionId);
     try {
       await active.review.stop();
     } catch (error) {
       bb.log.warn(`Could not stop Plannotator review ${active.sessionId}: ${String(error)}`);
     }
-    // The review is over once the upstream process ends. Free the thread now
-    // so a slow or retried decision delivery does not block the next review.
-    if (activeReviews.get(threadId) === active) activeReviews.delete(threadId);
     if (disposing || active.discarded) return;
     const record: StoredReview = {
       id: active.sessionId,
@@ -1017,6 +1028,7 @@ export default async function plugin(bb: BbPluginApi) {
     let upstream: RunningUpstreamReview | HostSession;
     let hostId: string | undefined;
     let annotatedPath: string | undefined;
+    let annotatedReply: string | undefined;
     let transport: BridgeTransport | undefined;
     let relaySession: RelaySession | undefined;
     let sourceSeqEnd: number | undefined;
@@ -1024,6 +1036,7 @@ export default async function plugin(bb: BbPluginApi) {
       const { origin, providerId, target } = await resolveReviewContext(bb, threadId, controller.signal);
       const session = await resolveSessionRequest(threadId, input, target, controller.signal);
       if (session.mode === "annotate") annotatedPath = session.path;
+      if (session.mode === "annotate-last") annotatedReply = replyExcerpt(session.markdown);
       const { askAiSource } = await settings.get();
       const bridgeHost = askAiSource === "thread" ? bridgeHostForProvider(providerId) : undefined;
       if (bridgeHost) sourceSeqEnd = await latestThreadSequence(bb, threadId);
@@ -1127,6 +1140,7 @@ export default async function plugin(bb: BbPluginApi) {
     const active: ActiveReview = {
       sessionId, kind, initiator: options.initiator, payload, review: upstream, controller,
       cancelledByUser: false, discarded: false,
+      ...(annotatedReply ? { annotatedReply } : {}),
     };
     activeReviews.set(threadId, active);
     startingReviews.delete(threadId);

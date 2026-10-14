@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { PLANNOTATOR_RELAY_PATH } from "./embedded";
+import { LOAD_SLOW_MS } from "../app";
 import { PLANNOTATOR_REALTIME_CHANNEL } from "./constants";
 
 const app = await loadPluginApp(() => import("../app"));
@@ -167,7 +168,7 @@ describe("Plannotator BB shell", () => {
 
     const iframe = await slot.findByTitle("Plannotator review");
     expect(iframe.getAttribute("src")).toBe(
-      `http://${window.location.host}${PLANNOTATOR_RELAY_PATH}?sessionId=session-1&path=%2F`,
+      `http://${window.location.host}${PLANNOTATOR_RELAY_PATH}?sessionId=session-1&path=%2F&bbLoad=session--0`,
     );
     expect(iframe.getAttribute("allow")).toBe("clipboard-read; clipboard-write");
     expect(document.cookie).toContain("plannotator-look-feel-announcement-seen=2");
@@ -192,7 +193,7 @@ describe("Plannotator BB shell", () => {
     );
 
     const iframe = await slot.findByTitle("Plannotator review");
-    expect(iframe.getAttribute("src")).toBe("https://mac.tail1b968e.ts.net:19500");
+    expect(iframe.getAttribute("src")).toBe("https://mac.tail1b968e.ts.net:19500/?bbLoad=session--0");
     expect((await slot.findByText("Open externally")).getAttribute("href")).toBe(
       "https://mac.tail1b968e.ts.net:19500",
     );
@@ -386,6 +387,103 @@ describe("Plannotator BB shell", () => {
     });
 
     await slot.findByText("Plannotator exited without a result.");
+  });
+
+  it("reloads with a fresh URL and never hides a slow page behind a failure", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    const head = vi.fn(async () => new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", head);
+    try {
+      const slot = renderSlot(
+        app.threadPanelActions[0]!,
+        { threadId: "thread-1", params: null },
+        {
+          rpc: { getActiveReview: () => ({ ...payload, sessionUrl: "https://mac.tail1b968e.ts.net:19500" }) },
+          sdk: launcherSdk().sdk,
+          openThreadPanel: () => true,
+        },
+      );
+      const iframe = await slot.findByTitle("Plannotator review");
+      expect(slot.getByText("Loading Plannotator…")).toBeTruthy();
+
+      await vi.advanceTimersByTimeAsync(LOAD_SLOW_MS + 10);
+      // Still loading after the threshold: a notice, not a cover, and no failure.
+      await slot.findByText(/still loading \(the page is large\)/u);
+      expect(slot.queryByText("Loading Plannotator…")).toBeNull();
+      expect(slot.queryByText(/cannot reach/u)).toBeNull();
+      expect(head).toHaveBeenCalledWith("https://mac.tail1b968e.ts.net:19500", expect.objectContaining({ method: "HEAD", mode: "no-cors" }));
+
+      fireEvent.click(slot.getByRole("button", { name: "Reload" }));
+      const reloaded = await slot.findByTitle("Plannotator review");
+      expect(reloaded.getAttribute("src")).toBe("https://mac.tail1b968e.ts.net:19500/?bbLoad=session--1");
+      expect(reloaded).not.toBe(iframe);
+      fireEvent.load(reloaded);
+      await waitFor(() => expect(slot.queryByText("Loading Plannotator…")).toBeNull());
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reports an unreachable session only when the page cannot be fetched at all", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    vi.stubGlobal("fetch", async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    try {
+      const slot = renderSlot(
+        app.threadPanelActions[0]!,
+        { threadId: "thread-1", params: null },
+        { rpc: { getActiveReview: () => payload }, sdk: launcherSdk().sdk, openThreadPanel: () => true },
+      );
+      await slot.findByTitle("Plannotator review");
+      await vi.advanceTimersByTimeAsync(LOAD_SLOW_MS + 10);
+      await slot.findByText("This browser cannot reach the Plannotator session.");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("names the tab after the open session", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => ({ ...payload, title: "Code review" }) }, sdk: launcherSdk().sdk, openThreadPanel: () => true },
+    );
+    await slot.findByTitle("Plannotator review");
+    await waitFor(() =>
+      expect(slot.inspection.navigateCalls).toContainEqual({
+        method: "openThreadPanel",
+        options: { actionId: "plannotator-review", title: "Code review" },
+      }),
+    );
+  });
+
+  it("annotates assistant replies only", () => {
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => 0 as never);
+    const action = app.messageActions.find(({ id }) => id === "plannotator-annotate-message")!;
+    const opened: unknown[] = [];
+    void action.run({
+      threadId: "thread-1",
+      message: { id: "m-1", threadId: "thread-1", role: "user", text: "My question", sourceSeqEnd: 1, experimental_messageSeq: 1 },
+      openPanel: (options: unknown) => opened.push(options) > 0,
+    } as never);
+    expect(opened).toEqual([]);
+    expect(toastError).toHaveBeenCalledWith(expect.stringContaining("annotates the agent's replies"));
+    toastError.mockRestore();
+  });
+
+  it("lists Markdown and HTML files in the picker before anything is typed", async () => {
+    const { sdk, calls } = launcherSdk(["docs/guide.md", "page.html"]);
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => null }, sdk },
+    );
+    await slot.findByRole("button", { name: "page.html" });
+    await slot.findByRole("button", { name: "docs/guide.md" });
+    expect(calls.map(({ query }) => query)).toEqual(["md", "html"]);
   });
 
   it("exposes explicit cancellation without a host interaction deadline", async () => {

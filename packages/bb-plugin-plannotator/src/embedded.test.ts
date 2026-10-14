@@ -5,6 +5,7 @@ import {
   embeddedSessionUrl,
   normalizeEmbeddedSessionUrl,
   sharedCookieDomain,
+  iframeLoadUrl,
   upstreamOnboardingCookies,
 } from "./embedded";
 
@@ -44,7 +45,22 @@ describe("embedded Plannotator host seams", () => {
       "plannotator-announce-tui-herdr-seen=1; path=/; max-age=31536000; SameSite=Lax",
       "plannotator-announce-ask-session-seen=1; path=/; max-age=31536000; SameSite=Lax",
       "plannotator-announce-agent-tool-seen=1; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-guide-intro-seen=2; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-edit-mode-announcement-seen=3; path=/; max-age=31536000; SameSite=Lax",
+      "plannotator-token-hover-announcement-seen=1; path=/; max-age=31536000; SameSite=Lax",
     ]);
+  });
+
+  it("gives each session and each reload its own iframe URL", () => {
+    expect(iframeLoadUrl("https://mac.tail1b968e.ts.net:19500", "6f9619ff-8b86", 0)).toBe(
+      "https://mac.tail1b968e.ts.net:19500/?bbLoad=6f9619ff-0",
+    );
+    expect(iframeLoadUrl("https://mac.tail1b968e.ts.net:19500", "6f9619ff-8b86", 2)).toBe(
+      "https://mac.tail1b968e.ts.net:19500/?bbLoad=6f9619ff-2",
+    );
+    expect(iframeLoadUrl("/api/v1/plugins/plannotator/http/review?sessionId=s-1&path=%2F", "abcdef0123", 1)).toBe(
+      "/api/v1/plugins/plannotator/http/review?sessionId=s-1&path=%2F&bbLoad=abcdef01-1",
+    );
   });
 
   it("also scopes the cookies to a shared parent domain and dismisses the update toast", () => {
@@ -52,7 +68,7 @@ describe("embedded Plannotator host seams", () => {
       domain: "tail1b968e.ts.net",
       dismissUpdateVersion: "0.29.0",
     });
-    expect(cookies).toHaveLength(14);
+    expect(cookies).toHaveLength(20);
     expect(cookies).toContain(
       "update-dismissed-version=0.29.0; path=/; max-age=31536000; SameSite=Lax",
     );

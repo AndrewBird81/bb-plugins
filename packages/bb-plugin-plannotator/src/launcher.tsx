@@ -1,8 +1,7 @@
 // The Plannotator panel when no session is open: start a code review or an
-// annotation. Commands and the message action open the panel with a `launch`
-// request, which starts once.
+// annotation. Commands and the message action hand the panel a request.
 import { useEffect, useRef, useState } from "react";
-import { useRpc, useSdk, type JsonValue } from "@get-bb/plugin-sdk/app";
+import { useRpc, useSdk } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
 
 export type LaunchRequest =
@@ -32,61 +31,47 @@ export const DIFF_TYPE_OPTIONS: ReadonlyArray<{ value: DiffType; label: string }
 ];
 
 const ANNOTATABLE = /\.(md|markdown|html?)$/iu;
-const LAUNCHED_KEY = "plannotator-launched";
+/** A request older than this was for a panel that never opened. */
+const PANEL_REQUEST_TTL_MS = 30_000;
 
-/** Panel params that start a session when the panel opens. */
-export function launchParams(request: LaunchRequest): JsonValue {
-  // randomUUID needs a secure context; bb may be served over plain HTTP.
-  const id =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return { launch: { id, request } } as JsonValue;
+/**
+ * What a command or message action asks the thread's Plannotator panel to
+ * do. They hand it over in memory, not as panel params: bb gives each
+ * distinct params value its own tab, and a thread has one Plannotator tab.
+ */
+export type PanelRequest =
+  | { kind: "launch"; request: LaunchRequest }
+  | { kind: "view"; view: "annotate-file" };
+
+const pendingPanelRequests = new Map<string, { request: PanelRequest; at: number }>();
+const panelRequestListeners = new Set<() => void>();
+
+export function requestPanel(threadId: string, request: PanelRequest): void {
+  pendingPanelRequests.set(threadId, { request, at: Date.now() });
+  for (const listener of panelRequestListeners) listener();
 }
 
-export function parseLaunchParams(
-  value: unknown,
-): { launch?: { id: string; request: LaunchRequest }; view?: "annotate-file" } {
-  if (typeof value !== "object" || value === null) return {};
-  const record = value as Record<string, unknown>;
-  if (record.view === "annotate-file") return { view: "annotate-file" };
-  const launch = record.launch as Record<string, unknown> | undefined;
-  if (!launch || typeof launch.id !== "string" || typeof launch.request !== "object" || launch.request === null) {
-    return {};
-  }
-  const request = launch.request as Record<string, unknown>;
-  if (request.mode === "review") {
-    const diffType = DIFF_TYPE_OPTIONS.find(({ value }) => value === request.diffType)?.value;
-    return { launch: { id: launch.id, request: { mode: "review", ...(diffType ? { diffType } : {}) } } };
-  }
-  if (request.mode === "annotate" && typeof request.path === "string") {
-    return { launch: { id: launch.id, request: { mode: "annotate", path: request.path } } };
-  }
-  if (request.mode === "annotate-last") {
-    return {
-      launch: {
-        id: launch.id,
-        request: {
-          mode: "annotate-last",
-          ...(typeof request.markdown === "string" && request.markdown ? { markdown: request.markdown } : {}),
-        },
-      },
+function takePanelRequest(threadId: string): PanelRequest | null {
+  const pending = pendingPanelRequests.get(threadId);
+  pendingPanelRequests.delete(threadId);
+  return pending && Date.now() - pending.at <= PANEL_REQUEST_TTL_MS ? pending.request : null;
+}
+
+/** Run `handle` for each request addressed to this thread's panel. */
+export function usePanelRequests(threadId: string, handle: (request: PanelRequest) => void): void {
+  const handler = useRef(handle);
+  handler.current = handle;
+  useEffect(() => {
+    const drain = () => {
+      const request = takePanelRequest(threadId);
+      if (request) handler.current(request);
     };
-  }
-  return {};
-}
-
-/** A launch tab survives a reload; start each launch once per browser session. */
-function claimLaunch(id: string): boolean {
-  try {
-    const launched = new Set<string>(JSON.parse(sessionStorage.getItem(LAUNCHED_KEY) ?? "[]") as string[]);
-    if (launched.has(id)) return false;
-    launched.add(id);
-    sessionStorage.setItem(LAUNCHED_KEY, JSON.stringify([...launched].slice(-50)));
-    return true;
-  } catch {
-    return true;
-  }
+    panelRequestListeners.add(drain);
+    drain();
+    return () => {
+      panelRequestListeners.delete(drain);
+    };
+  }, [threadId]);
 }
 
 const buttonClass =
@@ -185,14 +170,17 @@ function AnnotateFilePicker({
   );
 }
 
-export function SessionLauncher({ threadId, params }: { threadId: string; params: unknown }) {
+export type SessionStarter = {
+  start(request: LaunchRequest): void;
+  busy: boolean;
+  message: string | null;
+};
+
+/** Start sessions through the server; shared by the launcher and panel requests. */
+export function useSessionStarter(threadId: string): SessionStarter {
   const rpc = useRpc<typeof rpcContract>();
-  const { launch, view } = parseLaunchParams(params);
-  const [diffType, setDiffType] = useState<DiffType>("since-base");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const launched = useRef<string | null>(null);
-
   const start = (request: LaunchRequest) => {
     setBusy(true);
     setMessage(null);
@@ -208,14 +196,20 @@ export function SessionLauncher({ threadId, params }: { threadId: string; params
       .catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)))
       .finally(() => setBusy(false));
   };
+  return { start, busy, message };
+}
 
-  useEffect(() => {
-    if (!launch || launched.current === launch.id || !claimLaunch(launch.id)) return;
-    launched.current = launch.id;
-    start(launch.request);
-    // `start` is stable enough: it only reads the thread and the rpc client.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [launch?.id]);
+export function SessionLauncher({
+  threadId,
+  starter,
+  focusFilePicker,
+}: {
+  threadId: string;
+  starter: SessionStarter;
+  focusFilePicker: boolean;
+}) {
+  const { start, busy, message } = starter;
+  const [diffType, setDiffType] = useState<DiffType>("since-base");
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-background p-4 text-sm">
@@ -268,7 +262,7 @@ export function SessionLauncher({ threadId, params }: { threadId: string; params
         <AnnotateFilePicker
           threadId={threadId}
           disabled={busy}
-          autoFocus={view === "annotate-file"}
+          autoFocus={focusFilePicker}
           onPick={(path) => start({ mode: "annotate", path })}
         />
       </section>

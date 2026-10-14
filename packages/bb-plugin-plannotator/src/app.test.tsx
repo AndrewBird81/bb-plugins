@@ -70,12 +70,29 @@ describe("Plannotator BB shell", () => {
     });
     expect(slot.inspection.navigateCalls).toContainEqual({
       method: "openThreadPanel",
-      options: {
-        actionId: "plannotator-review",
-        title: payload.title,
-        params: payload,
-      },
+      options: { actionId: "plannotator-review", title: payload.title },
     });
+  });
+
+  it("opens every session in the thread's one param-less tab, so bb focuses it instead of adding another", async () => {
+    const slot = renderSlot(
+      app.threadHeaderActions[0]!,
+      { threadId: "thread-1", projectId: "project-1", isCompactViewport: false },
+      { openThreadPanel: () => true, rpc: { getActiveReview: () => null } },
+    );
+
+    await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, { kind: "review-opened", payload });
+    await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, {
+      kind: "review-opened",
+      payload: { ...payload, sessionId: "session-2", title: "Code review" },
+    });
+
+    // bb derives a tab's id from its action and params; with no params both
+    // sessions name the same tab, which bb focuses and retitles.
+    expect(slot.inspection.navigateCalls).toEqual([
+      { method: "openThreadPanel", options: { actionId: "plannotator-review", title: payload.title } },
+      { method: "openThreadPanel", options: { actionId: "plannotator-review", title: "Code review" } },
+    ]);
   });
 
   it("ignores review-opened events for other threads", async () => {
@@ -116,11 +133,7 @@ describe("Plannotator BB shell", () => {
     await waitFor(() =>
       expect(slot.inspection.navigateCalls).toContainEqual({
         method: "openThreadPanel",
-        options: {
-          actionId: "plannotator-review",
-          title: payload.title,
-          params: payload,
-        },
+        options: { actionId: "plannotator-review", title: payload.title },
       }),
     );
     expect(slot.inspection.rpcCalls).toContainEqual({
@@ -147,7 +160,8 @@ describe("Plannotator BB shell", () => {
   it("renders the real upstream URL in the right-panel iframe", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
-      { threadId: "thread-1", params: payload },
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => payload }, sdk: launcherSdk().sdk },
     );
 
     const iframe = await slot.findByTitle("Plannotator review");
@@ -162,14 +176,17 @@ describe("Plannotator BB shell", () => {
   it("iframes a session published by another host directly and pre-dismisses its update toast", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
       {
-        threadId: "thread-1",
-        params: {
-          ...payload,
-          sessionId: "session-2",
-          sessionUrl: "https://mac.tail1b968e.ts.net:19500",
-          dismissUpdateVersion: "0.29.0",
+        rpc: {
+          getActiveReview: () => ({
+            ...payload,
+            sessionId: "session-2",
+            sessionUrl: "https://mac.tail1b968e.ts.net:19500",
+            dismissUpdateVersion: "0.29.0",
+          }),
         },
+        sdk: launcherSdk().sdk,
       },
     );
 
@@ -179,6 +196,17 @@ describe("Plannotator BB shell", () => {
       "https://mac.tail1b968e.ts.net:19500",
     );
     expect(document.cookie).toContain("update-dismissed-version=0.29.0");
+  });
+
+  it("shows the thread's open session, not a session named in an older tab's params", async () => {
+    const legacy = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: payload },
+      { rpc: { getActiveReview: () => null }, sdk: launcherSdk().sdk },
+    );
+    await legacy.findByRole("button", { name: "Review changes" });
+    expect(legacy.queryByTitle("Plannotator review")).toBeNull();
+    legacy.lifecycle.unmount();
   });
 
   it("recovers the pending review when the panel action opens without params", async () => {
@@ -276,27 +304,7 @@ describe("Plannotator BB shell", () => {
     expect(calls[0]).toMatchObject({ environmentId: "env-1", includeFiles: "true", includeDirectories: "false" });
   });
 
-  it("starts a launch request from panel params once and shows a refusal", async () => {
-    const params = { launch: { id: "launch-1", request: { mode: "annotate-last", markdown: "Hello" } } };
-    const slot = renderSlot(
-      app.threadPanelActions[0]!,
-      { threadId: "thread-1", params },
-      {
-        rpc: {
-          getActiveReview: () => null,
-          startSession: () => ({ status: "already_active", reviewId: "r-0" }),
-        },
-        sdk: launcherSdk().sdk,
-      },
-    );
-
-    await slot.findByText("A Plannotator session is already open in this thread.");
-    expect(slot.rpcCalls.filter(({ method }) => method === "startSession")).toEqual([
-      { method: "startSession", input: { threadId: "thread-1", request: { mode: "annotate-last", markdown: "Hello" } } },
-    ]);
-  });
-
-  it("annotates a message, or its selected text, through the panel", () => {
+  it("hands a message-action launch to the thread's panel without tab params", async () => {
     const action = app.messageActions.find(({ id }) => id === "plannotator-annotate-message")!;
     const opened: unknown[] = [];
     const context = (selectedText?: string) =>
@@ -310,20 +318,37 @@ describe("Plannotator BB shell", () => {
         },
       }) as never;
 
-    void action.run(context());
     void action.run(context("Just this"));
+    expect(opened).toEqual([{ actionId: "plannotator-review", title: "Plannotator" }]);
 
-    expect(opened).toMatchObject([
-      { actionId: "plannotator-review", params: { launch: { request: { mode: "annotate-last", markdown: "Full reply" } } } },
-      { actionId: "plannotator-review", params: { launch: { request: { mode: "annotate-last", markdown: "Just this" } } } },
-    ]);
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      {
+        rpc: {
+          getActiveReview: () => null,
+          startSession: () => ({ status: "already_active", reviewId: "r-0" }),
+        },
+        sdk: launcherSdk().sdk,
+      },
+    );
+    await slot.findByText("A Plannotator session is already open in this thread.");
+
+    // A panel that is already open takes the next request too.
+    void action.run(context());
+    await waitFor(() =>
+      expect(slot.rpcCalls.filter(({ method }) => method === "startSession").map(({ input }) => input)).toEqual([
+        { threadId: "thread-1", request: { mode: "annotate-last", markdown: "Just this" } },
+        { threadId: "thread-1", request: { mode: "annotate-last", markdown: "Full reply" } },
+      ]),
+    );
   });
 
   it("exposes explicit cancellation without a host interaction deadline", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
-      { threadId: "thread-1", params: payload },
-      { rpc: { cancelReview: () => ({ cancelled: true }) } },
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => payload, cancelReview: () => ({ cancelled: true }) }, sdk: launcherSdk().sdk },
     );
 
     await slot.findByRole("button", { name: "Cancel review" });

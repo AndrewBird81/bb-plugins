@@ -67,20 +67,19 @@ process.stdin.resume();
   return binary;
 }
 
-async function reviewPanelTab(host: FakePluginHost) {
+/** The panel payload of the thread's open session, as the browser reads it. */
+async function activeReviewPayload(host: FakePluginHost, threadId = "thread-1") {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const update = [...host.harness.sdk.calls]
-      .reverse()
-      .find((call) => call.path === "threads.tabs.update") as
-      | { args: [input: { tabs: Array<Record<string, unknown>> }] }
-      | undefined;
-    const panel = update?.args[0].tabs.find(
-      (tab) => tab.kind === "plugin-panel" && tab.actionId === "plannotator-review",
-    );
-    if (panel) return panel;
+    const payload = (await host.harness.callRpc("getActiveReview", { threadId })) as Record<string, unknown> | null;
+    if (payload) return payload;
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
-  throw new Error("Expected a persisted Plannotator review tab");
+  throw new Error("Expected an open Plannotator session");
+}
+
+/** The server must leave the thread's tabs to the browser (one tab per thread). */
+function expectNoTabWrites(host: FakePluginHost) {
+  expect(host.harness.sdk.callsTo("threads.tabs.update")).toHaveLength(0);
 }
 
 function wireInteractionSdk(
@@ -235,12 +234,7 @@ describe("BB upstream Plannotator bridge", () => {
       { title: "Upstream UI", planMarkdown: "# Plan\n\n- Use the real app" },
       { threadId: "thread-1", projectId: "project-1" },
     );
-    const panel = await reviewPanelTab(host);
-    expect(panel).toMatchObject({
-      kind: "plugin-panel",
-      actionId: "plannotator-review",
-    });
-    expect(JSON.parse(String(panel.paramsJson))).toMatchObject({
+    expect(await activeReviewPayload(host)).toMatchObject({
       sessionUrl: "http://127.0.0.1:43210",
       threadId: "thread-1",
       relayPath: PLANNOTATOR_RELAY_PATH,
@@ -287,13 +281,7 @@ describe("BB upstream Plannotator bridge", () => {
     )).toContain('"decision":"approved"');
     expect(host.harness.inspection.pendingInteractions).toHaveLength(0);
     expect(host.harness.sdk.callsTo("threads.interactions.respond")).toHaveLength(0);
-    const finalTabUpdateCall = [...host.harness.sdk.calls]
-      .reverse()
-      .find((call) => call.path === "threads.tabs.update");
-    expect(finalTabUpdateCall?.args[0]).toMatchObject({
-      threadId: "thread-1",
-      tabs: [],
-    });
+    expectNoTabWrites(host);
   });
 
   it("cancels the upstream process through the thread-owned panel RPC", async () => {
@@ -311,8 +299,7 @@ describe("BB upstream Plannotator bridge", () => {
       { planMarkdown: "# Plan\n\n- Cancel me" },
       { threadId: "thread-1", projectId: "project-1" },
     );
-    const panel = await reviewPanelTab(host);
-    const payload = JSON.parse(String(panel.paramsJson)) as { sessionId: string };
+    const payload = (await activeReviewPayload(host)) as { sessionId: string };
     await expect(
       host.harness.callRpc("cancelReview", {
         threadId: "thread-1",
@@ -326,12 +313,7 @@ describe("BB upstream Plannotator bridge", () => {
       input: [{ text: expect.stringContaining('"decision":"cancelled"') }],
     });
     expect(host.harness.inspection.pendingInteractions).toHaveLength(0);
-    const finalTabUpdateCall = [...host.harness.sdk.calls]
-      .reverse()
-      .find((call) => call.path === "threads.tabs.update");
-    expect(finalTabUpdateCall?.args?.[0]).toMatchObject({
-      tabs: [],
-    });
+    expectNoTabWrites(host);
   });
 
   it("refuses a second review with a distinct status instead of cancelled", async () => {
@@ -468,10 +450,7 @@ describe("BB upstream Plannotator bridge", () => {
       { planMarkdown: "# Plan\n\n- Delete me" },
       { threadId: "thread-1", projectId: "project-1" },
     );
-    const panel = await reviewPanelTab(host);
-    const payload = JSON.parse(String(panel.paramsJson)) as {
-      sessionId: string;
-    };
+    const payload = (await activeReviewPayload(host)) as { sessionId: string };
     await expect(
       host.harness.callRpc("getActiveReview", { threadId: "thread-1" }),
     ).resolves.toMatchObject({ sessionId: payload.sessionId });
@@ -610,7 +589,7 @@ describe("BB upstream Plannotator bridge", () => {
         session: { mode: "plan", planMarkdown: "# Plan\n\n- On the Mac" },
       },
     });
-    const panel = JSON.parse(String((await reviewPanelTab(host)).paramsJson)) as Record<string, unknown>;
+    const panel = await activeReviewPayload(host);
     expect(panel).toMatchObject({
       sessionId: result.reviewId,
       sessionUrl: "https://mac.tail1b968e.ts.net:19500",
@@ -665,7 +644,7 @@ describe("BB upstream Plannotator bridge", () => {
       method: "startReview",
       input: { cwd: "/Users/me/repo", session: { mode: "review", diffType: "uncommitted", base: "origin/main" } },
     });
-    expect(JSON.parse(String((await reviewPanelTab(host)).paramsJson))).toMatchObject({
+    expect(await activeReviewPayload(host)).toMatchObject({
       title: "Code review",
       sessionKind: "code-review",
     });
@@ -854,6 +833,11 @@ describe("BB upstream Plannotator bridge", () => {
       expect.objectContaining({ method: "stopReview", hostId: "host_mac", input: { sessionId: reviewId } }),
     );
     expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
+    // An open panel switches to the launcher at once.
+    expect(host.harness.realtimeSignals).toContainEqual({
+      channel: PLANNOTATOR_REALTIME_CHANNEL,
+      payload: { kind: "review-closed", threadId: "thread-1", sessionId: reviewId },
+    });
     expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({
       status: "closed",
       result: { decision: "cancelled", error: "The review ended when its thread was archived." },
@@ -862,7 +846,7 @@ describe("BB upstream Plannotator bridge", () => {
     expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
-  it("closes a previous review's tab when a new review opens", async () => {
+  it("leaves tabs to the browser and removes only a legacy tab of the settling review", async () => {
     const remote = fakeRemoteHost();
     const host = createFakePluginHost({
       pluginId: "plannotator",
@@ -871,31 +855,43 @@ describe("BB upstream Plannotator bridge", () => {
     hosts.push(host);
     await plugin(host.bb);
     wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
-    const staleTab = {
-      kind: "plugin-panel",
-      id: "plugin-panel:plannotator:plannotator-review:old",
-      actionId: "plannotator-review",
-      pluginId: "plannotator",
-      title: "Plannotator review",
-      paramsJson: JSON.stringify({ sessionId: "old" }),
-    };
-    await host.bb.sdk.threads.tabs.update({
-      threadId: "thread-1",
-      expectedRevision: 1,
-      tabs: [{ kind: "thread-info", id: "thread-info" }, staleTab] as never,
-    });
 
     const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
       "plannotator_review_plan",
       { planMarkdown: "# Plan" },
       { threadId: "thread-1", projectId: "project-1" },
     ))) as { reviewId: string };
+    // Opening a review writes no tab: the browser opens the thread's one
+    // param-less Plannotator tab, so bb never sees two ids for one review.
+    expectNoTabWrites(host);
+
+    // A tab persisted by 0.5.1 or earlier for this review, next to the
+    // browser's param-less tab.
+    const sharedTab = {
+      kind: "plugin-panel",
+      id: "plugin-panel:plannotator%3Aplannotator-review%3A:none",
+      actionId: "plannotator-review",
+      pluginId: "plannotator",
+      title: "Plannotator review",
+      paramsJson: null,
+    };
+    const legacyTab = {
+      ...sharedTab,
+      id: `plugin-panel:plannotator:plannotator-review:${reviewId}`,
+      paramsJson: JSON.stringify({ sessionId: reviewId }),
+    };
+    await host.bb.sdk.threads.tabs.update({
+      threadId: "thread-1",
+      expectedRevision: 1,
+      tabs: [{ kind: "thread-info", id: "thread-info" }, sharedTab, legacyTab] as never,
+    });
+
+    remote.state = { status: "decided", decision: { approved: true } };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+    await sentReview(host);
 
     const { tabs } = await host.bb.sdk.threads.tabs.get({ threadId: "thread-1" });
-    expect(tabs.map((tab) => tab.id)).toEqual([
-      "thread-info",
-      `plugin-panel:plannotator:plannotator-review:${reviewId}`,
-    ]);
+    expect(tabs.map((tab) => tab.id)).toEqual(["thread-info", sharedTab.id]);
   });
 
   it("tells the agent to resubmit with plannotator_review_plan, not upstream's plan tool", () => {

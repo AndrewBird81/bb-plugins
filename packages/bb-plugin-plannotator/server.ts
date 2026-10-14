@@ -349,57 +349,11 @@ function panelSessionId(paramsJson: string | null): string | null {
   }
 }
 
-/** Persist and focus the upstream review in the thread's right-panel tabs. */
-async function openReviewPanel(
-  bb: BbPluginApi,
-  threadId: string,
-  payload: ReviewPanelPayload,
-): Promise<void> {
-  const tab = {
-    kind: "plugin-panel" as const,
-    id: `plugin-panel:${bb.pluginId}:${PANEL_ACTION_ID}:${payload.sessionId}`,
-    actionId: PANEL_ACTION_ID,
-    pluginId: bb.pluginId,
-    title: payload.title,
-    paramsJson: JSON.stringify(payload),
-  };
-
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const current = await bb.sdk.threads.tabs.get({ threadId });
-      const isReviewTab = (existing: (typeof current.tabs)[number]) =>
-        existing.kind === "plugin-panel" &&
-        existing.pluginId === bb.pluginId &&
-        existing.actionId === PANEL_ACTION_ID;
-      // Only one review is pending per thread, so any other review tab is
-      // left over from an earlier review.
-      const kept = current.tabs.filter(
-        (existing) =>
-          !isReviewTab(existing) ||
-          (existing.kind === "plugin-panel" &&
-            panelSessionId(existing.paramsJson) === payload.sessionId),
-      );
-      const alreadyOpen = kept.some(isReviewTab);
-      if (alreadyOpen && kept.length === current.tabs.length) return;
-
-      await bb.sdk.threads.tabs.update({
-        threadId,
-        expectedRevision: current.revision,
-        tabs: alreadyOpen ? kept : [...kept, tab],
-      });
-      return;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`Could not open the Plannotator tab: ${String(lastError)}`);
-}
-
-/** Remove only this review's persisted right-panel tab, retrying CAS races. */
+/**
+ * Remove tabs that 0.5.1 and earlier opened for this review. Those versions
+ * persisted a tab per review; a thread now has one param-less Plannotator tab,
+ * which the browser opens, so new reviews leave nothing here to remove.
+ */
 async function closeReviewPanel(
   bb: BbPluginApi,
   threadId: string,
@@ -1004,7 +958,6 @@ export default async function plugin(bb: BbPluginApi) {
     startingReviews.delete(threadId);
 
     try {
-      await openReviewPanel(bb, threadId, payload);
       if (options.signal?.aborted || active.discarded || controller.signal.aborted) {
         throw new Error("Plannotator review was cancelled before opening");
       }
@@ -1163,6 +1116,12 @@ export default async function plugin(bb: BbPluginApi) {
     activeReviews.delete(threadId);
     active.discarded = true;
     active.controller.abort();
+    // Open panels switch to the launcher now rather than showing a dead session.
+    bb.realtime.publish(PLANNOTATOR_REALTIME_CHANNEL, {
+      kind: "review-closed",
+      threadId,
+      sessionId: active.sessionId,
+    });
     await Promise.allSettled([
       closeReviewPanel(bb, threadId, active.sessionId),
       active.review.stop(),

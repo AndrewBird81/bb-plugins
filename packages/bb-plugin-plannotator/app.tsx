@@ -26,7 +26,13 @@ import {
   sharedCookieDomain,
   upstreamOnboardingCookies,
 } from "./src/embedded";
-import { SessionLauncher, launchParams } from "./src/launcher";
+import {
+  SessionLauncher,
+  requestPanel,
+  usePanelRequests,
+  useSessionStarter,
+  type PanelRequest,
+} from "./src/launcher";
 
 type PlannotatorPayload = {
   kind: "plannotator";
@@ -94,20 +100,16 @@ function parseReviewClosed(
 }
 
 /**
- * A panel opened from the thread action carries no params. Recover the
- * thread's pending review from the server so a review whose tab was closed
- * can still be approved, annotated, or cancelled.
+ * The thread's open session, from the server and kept current by realtime.
+ * A thread has one Plannotator tab, without params, and it always shows this
+ * session; tab params from older versions are ignored.
  */
-function useActiveReviewFallback(
-  threadId: string,
-  enabled: boolean,
-): PlannotatorPayload | null {
+function useActiveReview(threadId: string): PlannotatorPayload | null {
   const rpc = useRpc<typeof rpcContract>();
   const realtimeConnectionState = useRealtimeConnectionState();
   const [active, setActive] = useState<PlannotatorPayload | null>(null);
 
   useRealtime(PLANNOTATOR_REALTIME_CHANNEL, (value) => {
-    if (!enabled) return;
     const opened = parseReviewOpened(value);
     if (opened && opened.threadId === threadId) {
       setActive(opened);
@@ -122,7 +124,7 @@ function useActiveReviewFallback(
   });
 
   useEffect(() => {
-    if (!enabled || realtimeConnectionState !== "connected") return;
+    if (realtimeConnectionState !== "connected") return;
     let cancelled = false;
     void rpc
       .call("getActiveReview", { threadId })
@@ -135,15 +137,15 @@ function useActiveReviewFallback(
     return () => {
       cancelled = true;
     };
-  }, [enabled, realtimeConnectionState, rpc, threadId]);
+  }, [realtimeConnectionState, rpc, threadId]);
 
-  return enabled ? active : null;
+  return active;
 }
 
 /**
- * Server-side tool calls can persist a tab, but only the app navigation API
- * can focus/open the side panel. This deliberately renders no control: it is
- * just a per-thread listener for the one-shot review-opened signal.
+ * Opens and focuses the thread's Plannotator tab when a session starts. It
+ * passes no params, so bb keeps exactly one such tab per thread and focuses
+ * it again for every session. Renders no control.
  */
 function PlannotatorFocusBridge({
   threadId,
@@ -159,13 +161,7 @@ function PlannotatorFocusBridge({
       if (!payload || payload.threadId !== threadId) return;
       if (focusedSessionId.current === payload.sessionId) return;
 
-      if (
-        navigate.openThreadPanel({
-          actionId: PANEL_ACTION_ID,
-          title: payload.title,
-          params: payload,
-        })
-      ) {
+      if (navigate.openThreadPanel({ actionId: PANEL_ACTION_ID, title: payload.title })) {
         focusedSessionId.current = payload.sessionId;
       }
     },
@@ -197,11 +193,15 @@ function PlannotatorFocusBridge({
   return null;
 }
 
-function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
-  const paramsPayload = parsePayload(params);
-  const fallbackPayload = useActiveReviewFallback(threadId, !paramsPayload);
-  const payload = paramsPayload ?? fallbackPayload;
+function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
+  const payload = useActiveReview(threadId);
   const rpc = useRpc<typeof rpcContract>();
+  const starter = useSessionStarter(threadId);
+  const [focusFilePicker, setFocusFilePicker] = useState(false);
+  usePanelRequests(threadId, (request) => {
+    if (request.kind === "launch") starter.start(request.request);
+    else setFocusFilePicker(true);
+  });
   const [reloadKey, setReloadKey] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
@@ -247,7 +247,9 @@ function PlannotatorPanel({ threadId, params }: PluginThreadPanelProps) {
     );
   }, [payload?.sessionId, payload?.sessionUrl, payload?.dismissUpdateVersion]);
 
-  if (!payload) return <SessionLauncher threadId={threadId} params={params} />;
+  if (!payload) {
+    return <SessionLauncher threadId={threadId} starter={starter} focusFilePicker={focusFilePicker} />;
+  }
 
   if (!embeddedUrl) {
     return (
@@ -349,17 +351,21 @@ export default definePluginApp((app) => {
     title: "Plannotator focus bridge",
     component: PlannotatorFocusBridge,
   });
+  const openWith = (
+    context: { threadId: string | null; openPanel(options: { actionId: string; title?: string }): boolean },
+    request: PanelRequest,
+  ) => {
+    if (!context.threadId) return;
+    requestPanel(context.threadId, request);
+    context.openPanel({ actionId: PANEL_ACTION_ID, title: "Plannotator" });
+  };
   app.slots.messageAction({
     id: "plannotator-annotate-message",
     title: "Annotate in Plannotator",
     icon: "ClipboardCheck",
     run(context) {
       const markdown = context.selectedText?.trim() ? context.selectedText : context.message.text;
-      context.openPanel({
-        actionId: PANEL_ACTION_ID,
-        title: "Annotate reply",
-        params: launchParams({ mode: "annotate-last", markdown }),
-      });
+      openWith(context, { kind: "launch", request: { mode: "annotate-last", markdown } });
     },
   });
   const inThread = (context: { threadId: string | null }) => context.threadId !== null;
@@ -367,28 +373,18 @@ export default definePluginApp((app) => {
     id: "plannotator-review-changes",
     title: "Plannotator: Review changes",
     isAvailable: inThread,
-    run(context) {
-      context.openPanel({ actionId: PANEL_ACTION_ID, title: "Code review", params: launchParams({ mode: "review" }) });
-    },
+    run: (context) => openWith(context, { kind: "launch", request: { mode: "review" } }),
   });
   app.commands.register({
     id: "plannotator-annotate-last-reply",
     title: "Plannotator: Annotate last reply",
     isAvailable: inThread,
-    run(context) {
-      context.openPanel({
-        actionId: PANEL_ACTION_ID,
-        title: "Annotate reply",
-        params: launchParams({ mode: "annotate-last" }),
-      });
-    },
+    run: (context) => openWith(context, { kind: "launch", request: { mode: "annotate-last" } }),
   });
   app.commands.register({
     id: "plannotator-annotate-file",
     title: "Plannotator: Annotate file…",
     isAvailable: inThread,
-    run(context) {
-      context.openPanel({ actionId: PANEL_ACTION_ID, title: "Plannotator", params: { view: "annotate-file" } });
-    },
+    run: (context) => openWith(context, { kind: "view", view: "annotate-file" }),
   });
 });

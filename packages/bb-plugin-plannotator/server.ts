@@ -128,6 +128,15 @@ const REVIEW_KEY_PREFIX = "review:";
 const DELIVERED_REVIEW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DELIVERY_RETRY_MS = 30_000;
 const LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
+/** A failed release lookup is retried soon, so one timeout does not show the toast for hours. */
+const LATEST_VERSION_FAILURE_TTL_MS = 5 * 60 * 1000;
+const HOST_CLEANUP_KEY_PREFIX = "host-cleanup:";
+/** A host that stays unreachable this long is assumed gone. */
+const HOST_CLEANUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const hostCleanupSchema = z
+  .object({ hostId: z.string().min(1), sessionId: z.string().uuid(), queuedAt: z.number() })
+  .strict();
+type HostCleanup = z.infer<typeof hostCleanupSchema>;
 
 /**
  * Map BB's provider ids to the identities the upstream UI knows how to name.
@@ -477,27 +486,44 @@ export default async function plugin(bb: BbPluginApi) {
     });
   });
 
-  // Host reviews whose stop did not reach their machine. Retried until the
-  // host answers: stop the review if its worker survived, then reconcile so a
-  // fresh worker removes the orphan process and serve mapping.
-  const pendingHostCleanups = new Map<string, { hostId: string; sessionId: string }>();
-  const queueHostCleanup = (hostId: string, sessionId: string) =>
-    pendingHostCleanups.set(sessionId, { hostId, sessionId });
+  // Host reviews that may have left a process or serve mapping behind. Kept in
+  // KV so a plugin or server restart does not lose them, and retried until the
+  // host answers: stop the review if its worker survived, then reconcile so
+  // the worker removes what it recorded.
+  const hostCleanupKey = (sessionId: string) => `${HOST_CLEANUP_KEY_PREFIX}${sessionId}`;
+  async function runHostCleanup(cleanup: HostCleanup): Promise<void> {
+    try {
+      await hostClient.call("stopReview", { sessionId: cleanup.sessionId }, { hostId: cleanup.hostId });
+      await hostClient.call("reconcile", {}, { hostId: cleanup.hostId });
+      await bb.storage.kv.delete(hostCleanupKey(cleanup.sessionId));
+    } catch {
+      // Still unreachable; try again on the next delivery pass.
+    }
+  }
+  function queueHostCleanup(hostId: string, sessionId: string): void {
+    const cleanup: HostCleanup = { hostId, sessionId, queuedAt: Date.now() };
+    void bb.storage.kv
+      .set(hostCleanupKey(sessionId), cleanup)
+      .then(() => runHostCleanup(cleanup))
+      .catch((error: unknown) => {
+        bb.log.warn(`Could not queue Plannotator cleanup on ${hostId}: ${String(error)}`);
+      });
+  }
   async function retryHostCleanups(): Promise<void> {
-    for (const { hostId, sessionId } of [...pendingHostCleanups.values()]) {
-      try {
-        await hostClient.call("stopReview", { sessionId }, { hostId });
-        await hostClient.call("reconcile", {}, { hostId });
-        pendingHostCleanups.delete(sessionId);
-      } catch {
-        // Still unreachable; try again on the next delivery pass.
+    for (const key of await bb.storage.kv.list(HOST_CLEANUP_KEY_PREFIX)) {
+      const parsed = hostCleanupSchema.safeParse(await bb.storage.kv.get(key));
+      if (!parsed.success || Date.now() - parsed.data.queuedAt > HOST_CLEANUP_RETENTION_MS) {
+        await bb.storage.kv.delete(key);
+        continue;
       }
+      await runHostCleanup(parsed.data);
     }
   }
 
   let latestVersion: { value: string | null; fetchedAt: number } | null = null;
   async function latestUpstreamVersion(): Promise<string | undefined> {
-    if (!latestVersion || Date.now() - latestVersion.fetchedAt > LATEST_VERSION_TTL_MS) {
+    const ttl = latestVersion?.value ? LATEST_VERSION_TTL_MS : LATEST_VERSION_FAILURE_TTL_MS;
+    if (!latestVersion || Date.now() - latestVersion.fetchedAt > ttl) {
       latestVersion = { value: await fetchLatestUpstreamVersion(), fetchedAt: Date.now() };
     }
     return latestVersion.value ?? undefined;
@@ -690,6 +716,7 @@ export default async function plugin(bb: BbPluginApi) {
       context.signal.addEventListener("abort", abortStartup, { once: true });
       const dismissUpdateVersion = latestUpstreamVersion();
       let upstream: RunningUpstreamReview | HostPlanReview;
+      let hostId: string | undefined;
       try {
         const { origin, target } = await resolveReviewContext(
           bb,
@@ -697,6 +724,7 @@ export default async function plugin(bb: BbPluginApi) {
           controller.signal,
         );
         if (target.kind === "host") {
+          hostId = target.hostId;
           upstream = await startHostPlanReview({
             client: hostClient,
             hostId: target.hostId,
@@ -705,7 +733,7 @@ export default async function plugin(bb: BbPluginApi) {
             cwd: target.cwd,
             origin,
             signal: controller.signal,
-            onStopFailed: () => queueHostCleanup(target.hostId, sessionId),
+            onCleanupNeeded: () => queueHostCleanup(target.hostId, sessionId),
           });
         } else {
           const configuredPath = await getConfiguredPath(settings);
@@ -726,6 +754,9 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         context.signal.removeEventListener("abort", abortStartup);
         startingReviews.delete(context.threadId);
+        // An aborted or timed-out call may still have started and published
+        // the review on the host.
+        if (hostId) queueHostCleanup(hostId, sessionId);
         return errorResponse(error instanceof Error ? error.message : String(error));
       }
       // The process can exit while the panel and stored review are opening.
@@ -733,6 +764,7 @@ export default async function plugin(bb: BbPluginApi) {
       void upstream.result.catch(() => undefined);
 
       const title = params.title?.trim() || "Plannotator review";
+      const updateVersion = await dismissUpdateVersion;
       const payload = interactionPayloadSchema.parse({
         kind: "plannotator",
         sessionId,
@@ -740,7 +772,8 @@ export default async function plugin(bb: BbPluginApi) {
         sessionUrl: upstream.url,
         relayPath: PLANNOTATOR_RELAY_PATH,
         title,
-        dismissUpdateVersion: await dismissUpdateVersion,
+        // RPC results are strict JSON: omit the field rather than send undefined.
+        ...(updateVersion ? { dismissUpdateVersion: updateVersion } : {}),
       });
       // Host reviews are published on their own machine; only in-process
       // listeners go through BB's relay.

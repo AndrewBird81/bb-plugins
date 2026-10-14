@@ -1,6 +1,8 @@
 // Runs Plannotator on a bb host that is not the server machine. Plannotator
-// binds loopback in the thread's worktree; `tailscale serve` publishes it over
-// HTTPS so every tailnet device can load the 20+ MB UI directly from the host.
+// binds a random loopback port in the thread's worktree. A checking proxy
+// (src/review-proxy.ts) listens on a port in HOST_PORT_RANGE, and
+// `tailscale serve` publishes that port over HTTPS so every tailnet device can
+// load the 20+ MB UI directly from the host.
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
@@ -9,6 +11,7 @@ import {
   type ExperimentalHostWorkerLease,
 } from "@get-bb/plugin-sdk";
 import type { BridgeOptions, RunningUpstreamReview } from "./bridge";
+import type { ReviewProxyOptions, RunningReviewProxy } from "./review-proxy";
 import {
   HOST_PORT_RANGE,
   hostContract,
@@ -36,6 +39,10 @@ export type HostRuntimeDeps = {
   /** Run argv without a shell. Rejects only when the command cannot start. */
   runCommand(file: string, args: readonly string[], timeoutMs: number): Promise<CommandResult>;
   startPlanReview(options: BridgeOptions): Promise<RunningUpstreamReview>;
+  /** Listen on 127.0.0.1:port. Rejects with code EADDRINUSE when it is taken. */
+  startProxy(port: number, options: ReviewProxyOptions): Promise<RunningReviewProxy>;
+  /** Plannotator's image upload directory, which `/api/image` may read. */
+  uploadDir: string;
   /** Resolve a command name on PATH only. */
   findExecutable(name: string): string | null;
   isExecutable(path: string): boolean;
@@ -50,14 +57,21 @@ const KILL_GRACE_MS = 1_000;
 /** The server polls every few seconds; a review nobody polls is orphaned. */
 export const UNPOLLED_REVIEW_TIMEOUT_MS = 5 * 60_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
-const OWNED_PROCESSES_FILE = "owned-processes.json";
+const OWNED_FILE = "owned-processes.json";
 
 /** A Plannotator process this plugin started, identified by pid and start time. */
-type OwnedProcess = { pid: number; port: number; started: string };
+type OwnedProcess = { pid: number; started: string };
+/**
+ * What this plugin created on the host and has not cleaned up yet. Reconcile
+ * only removes serve mappings recorded here, never one by its shape alone.
+ */
+type OwnedState = { processes: OwnedProcess[]; mappings: number[] };
 
 type HostReview = {
   sessionId: string;
   review: RunningUpstreamReview;
+  proxy: RunningReviewProxy;
+  /** The published port, which the proxy listens on. */
   port: number;
   tailscalePath: string;
   state: HostReviewState;
@@ -66,6 +80,9 @@ type HostReview = {
   unpublished?: Promise<void>;
   stopped?: Promise<void>;
 };
+
+/** Resources of a review whose start has not finished, kept out of reconcile. */
+type StartClaim = { pid?: number; port?: number };
 
 type ReconcileResult = { removedPorts: number[]; killedPids: number[] };
 type HostContext = ExperimentalHostRpcContext<typeof hostSignals>;
@@ -83,11 +100,35 @@ function commandDetail(result: CommandResult): string {
 function isOwnedProcess(value: unknown): value is OwnedProcess {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
-  return (
-    Number.isInteger(record.pid) &&
-    Number.isInteger(record.port) &&
-    typeof record.started === "string"
-  );
+  return Number.isInteger(record.pid) && typeof record.started === "string";
+}
+
+function isPort(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 65_535;
+}
+
+/** Read the owned state, including 0.4.0's array of `{ pid, port, started }`. */
+export function parseOwnedState(text: string): OwnedState {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { processes: [], mappings: [] };
+  }
+  if (Array.isArray(parsed)) {
+    // 0.4.0 published each process on its own port.
+    const processes = parsed.filter(isOwnedProcess);
+    return {
+      processes: processes.map(({ pid, started }) => ({ pid, started })),
+      mappings: processes.map((owned) => (owned as { port?: unknown }).port).filter(isPort),
+    };
+  }
+  if (typeof parsed !== "object" || parsed === null) return { processes: [], mappings: [] };
+  const record = parsed as Record<string, unknown>;
+  return {
+    processes: Array.isArray(record.processes) ? record.processes.filter(isOwnedProcess) : [],
+    mappings: Array.isArray(record.mappings) ? record.mappings.filter(isPort) : [],
+  };
 }
 
 async function isDirectory(path: string): Promise<boolean> {
@@ -98,12 +139,38 @@ async function isDirectory(path: string): Promise<boolean> {
   }
 }
 
+function hostPorts(): number[] {
+  const ports: number[] = [];
+  for (let port = HOST_PORT_RANGE.first; port <= HOST_PORT_RANGE.last; port += 1) ports.push(port);
+  return ports;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new Error("Plannotator review was cancelled while it was starting.");
+}
+
 export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
   const reviews = new Map<string, HostReview>();
+  const claims = new Map<string, StartClaim>();
   let dataDir: string | null = null;
   let startup: Promise<ReconcileResult> | null = null;
+  let reconciling: Promise<unknown> = Promise.resolve();
   let watchdog: ReturnType<typeof setInterval> | null = null;
   let ownedWrites: Promise<unknown> = Promise.resolve();
+
+  function liveResources(): { pids: Set<number>; ports: Set<number> } {
+    const pids = new Set<number>();
+    const ports = new Set<number>();
+    for (const { review, port } of reviews.values()) {
+      if (review.pid !== undefined) pids.add(review.pid);
+      ports.add(port);
+    }
+    for (const claim of claims.values()) {
+      if (claim.pid !== undefined) pids.add(claim.pid);
+      if (claim.port !== undefined) ports.add(claim.port);
+    }
+    return { pids, ports };
+  }
 
   function resolveTailscale(): string | null {
     return (
@@ -169,25 +236,22 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     }
   }
 
-  async function readOwned(directory: string): Promise<OwnedProcess[]> {
+  async function readOwned(directory: string): Promise<OwnedState> {
     try {
-      const parsed = JSON.parse(
-        await readFile(join(directory, OWNED_PROCESSES_FILE), "utf8"),
-      ) as unknown;
-      return Array.isArray(parsed) ? parsed.filter(isOwnedProcess) : [];
+      return parseOwnedState(await readFile(join(directory, OWNED_FILE), "utf8"));
     } catch {
-      return [];
+      return { processes: [], mappings: [] };
     }
   }
 
   function updateOwned(
     directory: string,
-    update: (current: OwnedProcess[]) => OwnedProcess[],
+    update: (current: OwnedState) => OwnedState,
   ): Promise<void> {
     const next = ownedWrites.then(async () => {
       await mkdir(directory, { recursive: true });
       const updated = update(await readOwned(directory));
-      await writeFile(join(directory, OWNED_PROCESSES_FILE), JSON.stringify(updated), {
+      await writeFile(join(directory, OWNED_FILE), JSON.stringify(updated), {
         encoding: "utf8",
         mode: 0o600,
       });
@@ -197,34 +261,56 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
   }
 
   /**
-   * Remove what a dead worker left behind: Plannotator processes recorded in
-   * the data dir whose pid still has the recorded start time, and serve
-   * mappings in this plugin's port range that match the exact shape it creates.
+   * Remove what a dead worker or a failed cleanup left behind: recorded
+   * Plannotator processes whose pid still has the recorded start time, and
+   * recorded serve mappings that still have the exact shape this plugin
+   * creates. Live and starting reviews are never touched.
    */
-  async function reconcile(directory: string): Promise<ReconcileResult> {
-    const livePids = new Set([...reviews.values()].map(({ review }) => review.pid));
-    const livePorts = new Set([...reviews.values()].map(({ port }) => port));
-    const killedPids: number[] = [];
-    for (const owned of await readOwned(directory)) {
-      if (livePids.has(owned.pid)) continue;
-      if ((await processStart(owned.pid)) !== owned.started) continue;
-      await terminate(owned);
-      killedPids.push(owned.pid);
-    }
-    await updateOwned(directory, (current) =>
-      current.filter((owned) => livePids.has(owned.pid)),
-    );
+  async function reconcileOnce(directory: string): Promise<ReconcileResult> {
+    const live = liveResources();
+    const owned = await readOwned(directory);
 
+    const handledPids = new Set<number>();
+    const killedPids: number[] = [];
+    for (const recorded of owned.processes) {
+      if (live.pids.has(recorded.pid)) continue;
+      handledPids.add(recorded.pid);
+      if ((await processStart(recorded.pid)) !== recorded.started) continue;
+      await terminate(recorded);
+      killedPids.push(recorded.pid);
+    }
+
+    const handledPorts = new Set<number>();
     const removedPorts: number[] = [];
     const tailscalePath = resolveTailscale();
     if (tailscalePath) {
       const status = await readServeStatus(tailscalePath);
-      for (const port of ownedServePorts(status, HOST_PORT_RANGE)) {
-        if (livePorts.has(port)) continue;
-        if (await removeMapping(tailscalePath, port)) removedPorts.push(port);
+      const shaped = new Set(ownedServePorts(status, HOST_PORT_RANGE));
+      for (const port of owned.mappings) {
+        if (live.ports.has(port)) continue;
+        // Gone, or now something else: either way it is no longer ours.
+        if (!shaped.has(port)) {
+          handledPorts.add(port);
+          continue;
+        }
+        if (await removeMapping(tailscalePath, port)) {
+          handledPorts.add(port);
+          removedPorts.push(port);
+        }
       }
     }
+
+    await updateOwned(directory, (current) => ({
+      processes: current.processes.filter((recorded) => !handledPids.has(recorded.pid)),
+      mappings: current.mappings.filter((port) => !handledPorts.has(port)),
+    }));
     return { removedPorts, killedPids };
+  }
+
+  function reconcile(directory: string): Promise<ReconcileResult> {
+    const next = reconciling.then(() => reconcileOnce(directory));
+    reconciling = next.catch(() => undefined);
+    return next;
   }
 
   function ensureStartup(directory: string): Promise<ReconcileResult> {
@@ -236,8 +322,20 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     return startup;
   }
 
+  function forgetMapping(port: number): Promise<void> {
+    if (!dataDir) return Promise.resolve();
+    return updateOwned(dataDir, (current) => ({
+      ...current,
+      mappings: current.mappings.filter((owned) => owned !== port),
+    })).catch(() => undefined);
+  }
+
   function unpublish(entry: HostReview): Promise<void> {
-    entry.unpublished ??= removeMapping(entry.tailscalePath, entry.port).then(() => undefined);
+    entry.unpublished ??= (async () => {
+      await entry.proxy.close().catch(() => undefined);
+      // A mapping whose removal failed stays recorded for the next reconcile.
+      if (await removeMapping(entry.tailscalePath, entry.port)) await forgetMapping(entry.port);
+    })();
     return entry.unpublished;
   }
 
@@ -251,9 +349,10 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       await entry.review.stop().catch(() => undefined);
       await unpublish(entry);
       if (dataDir) {
-        await updateOwned(dataDir, (current) =>
-          current.filter((owned) => owned.pid !== entry.review.pid),
-        ).catch(() => undefined);
+        await updateOwned(dataDir, (current) => ({
+          ...current,
+          processes: current.processes.filter((owned) => owned.pid !== entry.review.pid),
+        })).catch(() => undefined);
       }
       await entry.lease.dispose();
     })();
@@ -283,111 +382,172 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       .catch(() => undefined);
   }
 
+  /** Listen on the first port in the range that is free locally and in serve. */
+  async function listenProxy(
+    tailscalePath: string,
+    claim: StartClaim,
+    options: ReviewProxyOptions,
+  ): Promise<RunningReviewProxy> {
+    const status = await readServeStatus(tailscalePath);
+    for (const port of hostPorts()) {
+      // A mapping this plugin did not create, or a stale one of its own, is
+      // left alone; the review moves to the next port.
+      if (servePortInUse(status, port) || liveResources().ports.has(port)) continue;
+      claim.port = port;
+      try {
+        return await deps.startProxy(port, options);
+      } catch (error) {
+        claim.port = undefined;
+        if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+      }
+    }
+    throw new Error(
+      `No free port in ${HOST_PORT_RANGE.first}-${HOST_PORT_RANGE.last} to publish the review with tailscale serve.`,
+    );
+  }
+
+  async function startClaimed(
+    input: { sessionId: string; planMarkdown: string; cwd: string; origin: BridgeOptions["origin"] },
+    context: HostContext,
+    claim: StartClaim,
+  ): Promise<{ url: string; port: number }> {
+    const directory = context.experimental_paths.dataDir;
+    const tailscalePath = resolveTailscale();
+    if (!tailscalePath) {
+      throw new Error(
+        `The tailscale CLI is not on this machine's PATH or at ${TAILSCALE_FALLBACK_PATH}. Plannotator reviews here are published with tailscale serve.`,
+      );
+    }
+    const dnsName = await readDnsName(tailscalePath);
+    if (!isAbsolute(input.cwd) || !(await isDirectory(input.cwd))) {
+      throw new Error(`The thread's worktree ${input.cwd} does not exist on this machine.`);
+    }
+    const binaryPath = deps.findExecutable("plannotator");
+    if (!binaryPath) {
+      throw new Error("plannotator is not on this machine's PATH for the bb host daemon.");
+    }
+
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    context.lifecycle.signal.addEventListener("abort", abort, { once: true });
+    context.signal.addEventListener("abort", abort, { once: true });
+    let review: RunningUpstreamReview | undefined;
+    let proxy: RunningReviewProxy | undefined;
+    let published = false;
+    try {
+      // A random loopback port: only the proxy below is published.
+      review = await deps.startPlanReview({
+        binaryPath,
+        planMarkdown: input.planMarkdown,
+        timeoutSeconds: null,
+        signal: controller.signal,
+        origin: input.origin,
+        dataDir: join(directory, "plannotator"),
+        remote: false,
+        cwd: input.cwd,
+      });
+      void review.result.catch(() => undefined);
+      const { pid } = review;
+      claim.pid = pid;
+      if (pid !== undefined) {
+        const started = await processStart(pid);
+        if (started) {
+          await updateOwned(directory, (current) => ({
+            ...current,
+            processes: [...current.processes, { pid, started }],
+          }));
+        }
+      }
+      throwIfAborted(controller.signal);
+
+      proxy = await listenProxy(tailscalePath, claim, {
+        publicHostname: dnsName,
+        upstreamPort: review.port,
+        cwd: input.cwd,
+        allowedRoots: [input.cwd, deps.uploadDir],
+      });
+      const port = proxy.port;
+      // Record before publishing, so a crash in between still gets cleaned up.
+      await updateOwned(directory, (current) => ({
+        ...current,
+        mappings: [...current.mappings.filter((owned) => owned !== port), port],
+      }));
+      const served = await deps.runCommand(tailscalePath, serveArgs(port), TAILSCALE_TIMEOUT_MS);
+      if (served.exitCode !== 0) {
+        throw new Error(`tailscale serve failed for port ${port}: ${commandDetail(served)}`);
+      }
+      published = true;
+      // The server may have given up while serve ran.
+      throwIfAborted(controller.signal);
+    } catch (error) {
+      context.lifecycle.signal.removeEventListener("abort", abort);
+      context.signal.removeEventListener("abort", abort);
+      await proxy?.close().catch(() => undefined);
+      if (proxy) {
+        const port = proxy.port;
+        if (!published || (await removeMapping(tailscalePath, port))) await forgetMapping(port);
+      }
+      if (review) {
+        const { pid } = review;
+        await review.stop().catch(() => undefined);
+        await updateOwned(directory, (current) => ({
+          ...current,
+          processes: current.processes.filter((owned) => owned.pid !== pid),
+        })).catch(() => undefined);
+      }
+      throw error;
+    }
+    context.signal.removeEventListener("abort", abort);
+
+    const entry: HostReview = {
+      sessionId: input.sessionId,
+      review,
+      proxy,
+      port: proxy.port,
+      tailscalePath,
+      state: { status: "pending" },
+      lease: context.experimental_retainWorker(),
+      lastPolledAt: deps.now(),
+    };
+    reviews.set(entry.sessionId, entry);
+    startWatchdog();
+    void review.result.then(
+      (decision) => settle(entry, { status: "decided", decision }, context),
+      (error: unknown) => settle(entry, { status: "failed", error: errorMessage(error) }, context),
+    );
+    return { url: `https://${dnsName}:${entry.port}`, port: entry.port };
+  }
+
   return experimental_defineHostEntry({
     contract: hostContract,
     experimental_signals: hostSignals,
     handlers: {
       async startReview(input, context) {
-        const directory = context.experimental_paths.dataDir;
-        await ensureStartup(directory);
-        if (reviews.has(input.sessionId)) {
+        await ensureStartup(context.experimental_paths.dataDir);
+        if (reviews.has(input.sessionId) || claims.has(input.sessionId)) {
           throw new Error("This Plannotator review is already running.");
         }
-        const tailscalePath = resolveTailscale();
-        if (!tailscalePath) {
-          throw new Error(
-            `The tailscale CLI is not on this machine's PATH or at ${TAILSCALE_FALLBACK_PATH}. Plannotator reviews here are published with tailscale serve.`,
-          );
-        }
-        const dnsName = await readDnsName(tailscalePath);
-        if (!isAbsolute(input.cwd) || !(await isDirectory(input.cwd))) {
-          throw new Error(`The thread's worktree ${input.cwd} does not exist on this machine.`);
-        }
-        const binaryPath = deps.findExecutable("plannotator");
-        if (!binaryPath) {
-          throw new Error("plannotator is not on this machine's PATH for the bb host daemon.");
-        }
-
-        const controller = new AbortController();
-        const abort = () => controller.abort();
-        context.lifecycle.signal.addEventListener("abort", abort, { once: true });
-        context.signal.addEventListener("abort", abort, { once: true });
-        let review: RunningUpstreamReview;
+        const claim: StartClaim = {};
+        claims.set(input.sessionId, claim);
         try {
-          review = await deps.startPlanReview({
-            binaryPath,
-            planMarkdown: input.planMarkdown,
-            timeoutSeconds: null,
-            signal: controller.signal,
-            origin: input.origin,
-            dataDir: join(directory, "plannotator"),
-            remote: false,
-            portRange: `${HOST_PORT_RANGE.first}-${HOST_PORT_RANGE.last}`,
-            cwd: input.cwd,
-          });
-        } catch (error) {
-          context.lifecycle.signal.removeEventListener("abort", abort);
-          throw error;
+          return await startClaimed(input, context, claim);
         } finally {
-          context.signal.removeEventListener("abort", abort);
+          claims.delete(input.sessionId);
         }
-        void review.result.catch(() => undefined);
-
-        const { pid, port } = review;
-        try {
-          if (pid !== undefined) {
-            const started = await processStart(pid);
-            if (started) {
-              await updateOwned(directory, (current) => [...current, { pid, port, started }]);
-            }
-          }
-          if (port < HOST_PORT_RANGE.first || port > HOST_PORT_RANGE.last) {
-            throw new Error(`Plannotator bound port ${port}, outside ${HOST_PORT_RANGE.first}-${HOST_PORT_RANGE.last}.`);
-          }
-          if (servePortInUse(await readServeStatus(tailscalePath), port)) {
-            throw new Error(
-              `tailscale serve already has a mapping on port ${port}. The plugin does not replace mappings it did not create.`,
-            );
-          }
-          const served = await deps.runCommand(tailscalePath, serveArgs(port), TAILSCALE_TIMEOUT_MS);
-          if (served.exitCode !== 0) {
-            throw new Error(`tailscale serve failed for port ${port}: ${commandDetail(served)}`);
-          }
-        } catch (error) {
-          context.lifecycle.signal.removeEventListener("abort", abort);
-          await review.stop().catch(() => undefined);
-          await updateOwned(directory, (current) =>
-            current.filter((owned) => owned.pid !== pid),
-          ).catch(() => undefined);
-          throw error;
-        }
-
-        const entry: HostReview = {
-          sessionId: input.sessionId,
-          review,
-          port,
-          tailscalePath,
-          state: { status: "pending" },
-          lease: context.experimental_retainWorker(),
-          lastPolledAt: deps.now(),
-        };
-        reviews.set(entry.sessionId, entry);
-        startWatchdog();
-        void review.result.then(
-          (decision) => settle(entry, { status: "decided", decision }, context),
-          (error: unknown) => settle(entry, { status: "failed", error: errorMessage(error) }, context),
-        );
-        return { url: `https://${dnsName}:${port}`, port };
       },
 
-      async getReview({ sessionId }) {
+      // Every method reconciles a fresh worker first, so a worker that
+      // replaced one killed with its daemon cleans up without a new review.
+      async getReview({ sessionId }, context) {
+        await ensureStartup(context.experimental_paths.dataDir).catch(() => undefined);
         const entry = reviews.get(sessionId);
         if (!entry) return { status: "unknown" as const };
         entry.lastPolledAt = deps.now();
         return entry.state;
       },
 
-      async stopReview({ sessionId }) {
+      async stopReview({ sessionId }, context) {
+        await ensureStartup(context.experimental_paths.dataDir).catch(() => undefined);
         const entry = reviews.get(sessionId);
         if (!entry) return { stopped: false };
         await stopEntry(entry);
@@ -395,7 +555,10 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       },
 
       async reconcile(_input, context) {
-        return ensureStartup(context.experimental_paths.dataDir);
+        const directory = context.experimental_paths.dataDir;
+        const fresh = startup === null;
+        const first = await ensureStartup(directory).catch(() => null);
+        return fresh && first ? first : reconcile(directory);
       },
     },
     dispose: async () => {

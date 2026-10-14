@@ -4,13 +4,13 @@ import { HOST_POLL_FAILURE_LIMIT, startHostPlanReview, type PlannotatorHostClien
 
 const SESSION_ID = "6f9619ff-8b86-4d01-b42d-00cf4fc964ff";
 
-function fakeClient(states: Array<HostReviewState | Error>) {
+function fakeClient(states: Array<HostReviewState | Error>, behavior: { stopped?: boolean } = {}) {
   const calls: Array<{ method: string; input: unknown; hostId: string; timeoutMs?: number }> = [];
   const client: PlannotatorHostClient = {
     async call(method, input, options) {
       calls.push({ method, input, hostId: options.hostId, timeoutMs: options.timeoutMs });
       if (method === "startReview") return { url: "https://mac.tail1b968e.ts.net:19500", port: 19500 } as never;
-      if (method === "stopReview") return { stopped: true } as never;
+      if (method === "stopReview") return { stopped: behavior.stopped ?? true } as never;
       const next = states.length > 1 ? states.shift()! : states[0]!;
       if (next instanceof Error) throw next;
       return next as never;
@@ -111,7 +111,7 @@ describe("host plan review handle", () => {
       origin: "codex",
       signal: new AbortController().signal,
       pollIntervalMs: 60_000,
-      onStopFailed: () => {
+      onCleanupNeeded: () => {
         stopFailed += 1;
       },
     });
@@ -120,6 +120,59 @@ describe("host plan review handle", () => {
     await review.stop();
 
     expect(stopFailed).toBe(1);
+  });
+
+  it("asks for cleanup when a fresh worker no longer knows the review", async () => {
+    const { client, calls } = fakeClient([{ status: "unknown" }], { stopped: false });
+    let cleanups = 0;
+    const review = await startHostPlanReview({
+      client,
+      hostId: "host_mac",
+      sessionId: SESSION_ID,
+      planMarkdown: "# Plan",
+      cwd: "/Users/me/repo",
+      origin: "codex",
+      signal: new AbortController().signal,
+      pollIntervalMs: 5,
+      onCleanupNeeded: () => {
+        cleanups += 1;
+      },
+    });
+    await expect(review.result).rejects.toThrow("restarted");
+
+    await review.stop();
+    await review.stop();
+
+    expect(cleanups).toBe(1);
+    expect(calls.filter(({ method }) => method === "stopReview")).toHaveLength(1);
+  });
+
+  it("polls again when a signal arrives during an in-flight poll", async () => {
+    let releaseFirst!: () => void;
+    const firstPoll = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let polls = 0;
+    const client: PlannotatorHostClient = {
+      async call(method) {
+        if (method === "startReview") return { url: "https://mac.tail1b968e.ts.net:19500", port: 19500 } as never;
+        if (method === "stopReview") return { stopped: true } as never;
+        polls += 1;
+        if (polls === 1) {
+          await firstPoll;
+          return { status: "pending" } as never;
+        }
+        return { status: "decided", decision: { approved: true } } as never;
+      },
+    };
+    const review = await start(client, 60_000);
+
+    review.refresh();
+    review.refresh();
+    releaseFirst();
+
+    await expect(review.result).resolves.toEqual({ approved: true });
+    expect(polls).toBe(2);
   });
 
   it("stops the host review and rejects the result as cancelled", async () => {

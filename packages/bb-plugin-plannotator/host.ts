@@ -2,9 +2,11 @@
 // the bb server. See src/host-runtime.ts.
 import { execFile } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { startUpstreamPlanReview } from "./src/bridge";
 import { createPlannotatorHostEntry, type CommandResult } from "./src/host-runtime";
+import { startReviewProxy } from "./src/review-proxy";
 
 function isExecutable(path: string): boolean {
   try {
@@ -34,6 +36,9 @@ export default createPlannotatorHostEntry({
     });
   },
   startPlanReview: startUpstreamPlanReview,
+  startProxy: startReviewProxy,
+  // Upstream's upload directory: the child inherits this process's TMPDIR.
+  uploadDir: join(tmpdir(), "plannotator"),
   // PATH only: unlike the server's resolver, no ~/.local/bin fallback, so a
   // stale standalone install never shadows the packaged binary.
   findExecutable(name) {

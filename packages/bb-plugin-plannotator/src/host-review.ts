@@ -39,8 +39,11 @@ export async function startHostPlanReview(options: {
   origin: UpstreamOrigin;
   signal: AbortSignal;
   pollIntervalMs?: number;
-  /** The host could not be told to stop, for example because it is offline. */
-  onStopFailed?: () => void;
+  /**
+   * The host's worker did not stop the review: it is offline, or a fresh
+   * worker no longer knows the review. Its process or serve mapping may remain.
+   */
+  onCleanupNeeded?: () => void;
 }): Promise<HostPlanReview> {
   const { client, hostId, sessionId } = options;
   const pollIntervalMs = options.pollIntervalMs ?? HOST_POLL_INTERVAL_MS;
@@ -66,6 +69,7 @@ export async function startHostPlanReview(options: {
   let polling = false;
   let pollAgain = false;
   let failures = 0;
+  let stopping: Promise<void> | undefined;
 
   const fail = (message: string) => {
     if (settled) return;
@@ -130,15 +134,23 @@ export async function startHostPlanReview(options: {
     result,
     refresh: () => void poll(),
     workerExited: () => fail("The Plannotator worker on the thread's machine exited."),
-    async stop() {
-      fail("Plannotator review was cancelled");
-      try {
-        await client.call("stopReview", { sessionId }, { hostId, timeoutMs: HOST_CALL_TIMEOUT_MS });
-      } catch {
-        // The host may be offline. Its worker stops reviews nobody polls,
-        // and the caller retries the cleanup when the host is back.
-        options.onStopFailed?.();
-      }
+    stop() {
+      stopping ??= (async () => {
+        fail("Plannotator review was cancelled");
+        try {
+          const { stopped } = await client.call(
+            "stopReview",
+            { sessionId },
+            { hostId, timeoutMs: HOST_CALL_TIMEOUT_MS },
+          );
+          if (!stopped) options.onCleanupNeeded?.();
+        } catch {
+          // The host may be offline. Its worker stops reviews nobody polls,
+          // and the caller retries the cleanup when the host is back.
+          options.onCleanupNeeded?.();
+        }
+      })();
+      return stopping;
     },
   };
 }

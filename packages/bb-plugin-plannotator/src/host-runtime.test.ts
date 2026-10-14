@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import type { BridgeOptions, RunningUpstreamReview, UpstreamDecision } from "./bridge";
+import type { ReviewProxyOptions } from "./review-proxy";
 import {
   UNPOLLED_REVIEW_TIMEOUT_MS,
   createPlannotatorHostEntry,
@@ -23,6 +24,10 @@ function fakeHost(options: {
   plannotator?: string | null;
   serveFails?: boolean;
   processes?: Record<number, string>;
+  /** Loopback ports another program already listens on. */
+  busyPorts?: number[];
+  /** Runs when `serve --bg` is called, for example to abort the start. */
+  onServe?: () => void;
 } = {}) {
   const serve = new Map<number, ServeMapping>(
     Object.entries(options.serve ?? {}).map(([port, mapping]) => [Number(port), mapping]),
@@ -37,6 +42,7 @@ function fakeHost(options: {
     stopped: boolean;
     decide(decision: UpstreamDecision): void;
   }> = [];
+  const proxies = new Map<number, ReviewProxyOptions & { closed: boolean }>();
   let now = 1_000;
 
   const serveStatus = () =>
@@ -65,6 +71,7 @@ function fakeHost(options: {
       if (command === "serve status --json") return ok(serveStatus());
       const on = /^serve --bg --https=(\d+) (\S+)$/u.exec(command);
       if (on) {
+        options.onServe?.();
         if (options.serveFails) return { exitCode: 1, stdout: "", stderr: "serve config denied" };
         serve.set(Number(on[1]), { proxy: on[2]! });
         return ok();
@@ -84,7 +91,8 @@ function fakeHost(options: {
         resolve = res;
         reject = rej;
       });
-      const pid = 4242;
+      const pid = 4242 + started.length - 1;
+      const upstreamPort = 50_000 + started.length - 1;
       processes.set(pid, "Tue Oct 14 13:00:00 2026");
       const record = {
         stopped: false,
@@ -95,8 +103,8 @@ function fakeHost(options: {
       };
       reviews.push(record);
       const review: RunningUpstreamReview = {
-        url: "http://localhost:19500",
-        port: 19500,
+        url: `http://localhost:${upstreamPort}`,
+        port: upstreamPort,
         pid,
         result,
         async stop() {
@@ -107,6 +115,21 @@ function fakeHost(options: {
       };
       return review;
     },
+    async startProxy(port, proxyOptions) {
+      const live = [...proxies.entries()].some(([open, proxy]) => open === port && !proxy.closed);
+      if (live || options.busyPorts?.includes(port)) {
+        throw Object.assign(new Error("listen EADDRINUSE"), { code: "EADDRINUSE" });
+      }
+      const proxy = { ...proxyOptions, closed: false };
+      proxies.set(port, proxy);
+      return {
+        port,
+        async close() {
+          proxy.closed = true;
+        },
+      };
+    },
+    uploadDir: "/fake/tmp/plannotator",
     findExecutable(name) {
       if (name === "tailscale") return options.tailscale === undefined ? TAILSCALE : options.tailscale;
       if (name === "plannotator") {
@@ -130,6 +153,7 @@ function fakeHost(options: {
     kills,
     started,
     reviews,
+    proxies,
     advance(ms: number) {
       now += ms;
     },
@@ -142,6 +166,8 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
+const SECOND_SESSION_ID = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
+
 async function harnessFor(fake: ReturnType<typeof fakeHost>, worktree?: string) {
   const dataDir = await mkdtemp(join(tmpdir(), "bb-plannotator-host-data-"));
   const tempDir = await mkdtemp(join(tmpdir(), "bb-plannotator-host-temp-"));
@@ -151,14 +177,15 @@ async function harnessFor(fake: ReturnType<typeof fakeHost>, worktree?: string) 
   const harness = experimental_createHostEntryHarness(fake.entry, {
     experimental_paths: { dataDir, tempDir },
   });
-  const start = () =>
-    harness.experimental_call("startReview", {
-      sessionId: SESSION_ID,
-      planMarkdown: "# Plan",
-      cwd,
-      origin: "claude-code",
-    });
-  return { harness, dataDir, cwd, start };
+  const start = (sessionId = SESSION_ID, signal?: AbortSignal) =>
+    harness.experimental_call(
+      "startReview",
+      { sessionId, planMarkdown: "# Plan", cwd, origin: "claude-code" },
+      signal ? { signal } : undefined,
+    );
+  const owned = async () =>
+    JSON.parse(await readFile(join(dataDir, "owned-processes.json"), "utf8")) as unknown;
+  return { harness, dataDir, cwd, start, owned };
 }
 
 async function flush(): Promise<void> {
@@ -166,9 +193,9 @@ async function flush(): Promise<void> {
 }
 
 describe("Plannotator host entry", () => {
-  it("starts Plannotator on loopback in the worktree and publishes it with tailscale serve", async () => {
+  it("starts Plannotator on a random loopback port and publishes its proxy with tailscale serve", async () => {
     const fake = fakeHost({ serve: { 33757: { proxy: "http://127.0.0.1:33757" } } });
-    const { harness, dataDir, cwd, start } = await harnessFor(fake);
+    const { harness, dataDir, cwd, start, owned } = await harnessFor(fake);
 
     await expect(start()).resolves.toEqual({ url: `https://${DNS_NAME}:19500`, port: 19500 });
 
@@ -176,10 +203,17 @@ describe("Plannotator host entry", () => {
       binaryPath: "/fake/bin/plannotator",
       cwd,
       remote: false,
-      portRange: "19500-19509",
       origin: "claude-code",
       dataDir: join(dataDir, "plannotator"),
       timeoutSeconds: null,
+    });
+    expect(fake.started[0]!.portRange).toBeUndefined();
+    expect(fake.proxies.get(19500)).toEqual({
+      publicHostname: DNS_NAME,
+      upstreamPort: 50_000,
+      cwd,
+      allowedRoots: [cwd, "/fake/tmp/plannotator"],
+      closed: false,
     });
     expect(fake.commands).toContainEqual({
       file: TAILSCALE,
@@ -188,22 +222,54 @@ describe("Plannotator host entry", () => {
     expect(fake.serve.get(19500)).toEqual({ proxy: "http://127.0.0.1:19500" });
     expect(fake.serve.has(33757)).toBe(true);
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(1);
-    expect(JSON.parse(await readFile(join(dataDir, "owned-processes.json"), "utf8"))).toEqual([
-      { pid: 4242, port: 19500, started: "Tue Oct 14 13:00:00 2026" },
-    ]);
+    expect(await owned()).toEqual({
+      processes: [{ pid: 4242, started: "Tue Oct 14 13:00:00 2026" }],
+      mappings: [19500],
+    });
+    await harness.experimental_dispose();
+  });
+
+  it("gives two concurrent reviews distinct ports and processes", async () => {
+    const fake = fakeHost();
+    const { harness, start, owned } = await harnessFor(fake);
+
+    const [first, second] = await Promise.all([start(), start(SECOND_SESSION_ID)]);
+
+    expect(new Set([first.port, second.port])).toEqual(new Set([19500, 19501]));
+    expect([...fake.serve.keys()].sort()).toEqual([19500, 19501]);
+    expect(await owned()).toMatchObject({
+      processes: [{ pid: 4242 }, { pid: 4243 }],
+    });
+    await harness.experimental_call("stopReview", { sessionId: SESSION_ID });
+    expect(fake.serve.has(first.port)).toBe(false);
+    expect(fake.serve.has(second.port)).toBe(true);
+    expect(fake.reviews.filter(({ stopped }) => stopped)).toHaveLength(1);
+    await harness.experimental_dispose();
+  });
+
+  it("moves to the next port when a foreign mapping or listener holds one", async () => {
+    const fake = fakeHost({
+      serve: { 19500: { proxy: "http://127.0.0.1:3000" } },
+      busyPorts: [19501],
+    });
+    const { harness, start } = await harnessFor(fake);
+
+    await expect(start()).resolves.toMatchObject({ port: 19502 });
+
+    expect(fake.serve.get(19500)).toEqual({ proxy: "http://127.0.0.1:3000" });
     await harness.experimental_dispose();
   });
 
   it("reports a decision by signal and status, then releases everything on stop", async () => {
     const fake = fakeHost();
-    const { harness, start } = await harnessFor(fake);
+    const { harness, start, owned } = await harnessFor(fake);
     await start();
 
     await expect(harness.experimental_call("getReview", { sessionId: SESSION_ID })).resolves.toEqual({
       status: "pending",
     });
     fake.reviews[0]!.decide({ approved: false, feedback: "Split step 2" });
-    await flush();
+    await vi.waitFor(() => expect(harness.experimental_getSignals()).toHaveLength(1));
 
     expect(harness.experimental_getSignals()).toEqual([
       { signal: "reviewChanged", payload: { sessionId: SESSION_ID } },
@@ -212,7 +278,8 @@ describe("Plannotator host entry", () => {
       status: "decided",
       decision: { approved: false, feedback: "Split step 2" },
     });
-    expect(fake.serve.has(19500)).toBe(false);
+    await vi.waitFor(() => expect(fake.serve.has(19500)).toBe(false));
+    expect(fake.proxies.get(19500)!.closed).toBe(true);
     // The decision stays collectable until the server stops the review.
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(1);
 
@@ -220,44 +287,53 @@ describe("Plannotator host entry", () => {
       stopped: true,
     });
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(0);
+    expect(await owned()).toEqual({ processes: [], mappings: [] });
     await expect(harness.experimental_call("getReview", { sessionId: SESSION_ID })).resolves.toEqual({
       status: "unknown",
     });
     await harness.experimental_dispose();
   });
 
-  it("kills the process and removes its mapping when a pending review is stopped", async () => {
+  it("kills the process and removes its mapping and proxy when a pending review is stopped", async () => {
     const fake = fakeHost();
-    const { harness, dataDir, start } = await harnessFor(fake);
+    const { harness, start, owned } = await harnessFor(fake);
     await start();
 
     await harness.experimental_call("stopReview", { sessionId: SESSION_ID });
 
     expect(fake.reviews[0]!.stopped).toBe(true);
     expect(fake.serve.size).toBe(0);
+    expect(fake.proxies.get(19500)!.closed).toBe(true);
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(0);
-    expect(JSON.parse(await readFile(join(dataDir, "owned-processes.json"), "utf8"))).toEqual([]);
+    expect(await owned()).toEqual({ processes: [], mappings: [] });
     await harness.experimental_dispose();
   });
 
-  it("removes only its own stale mappings and verified orphan processes on worker start", async () => {
+  it("removes only recorded mappings and verified orphan processes", async () => {
     const fake = fakeHost({
       serve: {
         33757: { proxy: "http://127.0.0.1:33757" },
         8447: { proxy: "http://127.0.0.1:8000" },
+        // Recorded and still ours.
         19504: { proxy: "http://127.0.0.1:19504" },
+        // Recorded, but someone replaced it since.
         19505: { proxy: "http://127.0.0.1:3000" },
+        // Our shape, but not recorded: an upstream `plannotator --tailscale`.
+        19507: { proxy: "http://127.0.0.1:19507" },
       },
       processes: { 777: "Mon Oct 13 09:00:00 2026", 778: "Tue Oct 14 08:00:00 2026" },
     });
-    const { harness, dataDir } = await harnessFor(fake);
+    const { harness, dataDir, owned } = await harnessFor(fake);
     await writeFile(
       join(dataDir, "owned-processes.json"),
-      JSON.stringify([
-        { pid: 777, port: 19504, started: "Mon Oct 13 09:00:00 2026" },
-        // The pid was reused by an unrelated process: different start time.
-        { pid: 778, port: 19506, started: "Sun Oct 12 10:00:00 2026" },
-      ]),
+      JSON.stringify({
+        processes: [
+          { pid: 777, started: "Mon Oct 13 09:00:00 2026" },
+          // The pid was reused by an unrelated process: different start time.
+          { pid: 778, started: "Sun Oct 12 10:00:00 2026" },
+        ],
+        mappings: [19504, 19505, 19506],
+      }),
     );
 
     await expect(harness.experimental_call("reconcile", {})).resolves.toEqual({
@@ -266,10 +342,57 @@ describe("Plannotator host entry", () => {
     });
 
     expect(fake.kills).toEqual([{ pid: 777, signal: "SIGTERM" }]);
-    expect([...fake.serve.keys()].sort()).toEqual([19505, 33757, 8447].sort());
+    expect([...fake.serve.keys()].sort((a, b) => a - b)).toEqual([8447, 19505, 19507, 33757]);
     expect(fake.commands.filter(({ args }) => args.includes("off"))).toEqual([
       { file: TAILSCALE, args: ["serve", "--https=19504", "off"] },
     ]);
+    expect(await owned()).toEqual({ processes: [], mappings: [] });
+    await harness.experimental_dispose();
+  });
+
+  it("reads the 0.4.0 record, where each process owned its own port", async () => {
+    const fake = fakeHost({ serve: { 19500: { proxy: "http://127.0.0.1:19500" } } });
+    const { harness, dataDir } = await harnessFor(fake);
+    await writeFile(
+      join(dataDir, "owned-processes.json"),
+      JSON.stringify([{ pid: 999, port: 19500, started: "Mon Oct 13 09:00:00 2026" }]),
+    );
+
+    await expect(harness.experimental_call("reconcile", {})).resolves.toEqual({
+      removedPorts: [19500],
+      killedPids: [],
+    });
+    await harness.experimental_dispose();
+  });
+
+  it("reconciles a fresh worker on its first status poll", async () => {
+    const fake = fakeHost({ serve: { 19500: { proxy: "http://127.0.0.1:19500" } } });
+    const { harness, dataDir } = await harnessFor(fake);
+    await writeFile(
+      join(dataDir, "owned-processes.json"),
+      JSON.stringify({ processes: [], mappings: [19500] }),
+    );
+
+    await expect(harness.experimental_call("getReview", { sessionId: SESSION_ID })).resolves.toEqual({
+      status: "unknown",
+    });
+
+    expect(fake.serve.has(19500)).toBe(false);
+    await harness.experimental_dispose();
+  });
+
+  it("tears the review down when the start is aborted while serve runs", async () => {
+    const controller = new AbortController();
+    const fake = fakeHost({ onServe: () => controller.abort() });
+    const { harness, start, owned } = await harnessFor(fake);
+
+    await expect(start(SESSION_ID, controller.signal)).rejects.toThrow();
+
+    expect(fake.reviews[0]!.stopped).toBe(true);
+    expect(fake.serve.size).toBe(0);
+    expect(fake.proxies.get(19500)!.closed).toBe(true);
+    expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(0);
+    await vi.waitFor(async () => expect(await owned()).toEqual({ processes: [], mappings: [] }));
     await harness.experimental_dispose();
   });
 
@@ -282,23 +405,15 @@ describe("Plannotator host entry", () => {
     await harness.experimental_dispose();
   });
 
-  it("stops Plannotator and reports the error when tailscale serve fails", async () => {
+  it("stops Plannotator and its proxy and reports the error when tailscale serve fails", async () => {
     const fake = fakeHost({ serveFails: true });
-    const { harness, start } = await harnessFor(fake);
+    const { harness, start, owned } = await harnessFor(fake);
 
     await expect(start()).rejects.toThrow("tailscale serve failed for port 19500: serve config denied");
     expect(fake.reviews[0]!.stopped).toBe(true);
+    expect(fake.proxies.get(19500)!.closed).toBe(true);
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(0);
-    await harness.experimental_dispose();
-  });
-
-  it("never replaces a mapping it did not create on its port", async () => {
-    const fake = fakeHost({ serve: { 19500: { proxy: "http://127.0.0.1:3000" } } });
-    const { harness, start } = await harnessFor(fake);
-
-    await expect(start()).rejects.toThrow("tailscale serve already has a mapping on port 19500");
-    expect(fake.serve.get(19500)).toEqual({ proxy: "http://127.0.0.1:3000" });
-    expect(fake.reviews[0]!.stopped).toBe(true);
+    expect(await owned()).toEqual({ processes: [], mappings: [] });
     await harness.experimental_dispose();
   });
 

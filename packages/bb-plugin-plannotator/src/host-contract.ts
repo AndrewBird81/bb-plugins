@@ -8,9 +8,10 @@ import {
 import { z } from "zod";
 
 /**
- * Loopback ports Plannotator may bind on a non-server host. `tailscale serve`
- * publishes the same port number over HTTPS. Only mappings in this range that
- * proxy to `http://127.0.0.1:<same port>` are treated as the plugin's own.
+ * Loopback ports the review proxy may bind on a non-server host.
+ * `tailscale serve` publishes the same port number over HTTPS. Reconcile
+ * removes only mappings it recorded that still proxy to
+ * `http://127.0.0.1:<same port>`.
  */
 export const HOST_PORT_RANGE = { first: 19500, last: 19509 } as const;
 

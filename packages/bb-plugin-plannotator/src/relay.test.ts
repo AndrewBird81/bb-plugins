@@ -179,9 +179,28 @@ describe("Plannotator same-origin relay", () => {
     expect(await post({ "sec-fetch-site": "cross-site" })).toBe(403);
     expect(await post({ origin: "https://bb.example.ts.net" })).toBe(200);
     expect(await post({ "sec-fetch-site": "same-origin" })).toBe(200);
+    // A name rebound to BB claims its own Host; only the bb page's origin counts.
+    expect(await post({ host: "rebound.example", origin: "https://rebound.example" })).toBe(403);
     const read = await host.harness.fetchHttp("GET", `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=%2F`, {
       headers: { origin: "null" },
     });
     expect(read.status).toBe(200);
+  });
+
+  it("falls back to the Host's origin for writes only when the bb origin is unknown", async () => {
+    const upstreamBaseUrl = await startUpstreamServer();
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    registerPlannotatorRelayRoutes(host.bb, await relaySessions(upstreamBaseUrl), () => undefined);
+    const post = async (headers: Record<string, string>) =>
+      (
+        await host.harness.fetchHttp("POST", `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=%2Fapi%2Fplan`, {
+          headers: { "content-type": "text/plain", ...headers },
+          body: '{"approved":true}',
+        })
+      ).status;
+
+    expect(await post({ host: "bb.local:8080", origin: "http://bb.local:8080" })).toBe(200);
+    expect(await post({ host: "bb.local:8080", origin: "https://evil.example" })).toBe(403);
   });
 });

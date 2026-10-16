@@ -82,14 +82,26 @@ export async function runBridgeClient(options: {
   pollWaitMs?: number;
   /** Consecutive failed polls before the session counts as gone. */
   maxFailures?: number;
+  /**
+   * How long the session must also have been unreachable before it counts as
+   * gone, and how long a failed event is retried. A session on another
+   * machine outlives a short daemon disconnect, so its client must too.
+   */
+  giveUpAfterMs?: number;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  now?: () => number;
   log?: (message: string) => void;
 }): Promise<BridgeClientEnd> {
   const { transport, signal } = options;
   const pollWaitMs = options.pollWaitMs ?? BRIDGE_POLL_WAIT_MS;
   const maxFailures = options.maxFailures ?? 6;
+  const giveUpAfterMs = options.giveUpAfterMs ?? 0;
   const sleep = options.sleep ?? defaultSleep;
+  const now = options.now ?? Date.now;
   const log = options.log ?? (() => undefined);
+  const backoff = (failures: number) => Math.min(4_000, 500 * 2 ** (failures - 1));
+  /** Aborted when the client ends, to stop retrying events. */
+  const ended = new AbortController();
   /** Questions seen so far: the server re-sends a command until acknowledged. */
   const asks = new Map<string, Ask>();
   const interrupts = new Set<string>();
@@ -98,14 +110,22 @@ export async function runBridgeClient(options: {
 
   const post = (event: BridgeEvent): Promise<void> => {
     sending = sending.then(async () => {
-      try {
-        const response = await transport(BRIDGE_EVENT_PATH, JSON.stringify(event), {
-          signal: AbortSignal.timeout(15_000),
-        });
-        // The server no longer runs this question (the reviewer stopped it).
-        if (response.status === 409 && "askId" in event) asks.get(event.askId)?.controller.abort();
-      } catch (error) {
-        log(`Plannotator bridge event failed: ${errorMessage(error)}`);
+      const firstTry = now();
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          const response = await transport(BRIDGE_EVENT_PATH, JSON.stringify(event), {
+            signal: AbortSignal.timeout(15_000),
+          });
+          // The server no longer runs this question (the reviewer stopped it).
+          if (response.status === 409 && "askId" in event) asks.get(event.askId)?.controller.abort();
+          return;
+        } catch (error) {
+          if (ended.signal.aborted || now() - firstTry >= giveUpAfterMs) {
+            log(`Plannotator bridge event failed: ${errorMessage(error)}`);
+            return;
+          }
+          await sleep(backoff(attempt), ended.signal);
+        }
       }
     });
     return sending;
@@ -159,6 +179,13 @@ export async function runBridgeClient(options: {
   };
 
   let failures = 0;
+  let failingSince = 0;
+  /** Count a failed poll; true once the session counts as gone. */
+  const failed = (): boolean => {
+    if (failures === 0) failingSince = now();
+    failures += 1;
+    return failures >= maxFailures && now() - failingSince >= giveUpAfterMs;
+  };
   let end: BridgeClientEnd = "aborted";
   try {
     while (!signal.aborted) {
@@ -172,13 +199,12 @@ export async function runBridgeClient(options: {
         );
       } catch (error) {
         if (signal.aborted) break;
-        failures += 1;
-        if (failures >= maxFailures) {
+        if (failed()) {
           log(`Plannotator bridge stopped: the session is not answering (${errorMessage(error)}).`);
           end = "gone";
           break;
         }
-        await sleep(Math.min(4_000, 500 * 2 ** (failures - 1)), signal);
+        await sleep(backoff(failures), signal);
         continue;
       }
       if ([401, 403, 404, 405, 503].includes(response.status)) {
@@ -188,12 +214,11 @@ export async function runBridgeClient(options: {
         break;
       }
       if (response.status < 200 || response.status >= 300) {
-        failures += 1;
-        if (failures >= maxFailures) {
+        if (failed()) {
           end = "gone";
           break;
         }
-        await sleep(Math.min(4_000, 500 * 2 ** (failures - 1)), signal);
+        await sleep(backoff(failures), signal);
         continue;
       }
       failures = 0;
@@ -218,6 +243,7 @@ export async function runBridgeClient(options: {
       }
     }
   } finally {
+    ended.abort();
     // Nobody can read an answer once the session is gone: stop the work.
     for (const ask of asks.values()) if (!ask.finished) ask.controller.abort();
     if (end !== "gone" && end !== "refused") await sending.catch(() => undefined);

@@ -116,8 +116,10 @@ runtime installer, file reads outside the worktree, custom save paths).
 Plannotator's own random loopback port is not published, but, as with stock
 local Plannotator, a web page in a browser on that host could still reach it
 and use endpoints the proxy denies, such as open-in-app (which opens a repo
-file with its default handler) and agent jobs. Browsers that block public
-pages from reaching localhost, such as Brave by default, stop this.
+file with its default handler) and agent jobs, and, in `thread` mode, Ask AI,
+which runs the thread's agent in a hidden fork with its tools (see
+[Ask AI](#ask-ai)). Browsers that block public pages from reaching localhost,
+such as Brave by default, stop this.
 
 ## Ask AI
 
@@ -129,7 +131,11 @@ setting **Ask AI answers from** chooses:
   follow-up in the same chat goes to the same fork. The user's thread is never
   interrupted or waited on. When the session ends, its forks are stopped and
   archived, and the result message the agent receives lists the questions and
-  answers (a few KB at most).
+  answers (a few KB at most) as a quoted block labelled as reviewer Q&A data,
+  not instructions. This needs a thread provider that can fork; for one that
+  can't, or when the plugin cannot look the provider up, the session uses
+  `local` instead, and the tool result says so (`askAiAnswersFrom`,
+  `askAiReason`).
 - `local`: the AI tools installed on the thread's machine (Claude, Codex, Pi,
   OpenCode), which start without the conversation. This is Plannotator's own
   behaviour.
@@ -151,6 +157,17 @@ session"). BB differs because BB itself has no authentication on a tailnet:
 anyone who can reach a review can already reach BB and message the thread
 directly, so the bridge adds no new trust boundary. Choose `local` if that does
 not hold for your setup.
+
+The reviewed document is a second way in. Plannotator puts the text a user
+selects into the Ask AI question verbatim, so a document with instructions in
+it (for example "run this command before answering") reaches the fork's agent
+when a user selects that text and asks about it. The fork keeps the thread's
+permission mode, because a hidden fork cannot show approval prompts, so it can
+act on them as the thread could. A hostile document cannot ask on its own: the
+user has to select the text and ask. The answers then reach the thread in the
+result message, quoted and labelled as data rather than instructions, which
+lowers but does not remove the chance the thread's agent follows them. Don't
+use Ask AI on text from documents you don't trust.
 
 ## Boundary
 

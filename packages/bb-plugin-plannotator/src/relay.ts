@@ -239,11 +239,14 @@ export function injectRelayBootstrap(
   return `${html.slice(0, insertAt)}${script}${html.slice(insertAt)}`;
 }
 
-/** Origins a page on BB may write from: the relay's own and the bb page's. */
+/**
+ * Origins a page on BB may write from: the bb page's when it is known. Only
+ * when it is not, the origin of the Host the request names, which a rebound
+ * DNS name could also claim.
+ */
 function relayOrigins(host: string | undefined, bbOrigin: string | undefined): string[] {
-  const origins = bbOrigin ? [bbOrigin] : [];
-  if (host) origins.push(`https://${host}`, `http://${host}`);
-  return origins;
+  if (bbOrigin) return [bbOrigin];
+  return host ? [`https://${host}`, `http://${host}`] : [];
 }
 
 export function createPlannotatorRelayHandler(

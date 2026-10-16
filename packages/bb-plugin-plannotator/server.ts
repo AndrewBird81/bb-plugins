@@ -44,7 +44,7 @@ import {
   type SessionRequest,
   type SessionResult,
 } from "./src/host-contract";
-import { startHostSession, type HostSession } from "./src/host-review";
+import { HOST_DISCONNECT_GRACE_MS, startHostSession, type HostSession } from "./src/host-review";
 import { lastFinishedReply } from "./src/last-reply";
 import { SESSION_KINDS, resolveAnnotateTarget, sessionErrorOutput, type SessionKind } from "./src/session";
 import {
@@ -325,7 +325,7 @@ async function resolveReviewContext(
   bb: BbPluginApi,
   threadId: string,
   signal: AbortSignal,
-): Promise<{ origin: UpstreamOrigin; providerId: string | null; target: ReviewTarget }> {
+): Promise<{ origin: UpstreamOrigin; providerId: string | null; environmentId?: string; target: ReviewTarget }> {
   let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
   try {
     thread = await bb.sdk.threads.get({ threadId, signal });
@@ -343,8 +343,45 @@ async function resolveReviewContext(
   return {
     origin,
     providerId: thread.providerId,
+    environmentId: thread.environmentId,
     target: reviewTargetFor(environment, systemConfig.primaryHostId),
   };
+}
+
+/** Who answers the session's Ask AI questions, and why. */
+export type AskAiPlacement = { answersFrom: "thread" | "local"; reason: string };
+
+/**
+ * `thread` mode needs a fork of the thread, so the thread's provider must be
+ * able to fork. A provider that can't, or one this plugin can't look up,
+ * keeps Plannotator's local AI tools: with the bridge on, Ask AI offers only
+ * the bridge, and every question would fail.
+ */
+export async function placeAskAi(
+  providers: Pick<BbPluginApi["sdk"]["providers"], "list">,
+  source: string,
+  thread: { providerId: string | null; environmentId?: string },
+  signal: AbortSignal,
+): Promise<AskAiPlacement> {
+  if (source !== "thread") {
+    return { answersFrom: "local", reason: 'the "Ask AI answers from" setting is local' };
+  }
+  const local = (why: string): AskAiPlacement => ({
+    answersFrom: "local",
+    reason: `${why}, so Ask AI uses the AI tools on the machine where Plannotator runs`,
+  });
+  if (!thread.providerId) return local("the thread's provider is unknown");
+  let canFork: boolean;
+  try {
+    const list = await providers.list(
+      thread.environmentId ? { environmentId: thread.environmentId, signal } : { signal },
+    );
+    canFork = list.some((provider) => provider.id === thread.providerId && provider.capabilities.supportsFork);
+  } catch (error) {
+    return local(`could not check whether the thread's provider can fork (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (!canFork) return local(`the thread's provider (${thread.providerId}) cannot fork`);
+  return { answersFrom: "thread", reason: "the thread's agent answers in a hidden fork" };
 }
 
 /**
@@ -623,7 +660,7 @@ function alreadyActiveResponse(reviewId: string | undefined) {
 }
 
 type StartOutcome =
-  | { status: "pending"; reviewId: string; kind: SessionKind; placement?: ReviewPlacement }
+  | { status: "pending"; reviewId: string; kind: SessionKind; placement?: ReviewPlacement; askAi?: AskAiPlacement }
   | { status: "already_active"; reviewId?: string }
   | { status: "error"; error: string };
 
@@ -636,6 +673,7 @@ function toolResponse(outcome: StartOutcome) {
     kind: outcome.kind,
     source: "plannotator",
     ...(outcome.placement ? { runsOn: outcome.placement.runsOn, runsOnReason: outcome.placement.reason } : {}),
+    ...(outcome.askAi ? { askAiAnswersFrom: outcome.askAi.answersFrom, askAiReason: outcome.askAi.reason } : {}),
     message: `End this turn. The ${KIND_NOUN[outcome.kind]} result will arrive as a new message in this thread.`,
   });
 }
@@ -698,7 +736,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "select",
       label: "Ask AI answers from",
       description:
-        "thread: Plannotator's Ask AI is answered by the thread's own agent, in a hidden fork that knows the conversation. local: the AI tools installed on the thread's machine (Claude, Codex, Pi, OpenCode), which start without the conversation.",
+        "thread: Plannotator's Ask AI is answered by the thread's own agent, in a hidden fork that knows the conversation (if the thread's provider cannot fork, the session uses local). local: the AI tools installed on the thread's machine (Claude, Codex, Pi, OpenCode), which start without the conversation.",
       options: ["thread", "local"],
       default: "thread",
     },
@@ -1044,6 +1082,7 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
     transport: BridgeTransport,
     sourceSeqEnd: number | undefined,
+    onHost: boolean,
   ): void {
     const controller = new AbortController();
     const asker = createForkAsker({
@@ -1051,6 +1090,7 @@ export default async function plugin(bb: BbPluginApi) {
       sourceThreadId: threadId,
       ...(sourceSeqEnd !== undefined ? { sourceSeqEnd } : {}),
       sessionId: active.sessionId,
+      pluginId: bb.pluginId,
       log: (message) => bb.log.warn(message),
     });
     active.askAi = { controller, asker };
@@ -1058,6 +1098,8 @@ export default async function plugin(bb: BbPluginApi) {
       transport,
       answer: (question, signal) => asker.ask(question, signal),
       signal: controller.signal,
+      // A host session survives a daemon disconnect this long; so must Ask AI.
+      ...(onHost ? { giveUpAfterMs: HOST_DISCONNECT_GRACE_MS } : {}),
       log: (message) => bb.log.info(`${message} (session ${active.sessionId})`),
     }).catch((error: unknown) => {
       bb.log.warn(`Plannotator bridge for ${active.sessionId} failed: ${String(error)}`);
@@ -1101,6 +1143,7 @@ export default async function plugin(bb: BbPluginApi) {
     let relaySession: RelaySession | undefined;
     let sourceSeqEnd: number | undefined;
     let placement: ReviewPlacement | undefined;
+    let askAi: AskAiPlacement | undefined;
     try {
       const context = await resolveReviewContext(bb, threadId, controller.signal);
       const { origin, providerId } = context;
@@ -1117,7 +1160,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (session.mode === "annotate") annotatedPath = session.path;
       if (session.mode === "annotate-last") annotatedReply = replyExcerpt(session.markdown);
       const { askAiSource } = await settings.get();
-      const bridgeHost = askAiSource === "thread" ? bridgeHostForProvider(providerId) : undefined;
+      askAi = await placeAskAi(bb.sdk.providers, askAiSource, context, controller.signal);
+      if (askAi.answersFrom === "local" && askAiSource === "thread") bb.log.info(`Plannotator Ask AI is local: ${askAi.reason}`);
+      const bridgeHost = askAi.answersFrom === "thread" ? bridgeHostForProvider(providerId) : undefined;
       if (bridgeHost) sourceSeqEnd = await latestThreadSequence(bb, threadId);
       if (target.kind === "host") {
         hostId = target.hostId;
@@ -1223,7 +1268,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
     activeReviews.set(threadId, active);
     startingReviews.delete(threadId);
-    if (transport) startAskAi(active, threadId, transport, sourceSeqEnd);
+    if (transport) startAskAi(active, threadId, transport, sourceSeqEnd, hostId !== undefined);
 
     try {
       if (options.signal?.aborted || active.discarded || controller.signal.aborted) {
@@ -1246,7 +1291,7 @@ export default async function plugin(bb: BbPluginApi) {
       active.settled = settleReview(threadId, active).catch((error) => {
         bb.log.error(`Could not settle Plannotator review ${sessionId}: ${String(error)}`);
       });
-      return { status: "pending", reviewId: sessionId, kind, ...(placement ? { placement } : {}) };
+      return { status: "pending", reviewId: sessionId, kind, ...(placement ? { placement } : {}), ...(askAi ? { askAi } : {}) };
     } catch (error) {
       options.signal?.removeEventListener("abort", abortStartup);
       activeReviews.delete(threadId);

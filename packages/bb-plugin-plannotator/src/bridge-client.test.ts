@@ -22,6 +22,8 @@ function fakeBridge() {
   const events: Event[] = [];
   const polls: Array<Record<string, unknown>> = [];
   let exited = false;
+  /** The host is disconnected for a while: requests fail, nothing is lost. */
+  let unreachable = false;
   let refuseWith: number | null = null;
   let closing = false;
   let waiters: Array<() => void> = [];
@@ -33,6 +35,7 @@ function fakeBridge() {
 
   const transport: BridgeTransport = async (path, body, { signal }) => {
     if (exited) throw new Error("connect ECONNREFUSED 127.0.0.1:54321");
+    if (unreachable) throw new Error("Host host_mac is not connected");
     if (path === BRIDGE_POLL_PATH) {
       polls.push(JSON.parse(body) as Record<string, unknown>);
       if (refuseWith !== null) return { status: refuseWith, body: "" };
@@ -84,6 +87,9 @@ function fakeBridge() {
     exit() {
       exited = true;
       wake();
+    },
+    setUnreachable(value: boolean) {
+      unreachable = value;
     },
     refuse(status: number) {
       refuseWith = status;
@@ -230,6 +236,67 @@ describe("session bridge client", () => {
 
     await expect(run).resolves.toBe("gone");
     expect(seenSignal!.aborted).toBe(true);
+  });
+
+  /** A clock that the client's backoff sleeps advance. */
+  function fakeClock() {
+    const clock = { ms: 0 };
+    return {
+      clock,
+      now: () => clock.ms,
+      sleep: async (ms: number) => {
+        clock.ms += ms;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      },
+    };
+  }
+
+  it("outlives a host disconnect shorter than its grace, and delivers an answer finished during it", async () => {
+    const bridge = fakeBridge();
+    const { clock, now, sleep } = fakeClock();
+    const controller = new AbortController();
+    let release: ((answer: string) => void) | undefined;
+    const answer: BridgeAnswerer = () => new Promise((resolve) => (release = resolve));
+    const run = runBridgeClient({
+      transport: bridge.transport,
+      answer,
+      signal: controller.signal,
+      pollWaitMs: 50,
+      giveUpAfterMs: 120_000,
+      now,
+      sleep,
+    });
+
+    bridge.ask("chat:1");
+    await until(() => release !== undefined && bridge.events.length === 1);
+    bridge.setUnreachable(true);
+    release!("Answer.");
+    // Far more than the 6 failed polls (about 11.5 s) that used to end it.
+    await until(() => clock.ms >= 60_000);
+    bridge.setUnreachable(false);
+    await until(() => bridge.events.some((event) => event.type === "done"));
+    controller.abort();
+
+    await expect(run).resolves.toBe("aborted");
+    expect(bridge.events.map(({ type }) => type)).toEqual(["started", "delta", "done"]);
+  });
+
+  it("counts an unreachable session as gone only once its grace has passed", async () => {
+    const bridge = fakeBridge();
+    const { clock, now, sleep } = fakeClock();
+    bridge.setUnreachable(true);
+
+    await expect(
+      runBridgeClient({
+        transport: bridge.transport,
+        answer: async () => "x",
+        signal: new AbortController().signal,
+        giveUpAfterMs: 120_000,
+        now,
+        sleep,
+      }),
+    ).resolves.toBe("gone");
+    expect(clock.ms).toBeGreaterThanOrEqual(120_000);
   });
 
   it("stops when the server refuses the bridge or says it is closing", async () => {

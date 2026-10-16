@@ -590,6 +590,11 @@ export async function startUpstreamSession(
     ...process.env,
     PLANNOTATOR_REMOTE: options.remote ? "1" : "0",
     PLANNOTATOR_SKIP_BROWSER_OPEN: "1",
+    // 0.28.20 and later advertise updates from the machine's daily cached
+    // release check, which can name an older release than the one the panel
+    // pre-dismisses. BB manages the binary, so turn the check off at the source.
+    // Older versions ignore the variable and check in the browser instead.
+    PLANNOTATOR_UPDATE_CHECK: "0",
     PLANNOTATOR_READY_FILE: readyFile,
     ...(portRange ? { PLANNOTATOR_PORT: portRange } : {}),
     ...(options.origin ? { PLANNOTATOR_ORIGIN: options.origin } : {}),

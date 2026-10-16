@@ -119,7 +119,7 @@ describe("upstream Plannotator bridge", () => {
     );
   });
 
-  it("passes remote transport settings, origin, and persistent state without a deadline", async () => {
+  it("passes remote transport settings, origin, persistent state and the update-check opt-out without a deadline", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-env-test-"));
     temporaryDirectories.push(directory);
     const binary = join(directory, "plannotator");
@@ -131,7 +131,7 @@ const fs = require("node:fs");
 fs.appendFileSync(ready, JSON.stringify({ url: "http://127.0.0.1:43210", isRemote: false, port: 43210 }) + "\\n");
 setTimeout(() => process.stdout.write(JSON.stringify({
   approved: true,
-  feedback: JSON.stringify({ origin: process.env.PLANNOTATOR_ORIGIN, dataDir: process.env.PLANNOTATOR_DATA_DIR, remote: process.env.PLANNOTATOR_REMOTE, port: process.env.PLANNOTATOR_PORT, allowedHosts: process.env.PLANNOTATOR_ALLOWED_HOSTS }),
+  feedback: JSON.stringify({ origin: process.env.PLANNOTATOR_ORIGIN, dataDir: process.env.PLANNOTATOR_DATA_DIR, remote: process.env.PLANNOTATOR_REMOTE, port: process.env.PLANNOTATOR_PORT, allowedHosts: process.env.PLANNOTATOR_ALLOWED_HOSTS, updateCheck: process.env.PLANNOTATOR_UPDATE_CHECK }),
 }) + "\\n"), 20);
 process.stdin.resume();
 `,
@@ -159,6 +159,7 @@ process.stdin.resume();
         remote: "1",
         port: REMOTE_PORT_RANGE,
         allowedHosts: "mac.tail1b968e.ts.net",
+        updateCheck: "0",
       }),
     });
     await running.stop();

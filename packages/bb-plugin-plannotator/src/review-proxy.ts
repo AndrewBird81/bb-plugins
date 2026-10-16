@@ -147,7 +147,12 @@ export async function startReviewProxy(
     const { url } = decision;
 
     const headers = forwardedRequestHeaders(req);
-    if (decision.loopbackHost) headers.host = `127.0.0.1:${options.upstreamPort}`;
+    if (decision.loopbackHost) {
+      headers.host = `127.0.0.1:${options.upstreamPort}`;
+      // The Origin, checked above, would now name another host than the
+      // Host. Upstream's same-origin rule passes a request without one.
+      delete headers.origin;
+    }
     let body: Uint8Array | null = null;
     if (decision.decisionBody) {
       const raw = await readBody(req, MAX_DECISION_BODY_BYTES);

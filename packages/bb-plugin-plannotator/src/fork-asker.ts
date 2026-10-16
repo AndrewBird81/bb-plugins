@@ -50,13 +50,20 @@ export function askChatId(askId: string): string {
 
 /**
  * The user's question without Plannotator's header. Upstream sends the header,
- * a `Surface:` line, a blank line, then the question.
+ * a `Surface:` line, a blank line, then the question. From 0.28.20 the
+ * reviewer's draft annotations can come between them, in a framed block and
+ * a blank line.
  */
 export function askQuestionText(text: string): string {
   const surface = text.search(/^Surface:.*$/mu);
   if (surface === -1) return text.trim();
   const blank = text.indexOf("\n\n", surface);
-  return blank === -1 ? text.trim() : text.slice(blank + 2).trim();
+  if (blank === -1) return text.trim();
+  let rest = text.slice(blank + 2);
+  const draftsEnd = rest.startsWith("[Draft annotations ") ? rest.indexOf("\n[End of draft annotations]\n\n") : -1;
+  if (draftsEnd !== -1) rest = rest.slice(draftsEnd + "\n[End of draft annotations]\n\n".length);
+  else if (rest.startsWith("[The reviewer has no draft annotations now.")) rest = rest.slice(rest.indexOf("\n\n") + 2);
+  return rest.trim();
 }
 
 function clip(text: string, max: number): string {

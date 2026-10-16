@@ -131,7 +131,7 @@ const fs = require("node:fs");
 fs.appendFileSync(ready, JSON.stringify({ url: "http://127.0.0.1:43210", isRemote: false, port: 43210 }) + "\\n");
 setTimeout(() => process.stdout.write(JSON.stringify({
   approved: true,
-  feedback: JSON.stringify({ origin: process.env.PLANNOTATOR_ORIGIN, dataDir: process.env.PLANNOTATOR_DATA_DIR, remote: process.env.PLANNOTATOR_REMOTE, port: process.env.PLANNOTATOR_PORT }),
+  feedback: JSON.stringify({ origin: process.env.PLANNOTATOR_ORIGIN, dataDir: process.env.PLANNOTATOR_DATA_DIR, remote: process.env.PLANNOTATOR_REMOTE, port: process.env.PLANNOTATOR_PORT, allowedHosts: process.env.PLANNOTATOR_ALLOWED_HOSTS }),
 }) + "\\n"), 20);
 process.stdin.resume();
 `,
@@ -148,6 +148,7 @@ process.stdin.resume();
       origin: "codex",
       dataDir: join(directory, "state"),
       remote: true,
+      allowedHost: "mac.tail1b968e.ts.net",
     });
     const decision = await running.result;
     expect(decision).toEqual({
@@ -157,6 +158,7 @@ process.stdin.resume();
         dataDir: join(directory, "state"),
         remote: "1",
         port: REMOTE_PORT_RANGE,
+        allowedHosts: "mac.tail1b968e.ts.net",
       }),
     });
     await running.stop();

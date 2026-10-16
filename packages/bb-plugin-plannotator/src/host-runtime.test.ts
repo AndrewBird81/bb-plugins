@@ -216,6 +216,8 @@ describe("Plannotator host entry", () => {
       binaryPath: "/fake/bin/plannotator",
       cwd,
       remote: false,
+      // Plannotator 0.28.20 answers only Hosts it knows; the proxy forwards this one.
+      allowedHost: DNS_NAME,
       origin: "claude-code",
       dataDir: join(dataDir, "plannotator"),
       timeoutSeconds: null,

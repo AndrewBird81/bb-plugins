@@ -80,7 +80,10 @@ documents, repository info, and plan history come from that checkout.
   `tailscale serve --bg --https=<port> http://127.0.0.1:<port>` and the panel
   iframes `https://<host MagicDNS name>:<port>` directly. The host needs the
   `tailscale` CLI on `PATH` or at `/usr/local/bin/tailscale`, signed in with
-  MagicDNS and HTTPS certificates enabled.
+  MagicDNS and HTTPS certificates enabled. Plannotator 0.28.20 and later
+  answer only loopback Hosts and the names in `PLANNOTATOR_ALLOWED_HOSTS`,
+  so the plugin sets it to exactly the host's MagicDNS name, which the proxy
+  forwards (no wildcard); earlier versions ignore it.
 
 The setting **Run reviews on** chooses where a session runs:
 
@@ -114,12 +117,24 @@ upstream endpoints a review never needs from another device (host control,
 editor and note-app integrations, open-in-app, PR actions, the call-flow
 runtime installer, file reads outside the worktree, custom save paths).
 Plannotator's own random loopback port is not published, but, as with stock
-local Plannotator, a web page in a browser on that host could still reach it
-and use endpoints the proxy denies, such as open-in-app (which opens a repo
-file with its default handler) and agent jobs, and, in `thread` mode, Ask AI,
-which runs the thread's agent in a hidden fork with its tools (see
-[Ask AI](#ask-ai)). Browsers that block public pages from reaching localhost,
-such as Brave by default, stop this.
+local Plannotator, a web page in a browser on that host can still send it
+requests, skipping the proxy's checks. What that page can do depends on the
+host's plannotator:
+
+- **0.28.20 and later:** Plannotator refuses any Host other than loopback and
+  the allowed MagicDNS name, so DNS rebinding fails and the page cannot read
+  Plannotator's responses. Without them it cannot find an Ask AI session, so
+  it cannot reach the thread's agent. It can still send blind `text/plain`
+  POSTs to `http://127.0.0.1:<port>`: Plannotator checks their Origin only for
+  config and source-save writes, so a forged approve or deny, open-in-app
+  (which opens a repo file with its default handler) and agent jobs remain
+  reachable.
+- **Earlier versions:** the page can also use DNS rebinding to read session
+  ids and, in `thread` mode, ask Ask AI, which runs the thread's agent in a
+  hidden fork with its tools (see [Ask AI](#ask-ai)).
+
+Browsers that block public pages from reaching localhost, such as Brave by
+default, stop all of this.
 
 ## Ask AI
 

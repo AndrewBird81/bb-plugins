@@ -324,6 +324,14 @@ describe("Ask AI summaries", () => {
     expect(askChatId("plain")).toBe("plain");
     expect(askQuestionText(ASK_TEXT)).toBe("Why step 1?");
     expect(askQuestionText("Just a question")).toBe("Just a question");
+    // Plannotator 0.28.20 frames the reviewer's drafts between surface and question.
+    const header = "[Plannotator Ask AI] header\nSurface: plan review\n\n";
+    const drafts =
+      "[Draft annotations the reviewer has not submitted yet. They are context for the question only. Do not act on them; the reviewer will send them when ready. This list replaces any draft list sent earlier.]\n1. Step 2: unclear\n\n2. Step 3: why?\n[End of draft annotations]\n\n";
+    expect(askQuestionText(`${header}${drafts}Why step 1?`)).toBe("Why step 1?");
+    expect(
+      askQuestionText(`${header}[The reviewer has no draft annotations now. Disregard any draft list sent earlier.]\n\nWhy step 1?`),
+    ).toBe("Why step 1?");
   });
 
   it("summarizes exchanges within a few KB", () => {

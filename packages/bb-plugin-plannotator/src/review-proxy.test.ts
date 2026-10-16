@@ -337,3 +337,106 @@ describe("review proxy", () => {
     expect((await send("GET", "/api/plan")).status).toBe(200);
   });
 });
+
+/**
+ * Plannotator's own Host and Origin rules. 0.28.20 answers only loopback
+ * Hosts and the names in PLANNOTATOR_ALLOWED_HOSTS (packages/shared/
+ * request-host.ts), and refuses a config write whose Origin names another
+ * host than the Host (request-origin.ts). Both versions answer Ask AI's
+ * bridge provider only on a loopback Host with the server's own port
+ * (ai-runtime.ts `authorizeSessionBridgeRequest`).
+ */
+async function upstreamWithHostRules(version: "0.28.6" | "0.28.20", allowedHosts: string[]) {
+  const seen: Seen[] = [];
+  let port = 0;
+  const server: Server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      seen.push({ method: req.method!, url: req.url!, headers: req.headers, body: "" });
+      const host = req.headers.host ?? "";
+      const hostname = host.replace(/:\d+$/u, "");
+      const origin = req.headers.origin;
+      const refuse = (reason: string) => {
+        res.writeHead(403);
+        res.end(reason);
+      };
+      if (version === "0.28.20" && hostname !== "127.0.0.1" && hostname !== "localhost" && !allowedHosts.includes(hostname)) {
+        return refuse("host_not_allowed");
+      }
+      if (
+        version === "0.28.20" &&
+        req.method === "POST" &&
+        req.url === "/api/config" &&
+        origin &&
+        req.headers["sec-fetch-site"] !== "same-origin" &&
+        new URL(origin).host !== host
+      ) {
+        return refuse("cross_origin");
+      }
+      if (req.method === "POST" && (req.url === "/api/ai/session" || req.url === "/api/ai/query") && host !== `127.0.0.1:${port}`) {
+        return refuse("session_bridge_forbidden_host");
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise((resolve) => server.close(resolve)));
+  port = (server.address() as { port: number }).port;
+  return { seen, port };
+}
+
+describe("review proxy against Plannotator's Host rules", () => {
+  it.each(["0.28.6", "0.28.20"] as const)("serves the page, decisions, config and Ask AI from Plannotator %s", async (version) => {
+    const upstream = await upstreamWithHostRules(version, [DNS_NAME]);
+    const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-proxy-worktree-"));
+    cleanups.push(() => rm(worktree, { recursive: true, force: true }));
+    const proxy = await startReviewProxy(0, {
+      publicHostname: DNS_NAME,
+      upstreamPort: upstream.port,
+      cwd: worktree,
+      allowedRoots: [worktree],
+    });
+    cleanups.push(() => proxy.close());
+    const host = `${DNS_NAME}:${proxy.port}`;
+    const send = (method: string, path: string, headers: Record<string, string> = {}) =>
+      new Promise<number>((resolve, reject) => {
+        const req = request({ host: "127.0.0.1", port: proxy.port, method, path, headers: { host, ...headers } }, (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode!));
+        });
+        req.on("error", reject);
+        req.end(method === "POST" ? "{}" : undefined);
+      });
+    const write = { origin: `https://${host}`, "content-type": "application/json" };
+
+    expect(await send("GET", "/")).toBe(200);
+    expect(await send("POST", "/api/approve", write)).toBe(200);
+    expect(await send("POST", "/api/config", write)).toBe(200);
+    expect(await send("POST", "/api/ai/session", write)).toBe(200);
+    expect(await send("POST", "/api/ai/query", write)).toBe(200);
+
+    // Ask AI reaches Plannotator as a loopback request without the browser's Origin.
+    const query = upstream.seen.find(({ url }) => url === "/api/ai/query")!;
+    expect(query.headers.host).toBe(`127.0.0.1:${upstream.port}`);
+    expect(query.headers.origin).toBeUndefined();
+    expect(upstream.seen.find(({ url }) => url === "/api/config")!.headers).toMatchObject({ host, origin: `https://${host}` });
+  });
+
+  it("is refused by Plannotator 0.28.20 unless the session allows the MagicDNS name", async () => {
+    const upstream = await upstreamWithHostRules("0.28.20", []);
+    const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-proxy-worktree-"));
+    cleanups.push(() => rm(worktree, { recursive: true, force: true }));
+    const proxy = await startReviewProxy(0, { publicHostname: DNS_NAME, upstreamPort: upstream.port, cwd: worktree, allowedRoots: [worktree] });
+    cleanups.push(() => proxy.close());
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: proxy.port, path: "/", headers: { host: `${DNS_NAME}:${proxy.port}` } }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode!));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    expect(status).toBe(403);
+  });
+});

@@ -146,6 +146,12 @@ export type SessionOptions = {
   dataDir?: string;
   /** Host used by BB's loopback server, so embedded cookies share one host. */
   embedHost?: string;
+  /**
+   * The one non-loopback name a proxy forwards as Host. Plannotator 0.28.20
+   * and later refuse any other (`PLANNOTATOR_ALLOWED_HOSTS`); older versions
+   * ignore the variable.
+   */
+  allowedHost?: string;
   /** Bind beyond loopback when BB itself is configured for remote access. */
   remote?: boolean;
   /** `PLANNOTATOR_PORT` value; defaults to the remote range in remote mode. */
@@ -588,6 +594,7 @@ export async function startUpstreamSession(
     ...(portRange ? { PLANNOTATOR_PORT: portRange } : {}),
     ...(options.origin ? { PLANNOTATOR_ORIGIN: options.origin } : {}),
     ...(options.dataDir ? { PLANNOTATOR_DATA_DIR: options.dataDir } : {}),
+    ...(options.allowedHost ? { PLANNOTATOR_ALLOWED_HOSTS: options.allowedHost } : {}),
     ...launch.env,
   };
   for (const name of launch.deleteEnv) delete env[name];

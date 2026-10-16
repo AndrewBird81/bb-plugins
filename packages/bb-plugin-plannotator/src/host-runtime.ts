@@ -468,6 +468,8 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
         origin: input.origin,
         dataDir: join(directory, "plannotator"),
         remote: false,
+        // The proxy forwards the browser's Host, this machine's MagicDNS name.
+        allowedHost: dnsName,
         cwd: input.cwd,
       });
       void review.result.catch(() => undefined);

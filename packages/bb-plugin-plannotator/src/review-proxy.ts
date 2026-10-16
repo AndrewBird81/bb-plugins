@@ -141,7 +141,12 @@ export async function startReviewProxy(
       allowedOrigins: [publicOrigin],
     });
     if (!decision.allowed) {
-      reply(res, decision.status, decision.message);
+      if ("json" in decision) {
+        res.writeHead(decision.status, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(method === "HEAD" ? undefined : decision.json);
+      } else {
+        reply(res, decision.status, decision.message);
+      }
       return;
     }
     const { url } = decision;

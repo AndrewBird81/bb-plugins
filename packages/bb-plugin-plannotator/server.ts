@@ -27,12 +27,13 @@ import {
 } from "./src/bridge";
 import {
   PANEL_ACTION_ID,
+  PANEL_TITLE,
   PLANNOTATOR_RELAY_PATH,
   PLANNOTATOR_REALTIME_CHANNEL,
 } from "./src/constants";
 import { isLocalBindHostname } from "./src/embedded";
 import { runBridgeClient, type BridgeTransport } from "./src/bridge-client";
-import { createForkAsker, summarizeExchanges, sweepForks, type ForkAsker } from "./src/fork-asker";
+import { createForkAsker, summarizeExchanges, sweepForks, type ForkAsker, type ForkLedger } from "./src/fork-asker";
 import { createRequestFilter } from "./src/request-filter";
 import {
   MAX_ANNOTATE_MARKDOWN,
@@ -209,6 +210,9 @@ const PROBE_TIMEOUT_MS = 15_000;
 /** A failed release lookup is retried soon, so one timeout does not show the toast for hours. */
 const LATEST_VERSION_FAILURE_TTL_MS = 5 * 60 * 1000;
 const HOST_CLEANUP_KEY_PREFIX = "host-cleanup:";
+/** Ask AI forks this plugin created (the fork ledger), by fork id. */
+const ASK_AI_FORK_KEY_PREFIX = "askai-fork:";
+const askAiForkSchema = z.object({ sourceThreadId: z.string().min(1) });
 /** A host that stays unreachable this long is assumed gone. */
 const HOST_CLEANUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const hostCleanupSchema = z
@@ -490,19 +494,29 @@ async function closeReviewPanel(
   bb: BbPluginApi,
   threadId: string,
   sessionId: string,
+  /** True when no other session has opened on the thread since this one ended. */
+  isThreadIdle: () => boolean = () => false,
 ): Promise<void> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const current = await bb.sdk.threads.tabs.get({ threadId });
-      const remaining = current.tabs.filter((tab) => {
-        if (tab.kind !== "plugin-panel") return true;
-        return !(
-          tab.pluginId === bb.pluginId &&
-          tab.actionId === PANEL_ACTION_ID &&
-          panelSessionId(tab.paramsJson) === sessionId
-        );
+      let changed = false;
+      const remaining = current.tabs.flatMap((tab) => {
+        if (tab.kind !== "plugin-panel" || tab.pluginId !== bb.pluginId || tab.actionId !== PANEL_ACTION_ID) {
+          return [tab];
+        }
+        if (panelSessionId(tab.paramsJson) === sessionId) {
+          changed = true;
+          return [];
+        }
+        // The thread's one tab now shows the launcher: drop the session's title.
+        if (tab.paramsJson === null && tab.title !== PANEL_TITLE && isThreadIdle()) {
+          changed = true;
+          return [{ ...tab, title: PANEL_TITLE }];
+        }
+        return [tab];
       });
-      if (remaining.length === current.tabs.length) return;
+      if (!changed) return;
 
       await bb.sdk.threads.tabs.update({
         threadId,
@@ -772,6 +786,23 @@ export default async function plugin(bb: BbPluginApi) {
     });
   });
 
+  const askAiForkKey = (forkId: string) => `${ASK_AI_FORK_KEY_PREFIX}${forkId}`;
+  const forkLedger: ForkLedger = {
+    async record(forkId, sourceThreadId) {
+      await bb.storage.kv.set(askAiForkKey(forkId), { sourceThreadId });
+    },
+    async sourceOf(forkId) {
+      const parsed = askAiForkSchema.safeParse(await bb.storage.kv.get(askAiForkKey(forkId)));
+      return parsed.success ? parsed.data.sourceThreadId : null;
+    },
+    async forget(forkId) {
+      await bb.storage.kv.delete(askAiForkKey(forkId));
+    },
+    async list() {
+      return (await bb.storage.kv.list(ASK_AI_FORK_KEY_PREFIX)).map((key) => key.slice(ASK_AI_FORK_KEY_PREFIX.length));
+    },
+  };
+
   // Host reviews that may have left a process or serve mapping behind. Kept in
   // KV so a plugin or server restart does not lose them, and retried until the
   // host answers: stop the review if its worker survived, then reconcile so
@@ -817,6 +848,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   const activeReviews = new Map<string, ActiveReview>();
   const startingReviews = new Set<string>();
+  /** Close the session's panel tab, or show the launcher's title in the thread's tab. */
+  const closePanel = (threadId: string, sessionId: string) =>
+    closeReviewPanel(bb, threadId, sessionId, () => !activeReviews.has(threadId) && !startingReviews.has(threadId));
   const relaySessions = new Map<string, RelaySession>();
   const delivering = new Set<string>();
   let disposing = false;
@@ -876,7 +910,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (record.status === "pending") {
         if (activeReviews.get(record.threadId)?.sessionId === record.id) continue;
         if (record.hostId) queueHostCleanup(record.hostId, record.id);
-        await closeReviewPanel(bb, record.threadId, record.id);
+        await closePanel(record.threadId, record.id);
         record = {
           ...record,
           // The user closed nothing and asked nothing: no message for them.
@@ -900,7 +934,7 @@ export default async function plugin(bb: BbPluginApi) {
     async start(signal) {
       // Forks a crashed or replaced plugin left behind. No session is open yet.
       try {
-        const swept = await sweepForks(bb.sdk.threads, bb.pluginId, (message) => bb.log.warn(message));
+        const swept = await sweepForks(bb.sdk.threads, forkLedger, bb.pluginId, (message) => bb.log.warn(message));
         if (swept > 0) bb.log.info(`Archived ${swept} Plannotator Ask AI fork(s) left from earlier sessions`);
       } catch (error) {
         bb.log.warn(`Could not sweep Plannotator Ask AI forks: ${String(error)}`);
@@ -974,7 +1008,7 @@ export default async function plugin(bb: BbPluginApi) {
       threadId,
       sessionId: active.sessionId,
     });
-    await closeReviewPanel(bb, threadId, active.sessionId);
+    await closePanel(threadId, active.sessionId);
     try {
       await active.review.stop();
     } catch (error) {
@@ -1088,6 +1122,7 @@ export default async function plugin(bb: BbPluginApi) {
     const controller = new AbortController();
     const asker = createForkAsker({
       threads: bb.sdk.threads,
+      ledger: forkLedger,
       sourceThreadId: threadId,
       ...(sourceSeqEnd !== undefined ? { sourceSeqEnd } : {}),
       sessionId: active.sessionId,
@@ -1300,7 +1335,7 @@ export default async function plugin(bb: BbPluginApi) {
       void stopAskAi(active);
       await Promise.allSettled([
         bb.storage.kv.delete(reviewKey(sessionId)),
-        closeReviewPanel(bb, threadId, sessionId),
+        closePanel(threadId, sessionId),
         upstream.stop(),
       ]);
       return { status: "error", error: error instanceof Error ? error.message : String(error) };
@@ -1438,7 +1473,7 @@ export default async function plugin(bb: BbPluginApi) {
       sessionId: active.sessionId,
     });
     await Promise.allSettled([
-      closeReviewPanel(bb, threadId, active.sessionId),
+      closePanel(threadId, active.sessionId),
       active.review.stop(),
       stopAskAi(active),
     ]);

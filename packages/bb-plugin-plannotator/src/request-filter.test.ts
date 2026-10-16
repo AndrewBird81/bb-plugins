@@ -156,6 +156,54 @@ describe("request filter", () => {
     expect(approvals.map(({ body }) => JSON.parse(body))).toEqual([{ planSave: {} }, { planSave: {} }]);
   });
 
+  it("answers the open-in app list as upstream does for a remote session, and still refuses opening files", async () => {
+    const { seen, port } = await upstream();
+    const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-filter-"));
+    cleanups.push(() => rm(worktree, { recursive: true, force: true }));
+    const options = { cwd: worktree, allowedRoots: [worktree] };
+    const proxy = await startReviewProxy(0, { ...options, publicHostname: DNS_NAME, upstreamPort: port });
+    cleanups.push(() => proxy.close());
+    const proxyHost = `${DNS_NAME}:${proxy.port}`;
+    const viaProxy = (method: string, path: string, headers: Record<string, string> = {}) =>
+      new Promise<{ status: number; type: string | undefined; body: string }>((resolve, reject) => {
+        const req = request(
+          { host: "127.0.0.1", port: proxy.port, method, path, headers: { host: proxyHost, ...headers } },
+          (res) => {
+            let body = "";
+            res.setEncoding("utf8");
+            res.on("data", (chunk: string) => (body += chunk));
+            res.on("end", () => resolve({ status: res.statusCode!, type: res.headers["content-type"], body }));
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    registerPlannotatorRelayRoutes(
+      host.bb,
+      new Map([["s-1", { url: `http://127.0.0.1:${port}`, filter: await createRequestFilter(options) }]]),
+      () => BB_ORIGIN,
+    );
+    const viaRelay = async (method: string, path: string, headers: Record<string, string> = {}) => {
+      const response = await host.harness.behavior.fetchHttp(
+        method,
+        `${PLANNOTATOR_RELAY_ROUTE}?sessionId=s-1&path=${encodeURIComponent(path)}`,
+        { headers },
+      );
+      return { status: response.status, type: response.headers.get("content-type") ?? undefined, body: await response.text() };
+    };
+
+    for (const answer of [await viaProxy("GET", "/api/open-in/apps"), await viaRelay("GET", "/api/open-in/apps")]) {
+      expect(answer.status).toBe(200);
+      expect(answer.type).toBe("application/json");
+      expect(JSON.parse(answer.body)).toEqual({ available: false, apps: [] });
+    }
+    expect((await viaProxy("POST", "/api/open-in", { origin: `https://${proxyHost}` })).status).toBe(403);
+    expect((await viaRelay("POST", "/api/open-in", { origin: BB_ORIGIN })).status).toBe(403);
+    expect(seen).toHaveLength(0);
+  });
+
   it("never forwards a browser's Authorization or cookies through the relay", async () => {
     const { seen, port } = await upstream();
     const host = createFakePluginHost({ pluginId: "plannotator" });

@@ -336,7 +336,7 @@ describe("BB upstream Plannotator bridge", () => {
     expectNoTabWrites(host);
   });
 
-  it("refuses a second review with a distinct status instead of cancelled", async () => {
+  it("refuses a second review with a distinct status instead of cancelled, and retitles the tab on cancel", async () => {
     const binary = await fakePlannotatorBinary({ approveAfterMs: null });
     const host = createFakePluginHost({
       pluginId: "plannotator",
@@ -372,6 +372,14 @@ describe("BB upstream Plannotator bridge", () => {
       threadId: "thread-1",
     })) as { sessionId: string };
     expect(active.sessionId).toBe(first.reviewId);
+    // The browser's one param-less tab, titled for the session.
+    await host.bb.sdk.threads.tabs.update({
+      threadId: "thread-1",
+      expectedRevision: 1,
+      tabs: [
+        { kind: "plugin-panel", id: "plugin-panel:plannotator%3Aplannotator-review%3A:none", actionId: "plannotator-review", pluginId: "plannotator", title: "Plannotator review", paramsJson: null },
+      ] as never,
+    });
     await expect(
       host.harness.callRpc("cancelReview", {
         threadId: "thread-1",
@@ -379,6 +387,10 @@ describe("BB upstream Plannotator bridge", () => {
       }),
     ).resolves.toEqual({ cancelled: true });
     await sentReview(host);
+    // Cancelled: the tab shows the launcher again, under its title.
+    await vi.waitFor(async () =>
+      expect((await host.bb.sdk.threads.tabs.get({ threadId: "thread-1" })).tabs).toMatchObject([{ title: "Plannotator" }]),
+    );
     await expect.poll(() => host.harness.realtimeSignals).toContainEqual({
       channel: PLANNOTATOR_REALTIME_CHANNEL,
       payload: {
@@ -1142,7 +1154,7 @@ describe("BB upstream Plannotator bridge", () => {
     expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
-  it("leaves tabs to the browser and removes only a legacy tab of the settling review", async () => {
+  it("leaves tabs to the browser, removes only a legacy tab of the settling review and restores the launcher title", async () => {
     const remote = fakeRemoteHost();
     const host = createFakePluginHost({
       pluginId: "plannotator",
@@ -1188,6 +1200,8 @@ describe("BB upstream Plannotator bridge", () => {
 
     const { tabs } = await host.bb.sdk.threads.tabs.get({ threadId: "thread-1" });
     expect(tabs.map((tab) => tab.id)).toEqual(["thread-info", sharedTab.id]);
+    // The thread's tab now shows the launcher, so it drops the session's title.
+    expect(tabs[1]).toMatchObject({ title: "Plannotator" });
   });
 
   /** A Mac host whose session bridge hands out the given questions once each. */
@@ -1233,6 +1247,12 @@ describe("BB upstream Plannotator bridge", () => {
     host.harness.sdk.stub("threads.fork", () => {
       forks += 1;
       return makeThreadResponse({ id: `thr_fork${forks}` });
+    });
+    host.harness.sdk.stub("threads.get", async (args) => {
+      const { threadId } = args as unknown as { threadId: string };
+      return threadId.startsWith("thr_fork")
+        ? makeThreadResponse({ id: threadId, originKind: "fork", originPluginId: "plannotator", visibility: "hidden", sourceThreadId: "thread-1" })
+        : makeThreadResponse({ id: threadId, providerId: "claude-code", environmentId: "env-1" });
     });
     host.harness.sdk.stub("threads.send", (args) => {
       const input = args as unknown as { threadId: string; input: Array<{ text: string }> };
@@ -1389,25 +1409,27 @@ describe("BB upstream Plannotator bridge", () => {
     });
   });
 
-  it("archives Ask AI forks left by an earlier plugin when it starts", async () => {
+  it("archives only the recorded Ask AI forks an earlier plugin left when it starts", async () => {
     const host = createFakePluginHost({ pluginId: "plannotator" });
     hosts.push(host);
     await plugin(host.bb);
     wireInteractionSdk(host);
-    let listed = false;
-    host.harness.sdk.stub("threads.list", () => {
-      if (listed) return [];
-      listed = true;
-      return [
-        makeThreadResponse({ id: "thr_old_fork", originKind: "fork", originPluginId: "plannotator", visibility: "hidden" }),
-        makeThreadResponse({ id: "thr_side_chat", originKind: "fork", originPluginId: "side-chat", visibility: "hidden" }),
-      ];
+    await host.bb.storage.kv.set("askai-fork:thr_old_fork", { sourceThreadId: "thread-1" });
+    // Recorded, but bb reports the user's own thread: never touched.
+    await host.bb.storage.kv.set("askai-fork:thread-2", { sourceThreadId: "thread-1" });
+    host.harness.sdk.stub("threads.get", async (args) => {
+      const { threadId } = args as unknown as { threadId: string };
+      return threadId === "thr_old_fork"
+        ? makeThreadResponse({ id: threadId, originKind: "fork", originPluginId: "plannotator", visibility: "hidden", sourceThreadId: "thread-1" })
+        : makeThreadResponse({ id: threadId });
     });
     host.harness.sdk.stub("threads.stop", async () => ({}) as never);
     host.harness.sdk.stub("threads.archive", async () => makeThreadResponse({ id: "x" }) as never);
 
     const service = host.harness.behavior.runService("review-delivery");
     await vi.waitFor(() => expect(host.harness.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "thr_old_fork" }]]));
+    expect(host.harness.sdk.callsTo("threads.stop")).toEqual([[{ threadId: "thr_old_fork" }]]);
+    await vi.waitFor(async () => expect(await host.bb.storage.kv.list("askai-fork:")).toEqual([]));
     service.controller.abort();
     await service.done;
   });

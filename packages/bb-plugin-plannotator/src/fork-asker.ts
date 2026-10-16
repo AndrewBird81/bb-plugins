@@ -5,8 +5,20 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
 type Threads = BbPluginApi["sdk"]["threads"];
-export type ForkAskerThreads = Pick<Threads, "fork" | "get" | "send" | "wait" | "stop" | "archive" | "list"> & {
+export type ForkAskerThreads = Pick<Threads, "fork" | "get" | "send" | "wait" | "stop" | "archive"> & {
   events: Pick<Threads["events"], "list" | "wait">;
+};
+
+/**
+ * The Ask AI forks this plugin created, kept in its own storage, which no one
+ * else can write. A thread is stopped or archived only when it is recorded
+ * here and bb also reports it as this plugin's hidden fork of that source.
+ */
+export type ForkLedger = {
+  record(forkId: string, sourceThreadId: string): Promise<void>;
+  sourceOf(forkId: string): Promise<string | null>;
+  forget(forkId: string): Promise<void>;
+  list(): Promise<string[]>;
 };
 
 /** An answer may take this long before the fork is stopped. */
@@ -31,6 +43,12 @@ export type ForkAsker = {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isThreadNotFound(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const { code, status } = error as { code?: unknown; status?: unknown };
+  return code === "thread_not_found" || status === 404;
 }
 
 function isSessionUnavailable(error: unknown): boolean {
@@ -129,19 +147,87 @@ async function latestSequence(threads: ForkAskerThreads, threadId: string): Prom
   return rows[0]?.seq ?? 0;
 }
 
+type ForkCheck =
+  | { kind: "own"; archived: boolean }
+  /** Not a recorded Ask AI fork of this plugin: never stop or archive it. */
+  | { kind: "refused"; reason: string }
+  | { kind: "gone" }
+  /** bb could not be asked; try again later. */
+  | { kind: "unknown"; reason: string };
+
+async function checkFork(
+  threads: Pick<Threads, "get">,
+  ledger: ForkLedger,
+  pluginId: string,
+  forkId: string,
+): Promise<ForkCheck> {
+  const sourceThreadId = await ledger.sourceOf(forkId);
+  if (!sourceThreadId) return { kind: "refused", reason: "this plugin did not record it as a fork" };
+  let thread: Awaited<ReturnType<Threads["get"]>>;
+  try {
+    thread = await threads.get({ threadId: forkId });
+  } catch (error) {
+    return isThreadNotFound(error) ? { kind: "gone" } : { kind: "unknown", reason: errorMessage(error) };
+  }
+  if (
+    thread.originKind !== "fork" ||
+    thread.originPluginId !== pluginId ||
+    thread.visibility !== "hidden" ||
+    thread.sourceThreadId !== sourceThreadId
+  ) {
+    return { kind: "refused", reason: "bb does not report it as this plugin's hidden fork of the recorded thread" };
+  }
+  return { kind: "own", archived: thread.archivedAt !== null };
+}
+
+/** Stop and archive a recorded Ask AI fork. Returns whether it archived one. */
+async function retireFork(
+  threads: Pick<Threads, "get" | "stop" | "archive">,
+  ledger: ForkLedger,
+  pluginId: string,
+  forkId: string,
+  log: (message: string) => void,
+): Promise<boolean> {
+  const check = await checkFork(threads, ledger, pluginId, forkId);
+  if (check.kind === "unknown") {
+    log(`Could not check Plannotator fork ${forkId}: ${check.reason}`);
+    return false;
+  }
+  if (check.kind === "refused") {
+    log(`Not archiving thread ${forkId}: ${check.reason}`);
+    await ledger.forget(forkId);
+    return false;
+  }
+  if (check.kind === "own" && !check.archived) {
+    await threads.stop({ threadId: forkId }).catch(() => undefined);
+    try {
+      await threads.archive({ threadId: forkId });
+    } catch (error) {
+      log(`Could not archive Plannotator fork ${forkId}: ${errorMessage(error)}`);
+      return false;
+    }
+    await ledger.forget(forkId);
+    return true;
+  }
+  await ledger.forget(forkId);
+  return false;
+}
+
 export function createForkAsker(options: {
   threads: ForkAskerThreads;
+  /** Where the forks are recorded, so only they are ever archived. */
+  ledger: ForkLedger;
   sourceThreadId: string;
   /** Pin forks to the thread's history when the session opened. */
   sourceSeqEnd?: number;
   /** Marks the forks as this session's. */
   sessionId: string;
-  /** This plugin's id: the forks' origin, which the startup sweep matches. */
+  /** This plugin's id: the forks' origin, checked before any stop or archive. */
   pluginId: string;
   timeoutMs?: number;
   log?: (message: string) => void;
 }): ForkAsker {
-  const { threads, sourceThreadId } = options;
+  const { threads, ledger, sourceThreadId, pluginId } = options;
   const timeoutMs = options.timeoutMs ?? ASK_TIMEOUT_MS;
   const log = options.log ?? (() => undefined);
   /** The fork each Ask AI chat uses now. */
@@ -156,7 +242,7 @@ export function createForkAsker(options: {
       sourceThreadId,
       lifecycleOwnerThreadId: sourceThreadId,
       visibility: "hidden" as const,
-      // Explicit, so the startup sweep finds these forks by plugin.
+      // Explicit: a fork is archived only when bb reports this origin.
       origin: "plugin" as const,
       originPluginId: options.pluginId,
       title: "Plannotator Ask AI",
@@ -164,8 +250,9 @@ export function createForkAsker(options: {
       // No permissionMode: the fork inherits the thread's. A stricter mode
       // would stall on approval prompts nobody can see in a hidden fork.
     };
+    let forkId: string;
     try {
-      return (
+      forkId = (
         await threads.fork({
           ...args,
           ...(options.sourceSeqEnd !== undefined ? { sourceSeqEnd: options.sourceSeqEnd } : {}),
@@ -175,15 +262,24 @@ export function createForkAsker(options: {
       // The pinned point is not a completed turn yet (the agent that opened
       // the session is still in its turn): fork at the tip instead.
       if (options.sourceSeqEnd === undefined || !isSessionUnavailable(error)) throw error;
-      return (await threads.fork(args)).id;
+      forkId = (await threads.fork(args)).id;
     }
+    // Unrecorded, the fork is never archived by this plugin; bb archives it
+    // with its thread (its lifecycle owner).
+    await ledger.record(forkId, sourceThreadId).catch((error: unknown) => {
+      log(`Could not record Plannotator fork ${forkId}: ${errorMessage(error)}`);
+    });
+    return forkId;
   }
 
   async function retire(threadId: string): Promise<void> {
-    await threads.stop({ threadId }).catch(() => undefined);
-    await threads.archive({ threadId }).catch((error: unknown) => {
-      log(`Could not archive Plannotator fork ${threadId}: ${errorMessage(error)}`);
-    });
+    await retireFork(threads, ledger, pluginId, threadId, log);
+  }
+
+  /** Stop a running answer, only in a recorded fork. */
+  async function stopFork(threadId: string): Promise<void> {
+    const check = await checkFork(threads, ledger, pluginId, threadId).catch(() => null);
+    if (check?.kind === "own") await threads.stop({ threadId }).catch(() => undefined);
   }
 
   function chatFork(chatId: string): Promise<string> {
@@ -315,7 +411,7 @@ export function createForkAsker(options: {
       exchange.answer = answer;
       return answer;
     } catch (error) {
-      if (step.aborted && forkId) await threads.stop({ threadId: forkId }).catch(() => undefined);
+      if (step.aborted && forkId) await stopFork(forkId);
       if (signal.aborted) {
         exchange.error = "cancelled";
         throw error;
@@ -343,39 +439,19 @@ export function createForkAsker(options: {
   };
 }
 
-/** Archive hidden forks this plugin left behind, for example after a crash. */
+/**
+ * Archive the recorded forks a crashed or replaced plugin left behind. Only
+ * forks in the ledger are candidates; anything else is left alone.
+ */
 export async function sweepForks(
-  threads: Pick<Threads, "list" | "stop" | "archive">,
+  threads: Pick<Threads, "get" | "stop" | "archive">,
+  ledger: ForkLedger,
   pluginId: string,
   log: (message: string) => void = () => undefined,
 ): Promise<number> {
   let swept = 0;
-  for (let page = 0; page < 20; page += 1) {
-    const rows = await threads.list({
-      includeHidden: true,
-      originKind: "fork",
-      originPluginId: pluginId,
-      archived: false,
-      limit: 100,
-    });
-    const own = rows.filter(
-      (thread) =>
-        thread.originKind === "fork" &&
-        thread.originPluginId === pluginId &&
-        thread.visibility === "hidden" &&
-        thread.archivedAt === null,
-    );
-    if (own.length === 0) break;
-    for (const thread of own) {
-      await threads.stop({ threadId: thread.id }).catch(() => undefined);
-      try {
-        await threads.archive({ threadId: thread.id });
-        swept += 1;
-      } catch (error) {
-        log(`Could not archive Plannotator fork ${thread.id}: ${errorMessage(error)}`);
-      }
-    }
-    if (rows.length < 100 || swept === 0) break;
+  for (const forkId of await ledger.list()) {
+    if (await retireFork(threads, ledger, pluginId, forkId, log)) swept += 1;
   }
   return swept;
 }

@@ -281,7 +281,15 @@ export function createPlannotatorRelayHandler(
       upgrade: request.headers.has("upgrade"),
       allowedOrigins: relayOrigins(request.headers.get("host") ?? undefined, bbOrigin()),
     });
-    if (!decision.allowed) return errorResponse(decision.message, decision.status);
+    if (!decision.allowed) {
+      if ("json" in decision) {
+        return new Response(request.method === "HEAD" ? null : decision.json, {
+          status: decision.status,
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
+        });
+      }
+      return errorResponse(decision.message, decision.status);
+    }
     const targetUrl = decision.url.toString();
 
     const requestHeaders = new Headers(request.headers);

@@ -6,6 +6,7 @@ import {
   summarizeExchanges,
   sweepForks,
   type ForkAskerThreads,
+  type ForkLedger,
 } from "./fork-asker";
 
 const ASK_TEXT =
@@ -30,7 +31,10 @@ function fakeThreads(
     /** Forks whose status is `error`, or that never become idle. */
     erroredForks?: string[];
     neverIdleForks?: string[];
-    listed?: Array<Record<string, unknown>>;
+    /** The id `threads.fork` returns, by fork number. */
+    forkId?: (fork: number) => string;
+    /** What `threads.get` reports for an id, over a live hidden fork of thr_main. */
+    threadRows?: Record<string, Record<string, unknown> | "not-found">;
     /** Turn events carry no turn scope. */
     unscoped?: boolean;
   } = {},
@@ -53,7 +57,7 @@ function fakeThreads(
       const error = options.forkError?.(args);
       if (error) throw error;
       forks += 1;
-      const id = `fork-${forks}`;
+      const id = options.forkId?.(forks) ?? `fork-${forks}`;
       // History copied from the source: a completed turn with an old reply.
       append(id, "turn/started", "copied", {});
       append(id, "item/completed", "copied", { item: { type: "agentMessage", text: "An old reply from the source." } });
@@ -62,7 +66,18 @@ function fakeThreads(
     },
     async get(args: Record<string, unknown>) {
       calls.push({ method: "get", args: { threadId: args.threadId } });
-      return { id: args.threadId, status: options.erroredForks?.includes(String(args.threadId)) ? "error" : "idle" };
+      const row = options.threadRows?.[String(args.threadId)];
+      if (row === "not-found") throw Object.assign(new Error("Thread not found"), { code: "thread_not_found", status: 404 });
+      return {
+        id: args.threadId,
+        status: options.erroredForks?.includes(String(args.threadId)) ? "error" : "idle",
+        originKind: "fork",
+        originPluginId: "plannotator",
+        visibility: "hidden",
+        sourceThreadId: "thr_main",
+        archivedAt: null,
+        ...row,
+      };
     },
     async wait(args: Record<string, unknown>) {
       calls.push({ method: "wait", args: { threadId: args.threadId, status: args.status } });
@@ -113,19 +128,43 @@ function fakeThreads(
       calls.push({ method: "archive", args });
       return {};
     },
-    async list(args: Record<string, unknown>) {
-      calls.push({ method: "list", args });
-      const rows = options.listed ?? [];
-      options.listed = [];
-      return rows;
-    },
   };
   return { threads: threads as unknown as ForkAskerThreads, calls };
 }
 
+/** The plugin's fork ledger, in memory. */
+function memoryLedger(entries: Record<string, string> = {}) {
+  const recorded = new Map(Object.entries(entries));
+  const ledger: ForkLedger = {
+    async record(forkId, sourceThreadId) {
+      recorded.set(forkId, sourceThreadId);
+    },
+    async sourceOf(forkId) {
+      return recorded.get(forkId) ?? null;
+    },
+    async forget(forkId) {
+      recorded.delete(forkId);
+    },
+    async list() {
+      return [...recorded.keys()];
+    },
+  };
+  return { ledger, recorded };
+}
+
 const signal = () => new AbortController().signal;
-const asker = (threads: ForkAskerThreads, extra: { sourceSeqEnd?: number; timeoutMs?: number } = {}) =>
-  createForkAsker({ threads, sourceThreadId: "thr_main", sessionId: "s-1", pluginId: "plannotator", ...extra });
+const asker = (
+  threads: ForkAskerThreads,
+  extra: { sourceSeqEnd?: number; timeoutMs?: number; ledger?: ForkLedger } = {},
+) =>
+  createForkAsker({
+    threads,
+    ledger: memoryLedger().ledger,
+    sourceThreadId: "thr_main",
+    sessionId: "s-1",
+    pluginId: "plannotator",
+    ...extra,
+  });
 const of = (calls: Call[], method: string) => calls.filter((call) => call.method === method).map(({ args }) => args);
 
 describe("ForkAsker", () => {
@@ -290,31 +329,60 @@ describe("ForkAsker", () => {
     await expect(forkAsker.ask({ askId: "chat-3:1", text: "q" }, signal())).rejects.toThrow("ended");
   });
 
-  it("sweeps only this plugin's live hidden forks", async () => {
-    const thread = (id: string, overrides: Record<string, unknown> = {}) => ({
-      id,
-      originKind: "fork",
-      originPluginId: "plannotator",
-      visibility: "hidden",
-      archivedAt: null,
-      ...overrides,
-    });
+  it("never stops or archives a thread that is not its own recorded hidden fork", async () => {
+    // bb hands back the user's own thread, or a thread that is not a hidden
+    // fork of this plugin: the asker uses it, but cleanup leaves it alone.
+    for (const [forkId, row] of [
+      ["thr_main", { originKind: null, originPluginId: null, visibility: "visible", sourceThreadId: null }],
+      ["thr_side", { originPluginId: "side-chat" }],
+      ["thr_shown", { visibility: "visible" }],
+      ["thr_other", { sourceThreadId: "thr_elsewhere" }],
+    ] as const) {
+      const { threads, calls } = fakeThreads({ forkId: () => forkId, threadRows: { [forkId]: row } });
+      const { ledger, recorded } = memoryLedger();
+      const forkAsker = asker(threads, { ledger });
+      await forkAsker.ask({ askId: "c:1", text: "q" }, signal());
+      await forkAsker.dispose();
+      expect(of(calls, "stop")).toEqual([]);
+      expect(of(calls, "archive")).toEqual([]);
+      expect(recorded.size).toBe(0);
+    }
+
+    // A thread bb reports as this plugin's hidden fork, but that this plugin
+    // never recorded, is not archived either.
+    const { threads, calls } = fakeThreads();
+    const unrecorded: ForkLedger = { ...memoryLedger().ledger, record: async () => undefined };
+    const forkAsker = asker(threads, { ledger: unrecorded });
+    await forkAsker.ask({ askId: "c:1", text: "q" }, signal());
+    await forkAsker.dispose();
+    expect(of(calls, "archive")).toEqual([]);
+  });
+
+  it("sweeps only the recorded forks that are still this plugin's live hidden forks", async () => {
     const { threads, calls } = fakeThreads({
-      listed: [
-        thread("fork-a"),
-        thread("fork-b", { originPluginId: "side-chat" }),
-        thread("fork-c", { visibility: "visible" }),
-        thread("fork-d", { archivedAt: 1 }),
-      ],
+      threadRows: {
+        "fork-b": { originPluginId: "side-chat" },
+        "fork-c": { visibility: "visible" },
+        "fork-d": { archivedAt: 1 },
+        "fork-e": "not-found",
+        "thr_user": { originKind: null, originPluginId: null, visibility: "visible", sourceThreadId: null },
+      },
+    });
+    const { ledger, recorded } = memoryLedger({
+      "fork-a": "thr_main",
+      "fork-b": "thr_main",
+      "fork-c": "thr_main",
+      "fork-d": "thr_main",
+      "fork-e": "thr_main",
+      "fork-f": "thr_elsewhere",
+      thr_user: "thr_main",
     });
 
-    await expect(sweepForks(threads, "plannotator")).resolves.toBe(1);
+    await expect(sweepForks(threads, ledger, "plannotator")).resolves.toBe(1);
 
-    expect(calls[0]).toEqual({
-      method: "list",
-      args: { includeHidden: true, originKind: "fork", originPluginId: "plannotator", archived: false, limit: 100 },
-    });
+    expect(of(calls, "stop")).toEqual([{ threadId: "fork-a" }]);
     expect(of(calls, "archive")).toEqual([{ threadId: "fork-a" }]);
+    expect([...recorded.keys()]).toEqual([]);
   });
 });
 

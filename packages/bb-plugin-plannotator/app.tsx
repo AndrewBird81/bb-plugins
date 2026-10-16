@@ -18,6 +18,7 @@ import {
 import type { rpcContract } from "./server";
 import {
   PANEL_ACTION_ID,
+  PANEL_TITLE,
   PLANNOTATOR_REALTIME_CHANNEL,
 } from "./src/constants";
 import {
@@ -375,7 +376,7 @@ function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
 export default definePluginApp((app) => {
   app.slots.threadPanelAction({
     id: PANEL_ACTION_ID,
-    title: "Plannotator",
+    title: PANEL_TITLE,
     icon: "ClipboardCheck",
     layout: "flush",
     component: PlannotatorPanel,
@@ -391,7 +392,7 @@ export default definePluginApp((app) => {
   ) => {
     if (!context.threadId) return;
     requestPanel(context.threadId, request);
-    if (!context.openPanel({ actionId: PANEL_ACTION_ID, title: "Plannotator" })) {
+    if (!context.openPanel({ actionId: PANEL_ACTION_ID, title: PANEL_TITLE })) {
       cancelPanelRequest(context.threadId, request);
       toast.error("Plannotator could not open its panel here. Open the thread's side panel and try again.");
     }

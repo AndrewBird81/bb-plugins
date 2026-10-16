@@ -486,6 +486,28 @@ describe("Plannotator BB shell", () => {
     expect(calls.map(({ query }) => query)).toEqual(["md", "html"]);
   });
 
+  it("says the picker is searching until the workspace answers, not that nothing matches", async () => {
+    const pending: Array<(value: unknown) => void> = [];
+    const answer = () => {
+      for (const resolve of pending.splice(0)) resolve({ paths: [], truncated: false });
+    };
+    const sdk = {
+      threads: { get: async () => ({ environmentId: "env-1" }) },
+      environments: { paths: () => new Promise((resolve) => pending.push(resolve)) },
+    } as never;
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => null }, sdk },
+    );
+    await slot.findByText("Searching files…");
+    expect(slot.queryByText("No Markdown or HTML files match.")).toBeNull();
+    await waitFor(() => expect(pending).toHaveLength(2));
+    answer();
+    await slot.findByText("No Markdown or HTML files match.");
+    expect(slot.queryByText("Searching files…")).toBeNull();
+  });
+
   it("exposes explicit cancellation without a host interaction deadline", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,

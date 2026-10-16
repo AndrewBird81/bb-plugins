@@ -37,6 +37,13 @@ const DENIED_PATHS: ReadonlyArray<{ path: string; prefix: boolean }> = [
  */
 const LOOPBACK_HOST_PATHS = new Set(["/api/ai/session", "/api/ai/query"]);
 
+/**
+ * Upstream's own answer for a remote session, where opening files in a
+ * desktop app is unavailable. The open-in UI then hides itself, where a
+ * refusal would leave a failed request on every load.
+ */
+const OPEN_IN_APPS_UNAVAILABLE = JSON.stringify({ available: false, apps: [] });
+
 /** Decision-body fields that write files or open apps on the host. */
 const STRIPPED_DECISION_FIELDS = ["obsidian", "bear", "octarine"] as const;
 const DECISION_PATHS = new Set(["/api/approve", "/api/deny"]);
@@ -62,6 +69,8 @@ export type FilterRequest = {
 
 export type FilterDecision =
   | { allowed: false; status: 403; message: string }
+  /** Answered here with this JSON body; nothing reaches upstream. */
+  | { allowed: false; status: 200; json: string }
   | {
       allowed: true;
       /** The URL to forward, with `/api/image` resolved to one absolute path. */
@@ -134,6 +143,9 @@ export async function createRequestFilter(options: RequestFilterOptions): Promis
     }
     const url = new URL(request.url.href);
     const path = url.pathname.toLowerCase();
+    if (path === "/api/open-in/apps" && (method === "GET" || method === "HEAD")) {
+      return { allowed: false, status: 200, json: OPEN_IN_APPS_UNAVAILABLE };
+    }
     for (const denied of DENIED_PATHS) {
       if (denied.prefix ? path.startsWith(denied.path) || path === denied.path.replace(/\/$/u, "") : path === denied.path) {
         return refuse("This Plannotator endpoint is not available through BB.");

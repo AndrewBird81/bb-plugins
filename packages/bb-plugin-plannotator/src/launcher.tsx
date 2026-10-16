@@ -97,6 +97,8 @@ function AnnotateFilePicker({
   const [environmentId, setEnvironmentId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [paths, setPaths] = useState<string[]>([]);
+  /** Until the first answer for the current query, an empty list means nothing yet. */
+  const [searching, setSearching] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -117,6 +119,7 @@ function AnnotateFilePicker({
   useEffect(() => {
     if (!environmentId) return;
     let cancelled = false;
+    setSearching(true);
     const timer = setTimeout(() => {
       // bb's path search is fuzzy: with no query, list Markdown and HTML.
       const queries = query.trim() ? [query.trim()] : ["md", "html"];
@@ -136,9 +139,12 @@ function AnnotateFilePicker({
           setError(null);
           const found = results.flatMap((result) => result.paths.map(({ path }) => path));
           setPaths([...new Set(found)].filter((path) => ANNOTATABLE.test(path)));
+          setSearching(false);
         })
         .catch(() => {
-          if (!cancelled) setError("Could not search the workspace.");
+          if (cancelled) return;
+          setError("Could not search the workspace.");
+          setSearching(false);
         });
     }, 150);
     return () => {
@@ -173,8 +179,10 @@ function AnnotateFilePicker({
             </button>
           </li>
         ))}
-        {environmentId && paths.length === 0 && !error ? (
-          <li className="px-2 py-1 text-muted-foreground">No Markdown or HTML files match.</li>
+        {paths.length === 0 && !error ? (
+          <li className="px-2 py-1 text-muted-foreground">
+            {searching ? "Searching files…" : "No Markdown or HTML files match."}
+          </li>
         ) : null}
       </ul>
     </div>

@@ -49,6 +49,10 @@ shell in the browser) is on, or does not report its state. Code review runs
 with `--no-git-remote-check`, so it compares against local refs. Sessions on
 the BB server in remote mode run with sharing disabled.
 
+Known limitation: an HTML file that sets no colors of its own can show black
+text on Plannotator's dark background. Plannotator leaves the styling of
+arbitrary HTML to the document, so give such a page its own background color.
+
 ## Remote BB and Tailscale access
 
 On the BB server machine, Plannotator always binds loopback. When BB is
@@ -115,7 +119,9 @@ and accepts writes only from that origin (blocking cross-site requests from
 other web pages), and lets only the bb page frame the review. It also denies
 upstream endpoints a review never needs from another device (host control,
 editor and note-app integrations, open-in-app, PR actions, the call-flow
-runtime installer, file reads outside the worktree, custom save paths).
+runtime installer, file reads outside the worktree, custom save paths). It
+answers the open-in-app list itself, as Plannotator does for a remote
+session (none available), so that control stays hidden.
 Plannotator's own random loopback port is not published, but, as with stock
 local Plannotator, a web page in a browser on that host can still send it
 requests, skipping the proxy's checks. What that page can do depends on the
@@ -145,12 +151,15 @@ setting **Ask AI answers from** chooses:
   thread, which has the whole conversation and works in the same worktree. A
   follow-up in the same chat goes to the same fork. The user's thread is never
   interrupted or waited on. When the session ends, its forks are stopped and
-  archived, and the result message the agent receives lists the questions and
-  answers (a few KB at most) as a quoted block labelled as reviewer Q&A data,
-  not instructions. This needs a thread provider that can fork; for one that
-  can't, or when the plugin cannot look the provider up, the session uses
-  `local` instead, and the tool result says so (`askAiAnswersFrom`,
-  `askAiReason`).
+  archived. The plugin records each fork it creates in its own storage and
+  stops or archives a thread only when it is recorded there and bb reports it
+  as this plugin's hidden fork of that thread; recorded forks a crash left
+  behind are archived when the plugin next starts. The result message the
+  agent receives lists the questions and answers (a few KB at most) as a
+  quoted block labelled as reviewer Q&A data, not instructions. This needs a
+  thread provider that can fork; for one that can't, or when the plugin cannot
+  look the provider up, the session uses `local` instead, and the tool result
+  says so (`askAiAnswersFrom`, `askAiReason`).
 - `local`: the AI tools installed on the thread's machine (Claude, Codex, Pi,
   OpenCode), which start without the conversation. This is Plannotator's own
   behaviour.

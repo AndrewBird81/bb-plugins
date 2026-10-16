@@ -211,6 +211,10 @@ describe("BB upstream Plannotator bridge", () => {
       "cancelReview",
       "startSession",
     ]);
+    // The CLI's `bb plugin rpc call plannotator status` sends null input.
+    for (const input of [null, {}]) {
+      expect(await host.harness.callRpc("status", input)).toEqual({ configuredPath: binary, binary });
+    }
     expect(
       host.harness.inspection.registrations.httpRoutes.map((route) => route.method),
     ).toEqual(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);

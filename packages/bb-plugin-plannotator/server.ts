@@ -106,7 +106,8 @@ type ReviewPanelPayload = z.infer<typeof interactionPayloadSchema>;
 export const rpcContract = defineRpcContract({
   /** A health check for the right-panel shell and plugin tests. */
   status: {
-    input: z.object({}).strict(),
+    // `bb plugin rpc call plannotator status` sends null without --input-file.
+    input: z.object({}).strict().nullable(),
     output: z
       .object({
         binary: z.string().nullable(),

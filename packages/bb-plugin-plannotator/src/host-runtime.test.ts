@@ -496,10 +496,13 @@ describe("Plannotator host entry", () => {
       origin: "codex",
       session: { mode: "plan", planMarkdown: "# Plan" },
       bridgeHost: "opencode",
+      bridgeLabel: "Ask this session · Codex",
     });
     expect(started).toEqual({ url: `https://${DNS_NAME}:19500`, port: 19500 });
     const bridge = fake.started[0]!.bridge!;
     expect(bridge.host).toBe("opencode");
+    // The proxy shows the thread's provider, not upstream's host name.
+    expect(fake.proxies.get(19500)!.sessionBridgeLabel).toBe("Ask this session · Codex");
     expect(bridge.token.length).toBeGreaterThanOrEqual(32);
     expect(JSON.stringify(started)).not.toContain(bridge.token);
 
@@ -527,6 +530,7 @@ describe("Plannotator host entry", () => {
     const { harness, start } = await harnessFor(fake);
     await start();
     expect(fake.started[0]!.bridge).toBeUndefined();
+    expect(fake.proxies.get(19500)).not.toHaveProperty("sessionBridgeLabel");
 
     const fetchBridge = (sessionId: string) =>
       harness.experimental_call("bridgeFetch", { sessionId, path: "/api/ai/bridge/event", body: "{}" });

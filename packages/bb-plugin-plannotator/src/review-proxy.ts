@@ -7,8 +7,11 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream";
 import {
+  MAX_CAPABILITIES_BODY_BYTES,
   MAX_DECISION_BODY_BYTES,
   createRequestFilter,
+  isRelabelableCapabilities,
+  relabelCapabilitiesBody,
   rewriteDecisionBody,
 } from "./request-filter";
 
@@ -38,6 +41,8 @@ export type ReviewProxyOptions = {
    * review, which stops other sites from framing it to steal clicks.
    */
   frameAncestor?: string;
+  /** Replaces upstream's label for the session-bridge Ask AI provider. */
+  sessionBridgeLabel?: string;
 };
 
 /** `frame-ancestors` for a review that bb iframes; null without a bb origin. */
@@ -96,6 +101,47 @@ function forwardedRequestHeaders(req: IncomingMessage): Record<string, string | 
     headers[name] = value;
   }
   return headers;
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value.join(", ") : value;
+}
+
+/**
+ * Send a capabilities response with the session-bridge label replaced. A body
+ * that cannot be relabelled, or grows past the limit, goes out unchanged.
+ */
+function sendRelabelledCapabilities(
+  upstreamRes: IncomingMessage,
+  res: ServerResponse,
+  status: number,
+  headers: Record<string, string | string[]>,
+  label: string,
+): void {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  const collect = (chunk: Buffer) => {
+    size += chunk.length;
+    chunks.push(chunk);
+    if (size <= MAX_CAPABILITIES_BODY_BYTES) return;
+    upstreamRes.off("data", collect);
+    upstreamRes.off("end", finish);
+    upstreamRes.pause();
+    res.writeHead(status, headers);
+    for (const buffered of chunks) res.write(buffered);
+    pipeline(upstreamRes, res, () => undefined);
+  };
+  const finish = () => {
+    const raw = Buffer.concat(chunks);
+    const relabelled = relabelCapabilitiesBody(raw, label);
+    const body = relabelled ? Buffer.from(relabelled) : raw;
+    if (relabelled) headers["content-length"] = String(body.length);
+    res.writeHead(status, headers);
+    res.end(body);
+  };
+  upstreamRes.on("data", collect);
+  upstreamRes.on("end", finish);
+  upstreamRes.on("error", () => res.destroy());
 }
 
 function forwardedResponseHeaders(upstream: IncomingMessage): Record<string, string | string[]> {
@@ -191,7 +237,19 @@ export async function startReviewProxy(
           framePolicy,
         ];
       }
-      res.writeHead(upstreamRes.statusCode ?? 502, headers);
+      const status = upstreamRes.statusCode ?? 502;
+      if (
+        decision.sessionBridgeLabel &&
+        isRelabelableCapabilities(
+          status,
+          headerValue(upstreamRes.headers["content-type"]),
+          headerValue(upstreamRes.headers["content-encoding"]),
+        )
+      ) {
+        sendRelabelledCapabilities(upstreamRes, res, status, headers, decision.sessionBridgeLabel);
+        return;
+      }
+      res.writeHead(status, headers);
       // Event streams must reach the browser as they arrive.
       res.flushHeaders();
       pipeline(upstreamRes, res, () => undefined);

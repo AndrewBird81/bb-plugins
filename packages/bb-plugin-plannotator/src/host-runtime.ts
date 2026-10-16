@@ -421,6 +421,7 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       session: SessionOptions["session"];
       frameAncestor?: string;
       bridgeHost?: BridgeHost;
+      bridgeLabel?: string;
     },
     context: HostContext,
     claim: StartClaim,
@@ -492,6 +493,7 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
         cwd: input.cwd,
         allowedRoots: [input.cwd, deps.uploadDir],
         ...(input.frameAncestor ? { frameAncestor: input.frameAncestor } : {}),
+        ...(bridgeToken && input.bridgeLabel ? { sessionBridgeLabel: input.bridgeLabel } : {}),
       });
       const port = proxy.port;
       // Record before publishing, so a crash in between still gets cleaned up.

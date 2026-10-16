@@ -43,6 +43,8 @@ export async function startHostSession(options: {
   frameAncestor?: string;
   /** Ask AI answered by the thread's agent through the session bridge. */
   bridgeHost?: BridgeHost;
+  /** The "Ask this session" label shown for the bridge. */
+  bridgeLabel?: string;
   cwd: string;
   origin: UpstreamOrigin;
   signal: AbortSignal;
@@ -68,6 +70,7 @@ export async function startHostSession(options: {
       session: options.session,
       ...(options.frameAncestor ? { frameAncestor: options.frameAncestor } : {}),
       ...(options.bridgeHost ? { bridgeHost: options.bridgeHost } : {}),
+      ...(options.bridgeHost && options.bridgeLabel ? { bridgeLabel: options.bridgeLabel } : {}),
     },
     { hostId, signal: options.signal, timeoutMs: HOST_START_TIMEOUT_MS },
   );

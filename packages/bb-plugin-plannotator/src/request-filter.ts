@@ -49,11 +49,28 @@ const STRIPPED_DECISION_FIELDS = ["obsidian", "bear", "octarine"] as const;
 const DECISION_PATHS = new Set(["/api/approve", "/api/deny"]);
 export const MAX_DECISION_BODY_BYTES = 1024 * 1024;
 
+/**
+ * Where the UI reads the "Ask this session" provider's label. Upstream names
+ * only its own bridge hosts (Pi, OpenCode, Claude Code, T3 Code), so a codex
+ * thread's bridge would otherwise say OpenCode.
+ */
+const CAPABILITIES_PATH = "/api/ai/capabilities";
+const SESSION_BRIDGE_PROVIDER_NAME = "session-bridge";
+export const MAX_CAPABILITIES_BODY_BYTES = 1024 * 1024;
+
+/** The "Ask this session" label for a thread's bb provider. */
+export function sessionBridgeLabel(providerName: string | undefined): string {
+  const name = providerName?.trim();
+  return name ? `Ask this session · ${name}` : "Ask this session";
+}
+
 export type RequestFilterOptions = {
   /** Plannotator's working directory, which relative paths resolve against. */
   cwd: string;
   /** Directories `/api/image` and the file browser may read. */
   allowedRoots: readonly string[];
+  /** Replaces upstream's label for the session-bridge Ask AI provider. */
+  sessionBridgeLabel?: string;
 };
 
 export type FilterRequest = {
@@ -79,6 +96,8 @@ export type FilterDecision =
       loopbackHost: boolean;
       /** An approve/deny body: buffer it and pass it through `stripDecisionBody`. */
       decisionBody: boolean;
+      /** Relabel the response's session-bridge provider with `relabelCapabilitiesBody`. */
+      sessionBridgeLabel?: string;
     };
 
 export type RequestFilter = (request: FilterRequest) => Promise<FilterDecision>;
@@ -187,8 +206,58 @@ export async function createRequestFilter(options: RequestFilterOptions): Promis
       url,
       loopbackHost: method === "POST" && LOOPBACK_HOST_PATHS.has(url.pathname),
       decisionBody: writes && DECISION_PATHS.has(url.pathname),
+      ...(method === "GET" && url.pathname === CAPABILITIES_PATH && options.sessionBridgeLabel
+        ? { sessionBridgeLabel: options.sessionBridgeLabel }
+        : {}),
     };
   };
+}
+
+/**
+ * Whether a capabilities response may be buffered and relabelled: a 200,
+ * uncompressed JSON body. Anything else passes through untouched.
+ */
+export function isRelabelableCapabilities(
+  status: number,
+  contentType: string | undefined,
+  contentEncoding: string | undefined,
+): boolean {
+  const encoding = contentEncoding?.trim().toLowerCase() ?? "";
+  return (
+    status === 200 &&
+    (encoding === "" || encoding === "identity") &&
+    (contentType ?? "").toLowerCase().startsWith("application/json")
+  );
+}
+
+/**
+ * Set the label of the one session-bridge provider in a capabilities body.
+ * Null, so the original bytes pass through, when the body is not the compact
+ * JSON upstream sends or does not have exactly one such provider.
+ */
+export function relabelCapabilitiesBody(raw: Uint8Array, label: string): Uint8Array | null {
+  const text = Buffer.from(raw).toString("utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  // Re-serializing must reproduce the body, so only the label changes.
+  if (JSON.stringify(parsed) !== text) return null;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const providers = (parsed as Record<string, unknown>).providers;
+  if (!Array.isArray(providers)) return null;
+  const bridges = providers.filter(
+    (provider): provider is Record<string, unknown> =>
+      typeof provider === "object" &&
+      provider !== null &&
+      !Array.isArray(provider) &&
+      (provider as Record<string, unknown>).name === SESSION_BRIDGE_PROVIDER_NAME,
+  );
+  if (bridges.length !== 1 || typeof bridges[0]!.label !== "string" || bridges[0]!.label === label) return null;
+  bridges[0]!.label = label;
+  return Buffer.from(JSON.stringify(parsed));
 }
 
 /** Remove fields that would write files or open apps from an approve/deny body. */

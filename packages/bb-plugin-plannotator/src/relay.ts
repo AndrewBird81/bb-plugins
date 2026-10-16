@@ -1,7 +1,10 @@
 import type { BbPluginApi, PluginHttpHandler } from "@get-bb/plugin-sdk";
 import { PLANNOTATOR_RELAY_PATH } from "./constants";
 import {
+  MAX_CAPABILITIES_BODY_BYTES,
   MAX_DECISION_BODY_BYTES,
+  isRelabelableCapabilities,
+  relabelCapabilitiesBody,
   rewriteDecisionBody,
   type RequestFilter,
 } from "./request-filter";
@@ -353,6 +356,26 @@ export function createPlannotatorRelayHandler(
       const document = await upstreamResponse.text();
       const embedded = injectRelayBootstrap(document, relayPath, sessionId);
       return new Response(embedded, {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers,
+      });
+    }
+
+    if (
+      decision.sessionBridgeLabel &&
+      isRelabelableCapabilities(
+        upstreamResponse.status,
+        upstreamResponse.headers.get("content-type") ?? undefined,
+        upstreamResponse.headers.get("content-encoding") ?? undefined,
+      )
+    ) {
+      const raw = new Uint8Array(await upstreamResponse.arrayBuffer());
+      const relabelled =
+        raw.byteLength <= MAX_CAPABILITIES_BODY_BYTES
+          ? relabelCapabilitiesBody(raw, decision.sessionBridgeLabel)
+          : null;
+      return new Response(relabelled ? new Uint8Array(relabelled) : raw, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
         headers,

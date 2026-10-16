@@ -127,6 +127,8 @@ export const hostContract = defineRpcContract({
         frameAncestor: z.string().url().max(2048).optional(),
         /** Ask AI answered by the thread's agent through the session bridge. */
         bridgeHost: bridgeHostSchema.optional(),
+        /** The "Ask this session" label the review proxy shows for the bridge. */
+        bridgeLabel: z.string().min(1).max(200).optional(),
       })
       .strict(),
     output: z

@@ -168,9 +168,11 @@ In `thread` mode the plugin starts Plannotator with its "Ask this session" pull
 bridge (`PLANNOTATOR_SESSION_BRIDGE_*`). The bridge's token is generated where
 Plannotator runs and never reaches a browser; the plugin server reaches the
 bridge directly on the BB server, and through the host entry's `bridgeFetch`
-on other hosts. Upstream labels the provider "Ask this session" with Claude
-Code, Pi or OpenCode; it has no BB or Codex value, so Codex threads show
-OpenCode. An answer can take up to 10 minutes before the fork is stopped.
+on other hosts. Upstream's bridge knows only Claude Code, Pi, OpenCode and T3
+Code, and names that host in the provider's label, so a Codex thread runs the
+bridge as OpenCode. The review proxy and the relay replace that label in
+`GET /api/ai/capabilities` with the thread's provider as BB names it ("Ask this
+session · Codex"), or plain "Ask this session" when BB gives no name. An answer can take up to 10 minutes before the fork is stopped.
 
 Security: in `thread` mode, anyone who can reach an open review can make the
 thread's agent run, in a hidden fork with its tools, in the worktree.

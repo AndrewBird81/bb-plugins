@@ -34,7 +34,7 @@ import {
 import { isLocalBindHostname } from "./src/embedded";
 import { runBridgeClient, type BridgeTransport } from "./src/bridge-client";
 import { createForkAsker, summarizeExchanges, sweepForks, type ForkAsker, type ForkLedger } from "./src/fork-asker";
-import { createRequestFilter } from "./src/request-filter";
+import { createRequestFilter, sessionBridgeLabel } from "./src/request-filter";
 import {
   MAX_ANNOTATE_MARKDOWN,
   diffTypeSchema,
@@ -354,7 +354,12 @@ async function resolveReviewContext(
 }
 
 /** Who answers the session's Ask AI questions, and why. */
-export type AskAiPlacement = { answersFrom: "thread" | "local"; reason: string };
+export type AskAiPlacement = {
+  answersFrom: "thread" | "local";
+  reason: string;
+  /** The thread's provider as bb names it, for the "Ask this session" label. */
+  providerName?: string;
+};
 
 /**
  * `thread` mode needs a fork of the thread, so the thread's provider must be
@@ -376,22 +381,28 @@ export async function placeAskAi(
     reason: `${why}, so Ask AI uses the AI tools on the machine where Plannotator runs`,
   });
   if (!thread.providerId) return local("the thread's provider is unknown");
-  let canFork: boolean;
+  let provider: Awaited<ReturnType<typeof providers.list>>[number] | undefined;
   try {
     const list = await providers.list(
       thread.environmentId ? { environmentId: thread.environmentId, signal } : { signal },
     );
-    canFork = list.some((provider) => provider.id === thread.providerId && provider.capabilities.supportsFork);
+    provider = list.find((candidate) => candidate.id === thread.providerId);
   } catch (error) {
     return local(`could not check whether the thread's provider can fork (${error instanceof Error ? error.message : String(error)})`);
   }
-  if (!canFork) return local(`the thread's provider (${thread.providerId}) cannot fork`);
-  return { answersFrom: "thread", reason: "the thread's agent answers in a hidden fork" };
+  if (!provider?.capabilities.supportsFork) return local(`the thread's provider (${thread.providerId}) cannot fork`);
+  const providerName = typeof provider.displayName === "string" ? provider.displayName.trim() : "";
+  return {
+    answersFrom: "thread",
+    reason: "the thread's agent answers in a hidden fork",
+    ...(providerName ? { providerName } : {}),
+  };
 }
 
 /**
- * The bridge host value for a thread's provider. It drives upstream's Ask AI
- * label; there is no `bb` or `codex` value, and `opencode` advertises nothing.
+ * The bridge host value for a thread's provider. Upstream has no `bb` or
+ * `codex` value, and `opencode` advertises nothing. Its label names the host,
+ * so the proxies replace it with the provider's bb name (`sessionBridgeLabel`).
  */
 export function bridgeHostForProvider(providerId: string | null | undefined): BridgeHost {
   const normalized = providerId?.trim().toLowerCase() ?? "";
@@ -1199,6 +1210,7 @@ export default async function plugin(bb: BbPluginApi) {
       askAi = await placeAskAi(bb.sdk.providers, askAiSource, context, controller.signal);
       if (askAi.answersFrom === "local" && askAiSource === "thread") bb.log.info(`Plannotator Ask AI is local: ${askAi.reason}`);
       const bridgeHost = askAi.answersFrom === "thread" ? bridgeHostForProvider(providerId) : undefined;
+      const bridgeLabel = bridgeHost ? sessionBridgeLabel(askAi.providerName) : undefined;
       if (bridgeHost) sourceSeqEnd = await latestThreadSequence(bb, threadId);
       if (target.kind === "host") {
         hostId = target.hostId;
@@ -1212,7 +1224,7 @@ export default async function plugin(bb: BbPluginApi) {
           cwd: target.cwd,
           origin,
           ...(frameAncestor ? { frameAncestor } : {}),
-          ...(bridgeHost ? { bridgeHost } : {}),
+          ...(bridgeHost && bridgeLabel ? { bridgeHost, bridgeLabel } : {}),
           signal: controller.signal,
           onCleanupNeeded: () => queueHostCleanup(target.hostId, sessionId),
         });
@@ -1251,7 +1263,11 @@ export default async function plugin(bb: BbPluginApi) {
         const cwd = target.cwd ?? process.cwd();
         relaySession = {
           url: upstream.url,
-          filter: await createRequestFilter({ cwd, allowedRoots: [cwd, join(tmpdir(), "plannotator")] }),
+          filter: await createRequestFilter({
+            cwd,
+            allowedRoots: [cwd, join(tmpdir(), "plannotator")],
+            ...(token && bridgeLabel ? { sessionBridgeLabel: bridgeLabel } : {}),
+          }),
         };
         if (token) {
           const base = `http://127.0.0.1:${upstream.port}`;

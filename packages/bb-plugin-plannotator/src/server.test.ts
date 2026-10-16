@@ -136,7 +136,10 @@ function wireThreadOnHost(
     makeThreadResponse({ id: "thread-1", providerId: "claude-code", environmentId: "env-1" }),
   );
   host.harness.sdk.stub("environments.get", () => ({ id: "env-1", ...environment }) as never);
-  host.harness.sdk.stub("providers.list", () => [{ id: "claude-code", capabilities: { supportsFork: true } }] as never);
+  host.harness.sdk.stub(
+    "providers.list",
+    () => [{ id: "claude-code", displayName: "Claude Code", capabilities: { supportsFork: true } }] as never,
+  );
   host.harness.sdk.stub("system.config", () =>
     ({ primaryHostId: "host_server", dataDir: "/tmp/bb-plannotator-test-data", serverUrl: "http://127.0.0.1:38886" }) as never,
   );
@@ -1304,7 +1307,7 @@ describe("BB upstream Plannotator bridge", () => {
     ))) as { reviewId: string };
     expect(hostCalls(host)[0]).toMatchObject({
       method: "startReview",
-      input: { bridgeHost: "claude-code" },
+      input: { bridgeHost: "claude-code", bridgeLabel: "Ask this session · Claude Code" },
     });
 
     await vi.waitFor(() => expect(asking.events.map(({ type }) => type)).toEqual(["started", "delta", "done"]));
@@ -1386,10 +1389,15 @@ describe("BB upstream Plannotator bridge", () => {
   it("answers Ask AI from the thread only when its provider is known and can fork", async () => {
     const signal = new AbortController().signal;
     const providers = (list: () => unknown) => ({ list: async () => list() }) as never;
-    const forking = providers(() => [{ id: "codex", capabilities: { supportsFork: true } }]);
+    const forking = providers(() => [{ id: "codex", displayName: "Codex", capabilities: { supportsFork: true } }]);
     const thread = { providerId: "codex", environmentId: "env-1" };
 
-    await expect(placeAskAi(forking, "thread", thread, signal)).resolves.toMatchObject({ answersFrom: "thread" });
+    await expect(placeAskAi(forking, "thread", thread, signal)).resolves.toMatchObject({
+      answersFrom: "thread",
+      providerName: "Codex",
+    });
+    const unnamed = providers(() => [{ id: "codex", displayName: " ", capabilities: { supportsFork: true } }]);
+    await expect(placeAskAi(unnamed, "thread", thread, signal)).resolves.not.toHaveProperty("providerName");
     await expect(placeAskAi(forking, "local", thread, signal)).resolves.toMatchObject({ answersFrom: "local" });
     // threads.get failed, so the provider is unknown.
     await expect(placeAskAi(forking, "thread", { providerId: null }, signal)).resolves.toMatchObject({

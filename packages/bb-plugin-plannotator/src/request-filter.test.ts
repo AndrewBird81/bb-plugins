@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { createFakePluginHost, type FakePluginHost } from "@get-bb/plugin-sdk/testing";
-import { createRequestFilter } from "./request-filter";
+import {
+  createRequestFilter,
+  isRelabelableCapabilities,
+  relabelCapabilitiesBody,
+  sessionBridgeLabel,
+} from "./request-filter";
 import { PLANNOTATOR_RELAY_ROUTE, registerPlannotatorRelayRoutes } from "./relay";
 import { startReviewProxy } from "./review-proxy";
 
@@ -223,5 +228,201 @@ describe("request filter", () => {
     expect(seen[0]!.headers.authorization).toBeUndefined();
     expect(seen[0]!.headers.cookie).toBeUndefined();
     expect(seen[0]!.headers.origin).toBeUndefined();
+  });
+});
+
+// Upstream 0.28.20's `/api/ai/capabilities` with the session bridge on (host opencode).
+const CAPABILITIES = JSON.stringify({
+  available: true,
+  providers: [
+    {
+      id: "session-bridge",
+      name: "session-bridge",
+      capabilities: { fork: false, resume: false, streaming: true, tools: true },
+      models: [],
+      label: "Ask this session · OpenCode",
+      sessionBridge: { host: "opencode", status: "idle", interruptible: true },
+    },
+  ],
+  defaultProvider: "session-bridge",
+});
+const CODEX_LABEL = "Ask this session · Codex";
+
+describe("session-bridge label", () => {
+  const relabel = (body: string) => {
+    const result = relabelCapabilitiesBody(Buffer.from(body), CODEX_LABEL);
+    return result && Buffer.from(result).toString("utf8");
+  };
+
+  it("names the thread's bb provider, or none", () => {
+    expect(sessionBridgeLabel("Codex")).toBe(CODEX_LABEL);
+    expect(sessionBridgeLabel(" ")).toBe("Ask this session");
+    expect(sessionBridgeLabel(undefined)).toBe("Ask this session");
+  });
+
+  it("changes only the session-bridge provider's label", () => {
+    const expected = JSON.parse(CAPABILITIES) as { providers: Array<Record<string, unknown>> };
+    expected.providers[0]!.label = CODEX_LABEL;
+    expect(relabel(CAPABILITIES)).toBe(JSON.stringify(expected));
+  });
+
+  it("passes through bodies that are not JSON, not compact, or not the expected shape", () => {
+    const bridge = (extra: Record<string, unknown>) => ({ name: "session-bridge", label: "Ask this session · OpenCode", ...extra });
+    for (const body of [
+      "not json",
+      JSON.stringify(JSON.parse(CAPABILITIES), null, 2),
+      JSON.stringify([bridge({})]),
+      JSON.stringify({ providers: "session-bridge" }),
+      JSON.stringify({ providers: [{ name: "claude-agent-sdk", label: "Claude" }] }),
+      JSON.stringify({ providers: [bridge({ id: "a" }), bridge({ id: "b" })] }),
+      JSON.stringify({ providers: [bridge({ label: 7 })] }),
+      JSON.stringify({ providers: [bridge({ label: CODEX_LABEL })] }),
+    ]) {
+      expect(relabel(body), body).toBeNull();
+    }
+  });
+
+  it("buffers only uncompressed 200 JSON", () => {
+    expect(isRelabelableCapabilities(200, "application/json;charset=utf-8", undefined)).toBe(true);
+    expect(isRelabelableCapabilities(200, "application/json", "identity")).toBe(true);
+    expect(isRelabelableCapabilities(200, "application/json", "gzip")).toBe(false);
+    expect(isRelabelableCapabilities(200, "text/plain", undefined)).toBe(false);
+    expect(isRelabelableCapabilities(200, undefined, undefined)).toBe(false);
+    expect(isRelabelableCapabilities(503, "application/json", undefined)).toBe(false);
+  });
+
+  it("is asked for only on GET /api/ai/capabilities of a session with a label", async () => {
+    const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-filter-"));
+    cleanups.push(() => rm(worktree, { recursive: true, force: true }));
+    const labelled = await createRequestFilter({ cwd: worktree, allowedRoots: [worktree], sessionBridgeLabel: CODEX_LABEL });
+    const plain = await createRequestFilter({ cwd: worktree, allowedRoots: [worktree] });
+    const decide = (filter: typeof plain, method: string, path: string) =>
+      filter({
+        method,
+        url: new URL(path, "http://x"),
+        origin: undefined,
+        secFetchSite: "same-origin",
+        upgrade: false,
+        allowedOrigins: [],
+      });
+
+    expect(await decide(labelled, "GET", "/api/ai/capabilities?activate=x")).toMatchObject({
+      allowed: true,
+      sessionBridgeLabel: CODEX_LABEL,
+    });
+    expect(await decide(labelled, "HEAD", "/api/ai/capabilities")).not.toHaveProperty("sessionBridgeLabel");
+    expect(await decide(labelled, "GET", "/api/ai/sessions")).not.toHaveProperty("sessionBridgeLabel");
+    expect(await decide(plain, "GET", "/api/ai/capabilities")).not.toHaveProperty("sessionBridgeLabel");
+  });
+
+  it("is relabelled by the Mac proxy and the bb relay, and anything else passes through byte for byte", async () => {
+    // [content-type, content-encoding, body] upstream answers with.
+    let reply: [string, string | undefined, Buffer] = ["application/json", undefined, Buffer.from(CAPABILITIES)];
+    const server: Server = createServer((_req, res) => {
+      const [type, encoding, body] = reply;
+      res.writeHead(200, { "content-type": type, ...(encoding ? { "content-encoding": encoding } : {}) });
+      res.end(body);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise((resolve) => server.close(resolve)));
+    const port = (server.address() as { port: number }).port;
+    const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-filter-"));
+    cleanups.push(() => rm(worktree, { recursive: true, force: true }));
+    const options = { cwd: worktree, allowedRoots: [worktree], sessionBridgeLabel: CODEX_LABEL };
+
+    const proxy = await startReviewProxy(0, { ...options, publicHostname: DNS_NAME, upstreamPort: port });
+    cleanups.push(() => proxy.close());
+    const viaProxy = (path: string) =>
+      new Promise<{ headers: IncomingMessage["headers"]; body: Buffer }>((resolve, reject) => {
+        const req = request(
+          { host: "127.0.0.1", port: proxy.port, method: "GET", path, headers: { host: `${DNS_NAME}:${proxy.port}` } },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk: Buffer) => chunks.push(chunk));
+            res.on("end", () => resolve({ headers: res.headers, body: Buffer.concat(chunks) }));
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    registerPlannotatorRelayRoutes(
+      host.bb,
+      new Map([["s-1", { url: `http://127.0.0.1:${port}`, filter: await createRequestFilter(options) }]]),
+      () => BB_ORIGIN,
+    );
+    const viaRelay = async (path: string) => {
+      const response = await host.harness.behavior.fetchHttp(
+        "GET",
+        `${PLANNOTATOR_RELAY_ROUTE}?sessionId=s-1&path=${encodeURIComponent(path)}`,
+      );
+      return Buffer.from(await response.arrayBuffer());
+    };
+
+    const proxied = await viaProxy("/api/ai/capabilities");
+    const relabelled = relabel(CAPABILITIES)!;
+    expect(proxied.body.toString("utf8")).toBe(relabelled);
+    expect(proxied.headers["content-length"]).toBe(String(Buffer.byteLength(relabelled)));
+    expect((await viaRelay("/api/ai/capabilities")).toString("utf8")).toBe(relabelled);
+    // Only the capabilities endpoint.
+    expect((await viaProxy("/api/ai/sessions")).body.toString("utf8")).toBe(CAPABILITIES);
+    expect((await viaRelay("/api/ai/sessions")).toString("utf8")).toBe(CAPABILITIES);
+
+    const untouched: Array<[string, string | undefined, Buffer]> = [
+      // Compressed: the proxy forwards the encoded bytes as they came.
+      ["application/json", "gzip", Buffer.from(CAPABILITIES)],
+      ["text/plain", undefined, Buffer.from(CAPABILITIES)],
+      ["application/json", undefined, Buffer.from("not json")],
+      ["application/json", undefined, Buffer.from(JSON.stringify({ providers: [] }))],
+    ];
+    for (const [type, encoding, body] of untouched) {
+      reply = [type, encoding, body];
+      expect((await viaProxy("/api/ai/capabilities")).body.equals(body), `${type} ${encoding}`).toBe(true);
+      if (!encoding) expect((await viaRelay("/api/ai/capabilities")).equals(body), type).toBe(true);
+    }
+  });
+
+  it("streams a capabilities body past the limit through unchanged", async () => {
+    const big = Buffer.from(
+      JSON.stringify({ providers: [{ name: "session-bridge", label: "Ask this session · OpenCode", pad: "x".repeat(1024 * 1024) }] }),
+    );
+    const server: Server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(big);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise((resolve) => server.close(resolve)));
+    const port = (server.address() as { port: number }).port;
+    const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-filter-"));
+    cleanups.push(() => rm(worktree, { recursive: true, force: true }));
+    const proxy = await startReviewProxy(0, {
+      cwd: worktree,
+      allowedRoots: [worktree],
+      sessionBridgeLabel: CODEX_LABEL,
+      publicHostname: DNS_NAME,
+      upstreamPort: port,
+    });
+    cleanups.push(() => proxy.close());
+    const body = await new Promise<Buffer>((resolve, reject) => {
+      const req = request(
+        {
+          host: "127.0.0.1",
+          port: proxy.port,
+          method: "GET",
+          path: "/api/ai/capabilities",
+          headers: { host: `${DNS_NAME}:${proxy.port}` },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => resolve(Buffer.concat(chunks)));
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    expect(body.equals(big)).toBe(true);
   });
 });

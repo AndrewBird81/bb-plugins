@@ -283,6 +283,8 @@ server.listen(0, "127.0.0.1", () => {
     const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-session-test-"));
     temporaryDirectories.push(directory);
     vi.stubEnv("FAKE_TERMINAL", "off");
+    // Long enough for the agent-terminal check to read /api/plan before the fake exits.
+    vi.stubEnv("PLANNOTATOR_FAKE_DELAY_MS", "500");
     const running = await startUpstreamSession({
       binaryPath: await fakeSessionBinary(directory),
       session: { mode: "annotate-last", markdown: "The reply" },

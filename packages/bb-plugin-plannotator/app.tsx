@@ -23,6 +23,7 @@ import {
 import {
   PLANNOTATOR_RELAY_PATH,
   embeddedSessionUrl,
+  iframeLoadUrl,
   sharedCookieDomain,
   upstreamOnboardingCookies,
 } from "./src/embedded";
@@ -207,6 +208,10 @@ function PlannotatorFocusBridge({
   return null;
 }
 
+type LoadState = "loading" | "slow" | "loaded" | "unreachable";
+/** After this, a page still loading stops being covered by the spinner. */
+export const LOAD_SLOW_MS = 15_000;
+
 function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
   const payload = useActiveReview(threadId);
   const rpc = useRpc<typeof rpcContract>();
@@ -220,21 +225,33 @@ function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
     const failed = parseReviewFailed(value);
     if (failed && failed.threadId === threadId) starter.notify(failed.message);
   });
+  const navigate = useBbNavigate();
   const [reloadKey, setReloadKey] = useState(0);
-  const [loaded, setLoaded] = useState(false);
-  const [loadError, setLoadError] = useState(false);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
   const [embeddedUrl, setEmbeddedUrl] = useState<string | null>(null);
   const [canceling, setCanceling] = useState(false);
-  const loadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // The tab shows the open session's title.
   useEffect(() => {
-    setLoaded(false);
-    setLoadError(false);
-    if (loadTimer.current) clearTimeout(loadTimer.current);
+    if (payload) navigate.openThreadPanel({ actionId: PANEL_ACTION_ID, title: payload.title });
+  }, [navigate, payload?.sessionId, payload?.title]);
+
+  // A slow link only delays the page: the review is 20+ MB. After a while,
+  // stop covering whatever has rendered, and check the session is reachable
+  // at all before calling it a failure.
+  useEffect(() => {
+    setLoadState("loading");
     if (!embeddedUrl) return;
-    loadTimer.current = setTimeout(() => setLoadError(true), 15_000);
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setLoadState((state) => (state === "loading" ? "slow" : state));
+      void fetch(embeddedUrl, { method: "HEAD", mode: "no-cors", cache: "no-store" }).catch(() => {
+        if (!cancelled) setLoadState((state) => (state === "loaded" ? state : "unreachable"));
+      });
+    }, LOAD_SLOW_MS);
     return () => {
-      if (loadTimer.current) clearTimeout(loadTimer.current);
+      cancelled = true;
+      clearTimeout(timer);
     };
   }, [embeddedUrl, reloadKey]);
 
@@ -287,10 +304,7 @@ function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
           <button
             type="button"
             className="rounded border border-border px-2 py-1 text-muted-foreground hover:bg-state-hover hover:text-foreground"
-            onClick={() => {
-              setLoaded(false);
-              setReloadKey((value) => value + 1);
-            }}
+            onClick={() => setReloadKey((value) => value + 1)}
           >
             Reload
           </button>
@@ -327,34 +341,31 @@ function PlannotatorPanel({ threadId }: PluginThreadPanelProps) {
         </div>
       ) : null}
       <div className="relative min-h-0 flex-1">
-        {!loaded && !loadError ? (
+        {loadState === "loading" ? (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-background text-xs text-muted-foreground">
             Loading Plannotator…
           </div>
         ) : null}
-        {loadError ? (
+        {loadState === "slow" ? (
+          <div className="absolute inset-x-0 top-0 z-10 border-b border-border bg-background px-3 py-1 text-xs text-muted-foreground">
+            Plannotator is still loading (the page is large). If nothing appears, try Reload or Open externally.
+          </div>
+        ) : null}
+        {loadState === "unreachable" ? (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-background p-6 text-center text-xs text-muted-foreground">
-            <div>Plannotator did not load through the current connection.</div>
+            <div>This browser cannot reach the Plannotator session.</div>
             <div>Try Reload or Open externally.</div>
           </div>
         ) : null}
         <iframe
           key={reloadKey}
           title="Plannotator review"
-          src={embeddedUrl}
+          src={iframeLoadUrl(embeddedUrl, payload.sessionId, reloadKey)}
           className="h-full w-full border-0"
           referrerPolicy="no-referrer"
           allow="clipboard-read; clipboard-write"
-          onLoad={() => {
-            if (loadTimer.current) clearTimeout(loadTimer.current);
-            setLoadError(false);
-            setLoaded(true);
-          }}
-          onError={() => {
-            if (loadTimer.current) clearTimeout(loadTimer.current);
-            setLoaded(false);
-            setLoadError(true);
-          }}
+          onLoad={() => setLoadState("loaded")}
+          onError={() => setLoadState("unreachable")}
         />
       </div>
     </div>
@@ -390,6 +401,11 @@ export default definePluginApp((app) => {
     title: "Annotate in Plannotator",
     icon: "ClipboardCheck",
     run(context) {
+      // bb shows message actions on every message; Plannotator annotates replies.
+      if (context.message.role !== "assistant") {
+        toast.error("Plannotator annotates the agent's replies. Use it on an assistant message.");
+        return;
+      }
       const markdown = context.selectedText?.trim() ? context.selectedText : context.message.text;
       openWith(context, { kind: "launch", request: { mode: "annotate-last", markdown } });
     },

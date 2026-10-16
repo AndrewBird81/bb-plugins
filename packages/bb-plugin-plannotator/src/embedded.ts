@@ -21,6 +21,11 @@ export const UPSTREAM_DISMISSED_COOKIES: ReadonlyArray<readonly [string, string]
   ["plannotator-announce-tui-herdr-seen", "1"],
   ["plannotator-announce-ask-session-seen", "1"],
   ["plannotator-announce-agent-tool-seen", "1"],
+  // Code review: "Introducing Guided Reviews", "Edit code to suggest" and
+  // "Hover cards".
+  ["plannotator-guide-intro-seen", "2"],
+  ["plannotator-edit-mode-announcement-seen", "3"],
+  ["plannotator-token-hover-announcement-seen", "1"],
 ];
 /** Upstream hides its update toast when this names the latest release. */
 export const UPSTREAM_UPDATE_DISMISSED_COOKIE = "update-dismissed-version";
@@ -147,6 +152,21 @@ export function sharedCookieDomain(pageHostname: string, sessionUrl: string): st
  * release is known, its update toast. Each is written host-only and, when
  * given, on `domain` so a session on another tailnet host reads it too.
  */
+/**
+ * The iframe URL for one load of a session. Each session and each Reload
+ * gets its own URL, so a browser never waits on an earlier, stalled request
+ * for the same 20+ MB page (its HTTP cache serializes identical URLs).
+ */
+export function iframeLoadUrl(embeddedUrl: string, sessionId: string, attempt: number): string {
+  try {
+    const url = new URL(embeddedUrl, "http://bb.invalid");
+    url.searchParams.set("bbLoad", `${sessionId.slice(0, 8)}-${attempt}`);
+    return embeddedUrl.startsWith("/") ? `${url.pathname}${url.search}` : url.toString();
+  } catch {
+    return embeddedUrl;
+  }
+}
+
 export function upstreamOnboardingCookies(
   options: { domain?: string | null; dismissUpdateVersion?: string } = {},
 ): string[] {

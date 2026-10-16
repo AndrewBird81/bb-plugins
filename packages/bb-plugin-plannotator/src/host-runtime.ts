@@ -3,6 +3,7 @@
 // (src/review-proxy.ts) listens on a port in HOST_PORT_RANGE, and
 // `tailscale serve` publishes that port over HTTPS so every tailnet device can
 // load the 20+ MB UI directly from the host.
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
@@ -17,6 +18,7 @@ import {
   HOST_PORT_RANGE,
   hostContract,
   hostSignals,
+  type BridgeHost,
   type HostReviewState,
 } from "./host-contract";
 import {
@@ -44,6 +46,8 @@ export type HostRuntimeDeps = {
   startProxy(port: number, options: ReviewProxyOptions): Promise<RunningReviewProxy>;
   /** Plannotator's image upload directory, which `/api/image` may read. */
   uploadDir: string;
+  /** Loopback requests to Plannotator's session bridge. */
+  fetch: typeof fetch;
   /** Resolve a command name on PATH only. */
   findExecutable(name: string): string | null;
   isExecutable(path: string): boolean;
@@ -75,6 +79,8 @@ type HostReview = {
   /** The published port, which the proxy listens on. */
   port: number;
   tailscalePath: string;
+  /** The session bridge's bearer token; set when Ask AI uses the thread's agent. */
+  bridgeToken?: string;
   state: HostReviewState;
   lease: ExperimentalHostWorkerLease;
   lastPolledAt: number;
@@ -414,6 +420,7 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       origin: SessionOptions["origin"];
       session: SessionOptions["session"];
       frameAncestor?: string;
+      bridgeHost?: BridgeHost;
     },
     context: HostContext,
     claim: StartClaim,
@@ -446,12 +453,16 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     let review: RunningUpstreamReview | undefined;
     let proxy: RunningReviewProxy | undefined;
     let published = false;
+    // Generated here so it never leaves this machine; the server reaches the
+    // bridge only through bridgeFetch.
+    const bridgeToken = input.bridgeHost ? randomBytes(32).toString("base64url") : undefined;
     try {
       // A random loopback port: only the proxy below is published.
       review = await deps.startSession({
         binaryPath,
         session,
         sessionId: input.sessionId,
+        ...(bridgeToken && input.bridgeHost ? { bridge: { token: bridgeToken, host: input.bridgeHost } } : {}),
         timeoutSeconds: null,
         signal: controller.signal,
         origin: input.origin,
@@ -519,6 +530,7 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       proxy,
       port: proxy.port,
       tailscalePath,
+      ...(bridgeToken ? { bridgeToken } : {}),
       state: { status: "pending" },
       lease: context.experimental_retainWorker(),
       lastPolledAt: deps.now(),
@@ -569,6 +581,23 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
         if (!entry) return { stopped: false };
         await stopEntry(entry);
         return { stopped: true };
+      },
+
+      async bridgeFetch({ sessionId, path, body, waitMs }, context) {
+        await ensureStartup(context.experimental_paths.dataDir).catch(() => undefined);
+        const entry = reviews.get(sessionId);
+        if (!entry?.bridgeToken || entry.state.status !== "pending") {
+          return { status: 404, body: JSON.stringify({ error: "No open session bridge." }) };
+        }
+        entry.lastPolledAt = deps.now();
+        // No Origin header: upstream refuses bridge requests from a browser.
+        const response = await deps.fetch(`http://127.0.0.1:${entry.review.port}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${entry.bridgeToken}` },
+          body,
+          signal: AbortSignal.any([context.signal, AbortSignal.timeout((waitMs ?? 0) + 10_000)]),
+        });
+        return { status: response.status, body: await response.text() };
       },
 
       async reconcile(_input, context) {

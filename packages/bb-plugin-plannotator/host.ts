@@ -37,6 +37,7 @@ export default createPlannotatorHostEntry({
   },
   startSession: startUpstreamSession,
   startProxy: startReviewProxy,
+  fetch: (input, init) => fetch(input, init),
   // Upstream's upload directory: the child inherits this process's TMPDIR.
   uploadDir: join(tmpdir(), "plannotator"),
   // PATH only: unlike the server's resolver, no ~/.local/bin fallback, so a

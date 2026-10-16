@@ -3,7 +3,7 @@
 // Host signals are lossy, so the decision is also polled.
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type { RunningUpstreamReview, SessionDecision, UpstreamOrigin } from "./bridge";
-import type { HostReviewState, SessionRequest, hostContract, hostSignals } from "./host-contract";
+import type { BridgeHost, HostReviewState, SessionRequest, hostContract, hostSignals } from "./host-contract";
 import { SessionOutputError } from "./session";
 
 export type PlannotatorHostClient = Pick<
@@ -41,6 +41,8 @@ export async function startHostSession(options: {
   sessionId: string;
   session: SessionRequest;
   frameAncestor?: string;
+  /** Ask AI answered by the thread's agent through the session bridge. */
+  bridgeHost?: BridgeHost;
   cwd: string;
   origin: UpstreamOrigin;
   signal: AbortSignal;
@@ -65,6 +67,7 @@ export async function startHostSession(options: {
       origin: options.origin,
       session: options.session,
       ...(options.frameAncestor ? { frameAncestor: options.frameAncestor } : {}),
+      ...(options.bridgeHost ? { bridgeHost: options.bridgeHost } : {}),
     },
     { hostId, signal: options.signal, timeoutMs: HOST_START_TIMEOUT_MS },
   );

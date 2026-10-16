@@ -26,6 +26,8 @@ function fakeHost(options: {
   processes?: Record<number, string>;
   /** Loopback ports another program already listens on. */
   busyPorts?: number[];
+  /** What Plannotator's session bridge answers. */
+  bridgeReply?: string;
   /** Runs when `serve --bg` is called, for example to abort the start. */
   onServe?: () => void;
 } = {}) {
@@ -44,6 +46,7 @@ function fakeHost(options: {
     fail(error: Error): void;
   }> = [];
   const proxies = new Map<number, ReviewProxyOptions & { closed: boolean }>();
+  const bridgeRequests: Array<{ url: string; init: RequestInit }> = [];
   let now = 1_000;
 
   const serveStatus = () =>
@@ -135,6 +138,10 @@ function fakeHost(options: {
       };
     },
     uploadDir: "/fake/tmp/plannotator",
+    async fetch(input, init) {
+      bridgeRequests.push({ url: String(input), init: init ?? {} });
+      return new Response(options.bridgeReply ?? '{"commands":[],"features":[]}', { status: 200 });
+    },
     findExecutable(name) {
       if (name === "tailscale") return options.tailscale === undefined ? TAILSCALE : options.tailscale;
       if (name === "plannotator") {
@@ -159,6 +166,7 @@ function fakeHost(options: {
     started,
     reviews,
     proxies,
+    bridgeRequests,
     advance(ms: number) {
       now += ms;
     },
@@ -473,6 +481,59 @@ describe("Plannotator host entry", () => {
     await expect(annotate(join(cwd, "..", "x.md"))).rejects.toThrow();
     expect(fake.started).toHaveLength(0);
     expect(fake.serve.size).toBe(0);
+    await harness.experimental_dispose();
+  });
+
+  it("runs the session bridge with a token generated on the host, reachable only through bridgeFetch", async () => {
+    const fake = fakeHost({ bridgeReply: '{"commands":[{"type":"ask","askId":"a:1","text":"q"}]}' });
+    const { harness, cwd } = await harnessFor(fake);
+
+    const started = await harness.experimental_call("startReview", {
+      sessionId: SESSION_ID,
+      cwd,
+      origin: "codex",
+      session: { mode: "plan", planMarkdown: "# Plan" },
+      bridgeHost: "opencode",
+    });
+    expect(started).toEqual({ url: `https://${DNS_NAME}:19500`, port: 19500 });
+    const bridge = fake.started[0]!.bridge!;
+    expect(bridge.host).toBe("opencode");
+    expect(bridge.token.length).toBeGreaterThanOrEqual(32);
+    expect(JSON.stringify(started)).not.toContain(bridge.token);
+
+    await expect(
+      harness.experimental_call("bridgeFetch", {
+        sessionId: SESSION_ID,
+        path: "/api/ai/bridge/poll",
+        body: '{"waitMs":25000}',
+        waitMs: 25_000,
+      }),
+    ).resolves.toEqual({ status: 200, body: '{"commands":[{"type":"ask","askId":"a:1","text":"q"}]}' });
+
+    // Straight to Plannotator on loopback (not the proxy), with the token and no Origin.
+    expect(fake.bridgeRequests).toHaveLength(1);
+    const [{ url, init }] = fake.bridgeRequests;
+    expect(url).toBe("http://127.0.0.1:50000/api/ai/bridge/poll");
+    expect(init.method).toBe("POST");
+    expect(init.headers).toEqual({ "content-type": "application/json", authorization: `Bearer ${bridge.token}` });
+    expect(init.body).toBe('{"waitMs":25000}');
+    await harness.experimental_dispose();
+  });
+
+  it("has no bridge for a session that uses local Ask AI providers, or one that has ended", async () => {
+    const fake = fakeHost();
+    const { harness, start } = await harnessFor(fake);
+    await start();
+    expect(fake.started[0]!.bridge).toBeUndefined();
+
+    const fetchBridge = (sessionId: string) =>
+      harness.experimental_call("bridgeFetch", { sessionId, path: "/api/ai/bridge/event", body: "{}" });
+    await expect(fetchBridge(SESSION_ID)).resolves.toMatchObject({ status: 404 });
+    await expect(fetchBridge(SECOND_SESSION_ID)).resolves.toMatchObject({ status: 404 });
+    expect(fake.bridgeRequests).toHaveLength(0);
+    await expect(
+      harness.experimental_call("bridgeFetch", { sessionId: SESSION_ID, path: "/api/host/close" as never, body: "{}" }),
+    ).rejects.toThrow();
     await harness.experimental_dispose();
   });
 

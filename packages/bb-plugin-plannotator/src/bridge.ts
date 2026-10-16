@@ -25,6 +25,7 @@ import {
   assertAgentTerminalOff,
   buildSessionLaunch,
   readSessionResult,
+  type SessionBridgeConfig,
 } from "./session";
 
 export { buildUpstreamInput } from "./session";
@@ -133,6 +134,10 @@ export type SessionOptions = {
   session: SessionRequest;
   /** Names the result file of review and annotate sessions. */
   sessionId?: string;
+  /** Ask AI answered by the thread's agent through the session bridge. */
+  bridge?: SessionBridgeConfig;
+  /** No uploads to the paste service. Defaults to `remote`. */
+  disableSharing?: boolean;
   timeoutSeconds: number | null;
   signal: AbortSignal;
   /** Do not let the child infer an agent from unrelated host environment. */
@@ -556,7 +561,8 @@ export async function startUpstreamSession(
   const launch = buildSessionLaunch(options.session, {
     dataDir: options.dataDir,
     sessionId: options.sessionId ?? randomUUID(),
-    remote: options.remote === true,
+    disableSharing: options.disableSharing ?? options.remote === true,
+    ...(options.bridge ? { bridge: options.bridge } : {}),
   });
   const resultDir = launch.resultFile ? dirname(launch.resultFile) : null;
   const cleanUp = async (tempDir: string) => {

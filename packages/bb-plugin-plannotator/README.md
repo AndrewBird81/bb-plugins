@@ -52,23 +52,20 @@ the BB server in remote mode run with sharing disabled.
 
 ## Remote BB and Tailscale access
 
-When BB is configured with a non-loopback `BB_APP_URL` (for example, its
-Tailscale hostname), or with `BB_SERVER_BIND_HOST=0.0.0.0`, the plugin starts
-Plannotator in its supported remote mode. The upstream listener binds beyond
-loopback and selects a port from `19432-19441`. The embedded panel uses a
-session-scoped same-origin relay for local child listeners over both HTTP and
-HTTPS, so a one-port Tailscale Serve endpoint is enough and the browser never
-has to reach the upstream port directly. The relay accepts writes only from
-the bb page's own origin, and never forwards a browser's `Authorization`
-header or cookies. Local-only BB sessions use the same
-relay while the review is open; **Open externally** can still use the direct
-upstream port when the network allows it.
-
-If you choose **Open externally** over plain HTTP, allow the `19432-19441` port
-range between the Tailscale client and the BB machine. With the recommended
-Tailscale Serve setup, no additional Plannotator port mapping is required on
-the BB server machine; the plugin changes Tailscale configuration only on
-other hosts, as described below.
+On the BB server machine, Plannotator always binds loopback. When BB is
+configured with a non-loopback `BB_APP_URL` (for example, its Tailscale
+hostname), or with `BB_SERVER_BIND_HOST=0.0.0.0`, it picks a port from
+`19432-19441`. Browsers reach it only through BB's session-scoped same-origin
+relay, so a one-port Tailscale Serve endpoint for BB is enough. The relay
+applies the same request filter as the proxy on other hosts (below): writes
+only from the bb page's origin, the same endpoint denylist and worktree path
+checks, no WebSocket upgrades, and it never forwards a browser's
+`Authorization` header or cookies. Sessions on the BB server also run with
+Plannotator's sharing (paste service uploads) disabled. Known limitation: an
+annotated HTML file's relative assets (images, stylesheets) do not load
+through the relay, because its `<base>` points at BB's own origin and BB's
+plugin routes are exact-match. The plugin changes
+Tailscale configuration only on other hosts, as described below.
 
 ## Threads on other machines
 
@@ -108,8 +105,58 @@ runtime installer, file reads outside the worktree, custom save paths).
 Plannotator's own random loopback port is not published, but, as with stock
 local Plannotator, a web page in a browser on that host could still reach it
 and use endpoints the proxy denies, such as open-in-app (which opens a repo
-file with its default handler) and agent jobs. Browsers that block public
-pages from reaching localhost, such as Brave by default, stop this.
+file with its default handler) and agent jobs, and, in `thread` mode, Ask AI,
+which runs the thread's agent in a hidden fork with its tools (see
+[Ask AI](#ask-ai)). Browsers that block public pages from reaching localhost,
+such as Brave by default, stop this.
+
+## Ask AI
+
+Plannotator's **Ask AI** panel can be answered by the thread's own agent. The
+setting **Ask AI answers from** chooses:
+
+- `thread` (default): each Ask AI chat is answered in a hidden fork of the
+  thread, which has the whole conversation and works in the same worktree. A
+  follow-up in the same chat goes to the same fork. The user's thread is never
+  interrupted or waited on. When the session ends, its forks are stopped and
+  archived, and the result message the agent receives lists the questions and
+  answers (a few KB at most) as a quoted block labelled as reviewer Q&A data,
+  not instructions. This needs a thread provider that can fork; for one that
+  can't, or when the plugin cannot look the provider up, the session uses
+  `local` instead, and the tool result says so (`askAiAnswersFrom`,
+  `askAiReason`).
+- `local`: the AI tools installed on the thread's machine (Claude, Codex, Pi,
+  OpenCode), which start without the conversation. This is Plannotator's own
+  behaviour.
+
+In `thread` mode the plugin starts Plannotator with its "Ask this session" pull
+bridge (`PLANNOTATOR_SESSION_BRIDGE_*`). The bridge's token is generated where
+Plannotator runs and never reaches a browser; the plugin server reaches the
+bridge directly on the BB server, and through the host entry's `bridgeFetch`
+on other hosts. Upstream labels the provider "Ask this session" with Claude
+Code, Pi or OpenCode; it has no BB or Codex value, so Codex threads show
+OpenCode. An answer can take up to 10 minutes before the fork is stopped.
+
+Security: in `thread` mode, anyone who can reach an open review can make the
+thread's agent run, in a hidden fork with its tools, in the worktree.
+Plannotator's Ask AI header asks the agent not to edit files, but that is
+guidance, not a sandbox. Upstream disables this bridge for sessions reachable
+over a network ("anyone who can reach the session URL could type into the agent
+session"). BB differs because BB itself has no authentication on a tailnet:
+anyone who can reach a review can already reach BB and message the thread
+directly, so the bridge adds no new trust boundary. Choose `local` if that does
+not hold for your setup.
+
+The reviewed document is a second way in. Plannotator puts the text a user
+selects into the Ask AI question verbatim, so a document with instructions in
+it (for example "run this command before answering") reaches the fork's agent
+when a user selects that text and asks about it. The fork keeps the thread's
+permission mode, because a hidden fork cannot show approval prompts, so it can
+act on them as the thread could. A hostile document cannot ask on its own: the
+user has to select the text and ask. The answers then reach the thread in the
+result message, quoted and labelled as data rather than instructions, which
+lowers but does not remove the chance the thread's agent follows them. Don't
+use Ask AI on text from documents you don't trust.
 
 ## Boundary
 

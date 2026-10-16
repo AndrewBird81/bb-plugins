@@ -7,6 +7,8 @@ Review a plan in Plannotator without keeping an agent tool call open while you d
 - **Annotate a document:** annotate a Markdown or HTML file from the worktree with `plannotator_annotate_file` or the panel's file picker.
 - **Annotate a reply:** annotate the agent's last reply, or any message from its action bar, with `plannotator_annotate_reply`.
 
+- **Ask AI from the thread:** Plannotator's Ask AI panel is answered by the thread's own agent, in a hidden fork that knows the conversation, when the thread's provider can fork. The setting **Ask AI answers from** switches back to the AI tools installed on the machine.
+
 The Plannotator panel and three palette commands start code reviews and annotations yourself. Feedback you send arrives in the thread as a new message; closing without feedback sends nothing.
 
 ## How it works

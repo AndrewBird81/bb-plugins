@@ -118,18 +118,24 @@ function AnnotateFilePicker({
     if (!environmentId) return;
     let cancelled = false;
     const timer = setTimeout(() => {
-      void sdk.environments
-        .paths({
-          environmentId,
-          includeFiles: "true",
-          includeDirectories: "false",
-          query: query.trim() || "md",
-          limit: "50",
-        })
-        .then((result) => {
+      // bb's path search is fuzzy: with no query, list Markdown and HTML.
+      const queries = query.trim() ? [query.trim()] : ["md", "html"];
+      void Promise.all(
+        queries.map((search) =>
+          sdk.environments.paths({
+            environmentId,
+            includeFiles: "true",
+            includeDirectories: "false",
+            query: search,
+            limit: "50",
+          }),
+        ),
+      )
+        .then((results) => {
           if (cancelled) return;
           setError(null);
-          setPaths(result.paths.map(({ path }) => path).filter((path) => ANNOTATABLE.test(path)));
+          const found = results.flatMap((result) => result.paths.map(({ path }) => path));
+          setPaths([...new Set(found)].filter((path) => ANNOTATABLE.test(path)));
         })
         .catch(() => {
           if (!cancelled) setError("Could not search the workspace.");

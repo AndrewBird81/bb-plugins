@@ -23,6 +23,8 @@ function fakeHost(options: {
   tailscale?: string | null;
   plannotator?: string | null;
   serveFails?: boolean;
+  /** `serve --bg` applies the mapping but is killed by its timeout. */
+  serveTimesOut?: boolean;
   processes?: Record<number, string>;
   /** Loopback ports another program already listens on. */
   busyPorts?: number[];
@@ -78,6 +80,7 @@ function fakeHost(options: {
         options.onServe?.();
         if (options.serveFails) return { exitCode: 1, stdout: "", stderr: "serve config denied" };
         serve.set(Number(on[1]), { proxy: on[2]! });
+        if (options.serveTimesOut) return { exitCode: null, stdout: "", stderr: "" };
         return ok();
       }
       const off = /^serve --https=(\d+) off$/u.exec(command);
@@ -581,6 +584,16 @@ describe("Plannotator host entry", () => {
     expect(fake.reviews[0]!.stopped).toBe(true);
     expect(fake.proxies.get(19500)!.closed).toBe(true);
     expect(harness.experimental_getRetainedWorkerLeaseCount()).toBe(0);
+    expect(await owned()).toEqual({ processes: [], mappings: [] });
+    await harness.experimental_dispose();
+  });
+
+  it("removes the mapping a timed-out tailscale serve applied anyway", async () => {
+    const fake = fakeHost({ serveTimesOut: true });
+    const { harness, start, owned } = await harnessFor(fake);
+
+    await expect(start()).rejects.toThrow("tailscale serve failed for port 19500");
+    expect(fake.serve.has(19500)).toBe(false);
     expect(await owned()).toEqual({ processes: [], mappings: [] });
     await harness.experimental_dispose();
   });

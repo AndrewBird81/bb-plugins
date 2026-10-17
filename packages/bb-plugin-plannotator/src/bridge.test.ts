@@ -222,6 +222,10 @@ const path = require("node:path");
 const terminal = process.env.FAKE_TERMINAL === "missing" ? undefined : { enabled: process.env.FAKE_TERMINAL === "on" };
 let stdin = "";
 process.stdin.on("data", (chunk) => { stdin += chunk; });
+if (process.env.FAKE_EXIT_BEFORE_READY) {
+  process.stderr.write("Not in a VCS repo and no nested Git/JJ/GitButler repositories were found.\\n");
+  process.exit(1);
+}
 const server = http.createServer((req, res) => {
   res.setHeader("content-type", "application/json");
   res.end(JSON.stringify({ plan: "", ...(terminal ? { agentTerminal: terminal } : {}) }));
@@ -347,7 +351,19 @@ server.listen(0, "127.0.0.1", () => {
     const running = await start();
     const outcome = running.result.catch((error: Error) => error.message);
     await running.stop();
-    expect(await outcome).toMatch(/Plannotator exited with code/u);
+    expect(await outcome).toBe("Plannotator exited on signal SIGTERM");
+
+    // A process killed outside bb says so.
+    const killed = await start();
+    const killedOutcome = killed.result.catch((error: Error) => error.message);
+    process.kill(killed.pid!, "SIGKILL");
+    expect(await killedOutcome).toBe("Plannotator exited on signal SIGKILL");
+    vi.stubEnv("PLANNOTATOR_FAKE_DELAY_MS", "");
+
+    vi.stubEnv("FAKE_EXIT_BEFORE_READY", "1");
+    await expect(start()).rejects.toThrow(
+      "Plannotator exited before its review UI was ready: Not in a VCS repo and no nested Git/JJ/GitButler repositories were found.",
+    );
   });
 
   it("reads the latest upstream release for the update-toast dismissal", async () => {
@@ -360,6 +376,33 @@ server.listen(0, "127.0.0.1", () => {
         throw new Error("offline");
       }),
     ).toBeNull();
+  });
+
+  it("keeps a decision line longer than 256 KiB", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-large-test-"));
+    temporaryDirectories.push(directory);
+    const binary = join(directory, "plannotator");
+    await writeFile(
+      binary,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(process.env.PLANNOTATOR_READY_FILE, JSON.stringify({ url: "http://127.0.0.1:43212", isRemote: false, port: 43212 }) + "\\n");
+process.stdout.write(JSON.stringify({ approved: false, feedback: "start " + "x".repeat(400 * 1024) + " end" }) + "\\n", () => process.exit(0));
+`,
+      "utf8",
+    );
+    await chmod(binary, 0o755);
+
+    const running = await startUpstreamPlanReview({
+      binaryPath: binary,
+      planMarkdown: "# Plan",
+      timeoutSeconds: null,
+      signal: new AbortController().signal,
+    });
+    const decision = await running.result;
+    expect(decision).toMatchObject({ approved: false });
+    expect((decision as { feedback: string }).feedback).toMatch(/^start x+ end$/u);
+    expect((decision as { feedback: string }).feedback).toHaveLength(400 * 1024 + 10);
   });
 
   it("returns a terminal decision when the upstream review times out", async () => {

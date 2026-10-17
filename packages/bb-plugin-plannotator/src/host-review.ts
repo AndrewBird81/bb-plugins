@@ -25,8 +25,8 @@ export const HOST_DISCONNECT_GRACE_MS = 2 * 60_000;
 export type HostSession = RunningUpstreamReview & {
   hostId: string;
   sessionId: string;
-  /** Poll now, for example after a host signal. */
-  refresh(): void;
+  /** Poll now, for example after a host signal. Resolves when this poll ends. */
+  refresh(): Promise<void>;
   /** The host worker crashed, so the review cannot finish. */
   workerExited(): void;
 };
@@ -151,7 +151,7 @@ export async function startHostSession(options: {
     hostId,
     sessionId,
     result,
-    refresh: () => void poll(),
+    refresh: () => poll(),
     workerExited: () => fail("The Plannotator worker on the thread's machine exited."),
     stop() {
       stopping ??= (async () => {

@@ -28,6 +28,9 @@ const DENIED_PATHS: ReadonlyArray<{ path: string; prefix: boolean }> = [
   { path: "/api/call-flow/install", prefix: false },
   // The VS Code extension's injection API; the browser UI uses it only inside VS Code.
   { path: "/api/editor-annotation", prefix: true },
+  // Runs the install script; bb manages the binary. Upstream allows it for a
+  // loopback Host, which the relay always sends.
+  { path: "/api/update", prefix: false },
 ];
 
 /**
@@ -47,6 +50,11 @@ const OPEN_IN_APPS_UNAVAILABLE = JSON.stringify({ available: false, apps: [] });
 /** Decision-body fields that write files or open apps on the host. */
 const STRIPPED_DECISION_FIELDS = ["obsidian", "bear", "octarine"] as const;
 const DECISION_PATHS = new Set(["/api/approve", "/api/deny"]);
+/**
+ * Plannotator's plan server answers ok to every decision after the first and
+ * drops it, so a second device would be told its decision was sent.
+ */
+const ALREADY_DECIDED = JSON.stringify({ error: "This review already has a decision." });
 export const MAX_DECISION_BODY_BYTES = 1024 * 1024;
 
 /**
@@ -57,6 +65,20 @@ export const MAX_DECISION_BODY_BYTES = 1024 * 1024;
 const CAPABILITIES_PATH = "/api/ai/capabilities";
 const SESSION_BRIDGE_PROVIDER_NAME = "session-bridge";
 export const MAX_CAPABILITIES_BODY_BYTES = 1024 * 1024;
+
+/**
+ * Upstream serves worktree images, SVG included, with no CSP. An SVG (or any
+ * XML document) opened in its own tab would run its script on the review's
+ * origin, where it could approve the review or prompt the thread's agent. An
+ * empty sandbox stops that; `<img>` rendering ignores the policy.
+ */
+export const SCRIPTABLE_IMAGE_POLICY = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+
+/** Whether a non-HTML response can run script when opened as a document. */
+export function isScriptableImage(contentType: string | undefined): boolean {
+  const type = contentType?.split(";")[0]?.trim().toLowerCase() ?? "";
+  return type === "text/xml" || type === "application/xml" || type.endsWith("+xml");
+}
 
 /** The "Ask this session" label for a thread's bb provider. */
 export function sessionBridgeLabel(providerName: string | undefined): string {
@@ -87,7 +109,7 @@ export type FilterRequest = {
 export type FilterDecision =
   | { allowed: false; status: 403; message: string }
   /** Answered here with this JSON body; nothing reaches upstream. */
-  | { allowed: false; status: 200; json: string }
+  | { allowed: false; status: 200 | 409; json: string }
   | {
       allowed: true;
       /** The URL to forward, with `/api/image` resolved to one absolute path. */
@@ -96,6 +118,11 @@ export type FilterDecision =
       loopbackHost: boolean;
       /** An approve/deny body: buffer it and pass it through `stripDecisionBody`. */
       decisionBody: boolean;
+      /**
+       * The session's one decision is claimed for this request. Call this
+       * when the request did not succeed, so another decision may be sent.
+       */
+      releaseDecision?: () => void;
       /** Relabel the response's session-bridge provider with `relabelCapabilitiesBody`. */
       sessionBridgeLabel?: string;
     };
@@ -153,6 +180,7 @@ function isSameOrigin(request: FilterRequest): boolean {
 /** Build the filter for one session. */
 export async function createRequestFilter(options: RequestFilterOptions): Promise<RequestFilter> {
   const isAllowedPath = await createPathGuard(options.allowedRoots);
+  let decisionClaimed = false;
 
   return async (request) => {
     if (request.upgrade) return refuse("Plannotator sessions in BB have no WebSocket endpoints.");
@@ -201,11 +229,17 @@ export async function createRequestFilter(options: RequestFilterOptions): Promis
       }
     }
     const writes = method !== "GET" && method !== "HEAD";
+    const claimsDecision = method === "POST" && DECISION_PATHS.has(url.pathname);
+    if (claimsDecision) {
+      if (decisionClaimed) return { allowed: false, status: 409, json: ALREADY_DECIDED };
+      decisionClaimed = true;
+    }
     return {
       allowed: true,
       url,
       loopbackHost: method === "POST" && LOOPBACK_HOST_PATHS.has(url.pathname),
       decisionBody: writes && DECISION_PATHS.has(url.pathname),
+      ...(claimsDecision ? { releaseDecision: () => (decisionClaimed = false) } : {}),
       ...(method === "GET" && url.pathname === CAPABILITIES_PATH && options.sessionBridgeLabel
         ? { sessionBridgeLabel: options.sessionBridgeLabel }
         : {}),

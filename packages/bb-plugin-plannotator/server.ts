@@ -4,6 +4,7 @@
 // embeds the upstream session, and delivers decisions in a later thread message.
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import {
@@ -42,6 +43,7 @@ import {
   hostContract,
   hostSignals,
   type BridgeHost,
+  type HostReviewState,
   type SessionRequest,
   type SessionResult,
 } from "./src/host-contract";
@@ -202,8 +204,39 @@ const storedReviewSchema = z.object({
 });
 type StoredReview = z.infer<typeof storedReviewSchema>;
 const REVIEW_KEY_PREFIX = "review:";
+/** bb refuses a kv value over 256 KiB. */
+const MAX_STORED_REVIEW_BYTES = 240 * 1024;
+const SHORTENED_NOTE = "\n\n[Shortened by the Plannotator plugin to fit bb's storage limit.]";
+
+/**
+ * The record as bb can store it. Plan feedback can quote a whole plan, far
+ * over bb's kv limit; the thread message carries it whole, and the stored
+ * copy (for plannotator_review_status and delivery retries) is shortened.
+ */
+export function storableReview(record: StoredReview): StoredReview {
+  const size = (value: StoredReview) => Buffer.byteLength(JSON.stringify(value));
+  if (!record.result || size(record) <= MAX_STORED_REVIEW_BYTES) return record;
+  let shortened: StoredReview = record;
+  for (const field of ["feedback", "message"] as const) {
+    const text = shortened.result?.[field];
+    if (!text) continue;
+    const over = size(shortened) - MAX_STORED_REVIEW_BYTES;
+    if (over <= 0) break;
+    let keep = Math.max(0, text.length - over - SHORTENED_NOTE.length);
+    const withText = (length: number): StoredReview => ({
+      ...shortened,
+      result: { ...shortened.result!, [field]: `${text.slice(0, length)}${SHORTENED_NOTE}` },
+    });
+    // Characters JSON escapes or encodes in several bytes need a shorter cut.
+    while (keep > 0 && size(withText(keep)) > MAX_STORED_REVIEW_BYTES) keep = Math.floor(keep * 0.9);
+    shortened = withText(keep);
+  }
+  return shortened;
+}
 const DELIVERED_REVIEW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const DELIVERY_RETRY_MS = 30_000;
+/** A result its thread keeps refusing is closed after this long; plannotator_review_status still has it. */
+const DELIVERY_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 const LATEST_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 /** How long the thread's machine has to say whether it can publish a review. */
 const PROBE_TIMEOUT_MS = 15_000;
@@ -786,7 +819,7 @@ export default async function plugin(bb: BbPluginApi) {
       .filter((review): review is HostSession => isHostReview(review) && review.hostId === hostId);
   hostClient.experimental_onSignal("reviewChanged", ({ hostId, payload }) => {
     for (const review of activeHostReviews(hostId)) {
-      if (review.sessionId === payload.sessionId) review.refresh();
+      if (review.sessionId === payload.sessionId) void review.refresh();
     }
   });
   hostClient.experimental_onWorkerExit(({ hostId }) => {
@@ -858,15 +891,23 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   const activeReviews = new Map<string, ActiveReview>();
-  const startingReviews = new Set<string>();
+  /** Threads whose session is starting, with the abort for that start. */
+  const startingReviews = new Map<string, AbortController>();
   /** Close the session's panel tab, or show the launcher's title in the thread's tab. */
   const closePanel = (threadId: string, sessionId: string) =>
     closeReviewPanel(bb, threadId, sessionId, () => !activeReviews.has(threadId) && !startingReviews.has(threadId));
   const relaySessions = new Map<string, RelaySession>();
+  /**
+   * Sessions this plugin instance opened and has not finished settling. Their
+   * records stay `pending` until the decision is saved; recovery must not
+   * mistake them for sessions a restart left behind.
+   */
+  const liveSessions = new Set<string>();
   const delivering = new Set<string>();
   let disposing = false;
 
   const reviewKey = (id: string) => `${REVIEW_KEY_PREFIX}${id}`;
+  const saveReview = (record: StoredReview) => bb.storage.kv.set(reviewKey(record.id), storableReview(record));
   async function loadReview(id: string): Promise<StoredReview | null> {
     const parsed = storedReviewSchema.safeParse(await bb.storage.kv.get(reviewKey(id)));
     return parsed.success ? parsed.data : null;
@@ -883,24 +924,56 @@ export default async function plugin(bb: BbPluginApi) {
         mode: "queue-if-active",
         input: [{ type: "text", text: reviewMessage(record.result, record.kind, record.initiator), mentions: [] }],
       });
-      await bb.storage.kv.set(reviewKey(record.id), {
-        ...record,
-        status: "delivered",
-        updatedAt: Date.now(),
-      } satisfies StoredReview);
+      await saveReview({ ...record, status: "delivered", updatedAt: Date.now() });
     } catch (error) {
       // An archived or deleted thread takes no message: stop retrying.
       const thread = await bb.sdk.threads.get({ threadId: record.threadId }).catch(() => null);
       if (thread && (thread.archivedAt !== null || thread.deletedAt !== null)) {
-        await bb.storage.kv
-          .set(reviewKey(record.id), { ...record, status: "closed", updatedAt: Date.now() } satisfies StoredReview)
-          .catch(() => undefined);
+        await saveReview({ ...record, status: "closed", updatedAt: Date.now() }).catch(() => undefined);
+      } else if (Date.now() - record.updatedAt > DELIVERY_GIVE_UP_MS) {
+        bb.log.warn(`Gave up delivering Plannotator review ${record.id} after a day: ${String(error)}`);
+        await saveReview({ ...record, status: "closed", updatedAt: Date.now() }).catch(() => undefined);
       } else {
         bb.log.warn(`Could not deliver Plannotator review ${record.id}: ${String(error)}`);
       }
     } finally {
       delivering.delete(record.id);
     }
+  }
+
+  /** Hosts of orphaned reviews that have not answered recovery, by review id: since when. */
+  const unansweredSince = new Map<string, number>();
+
+  /**
+   * The result of a review no running session owns, left by a restart. A
+   * host review may have outlived the restart and hold the user's decision.
+   * Null while its host has been unreachable for less than the disconnect grace.
+   */
+  async function orphanedReviewResult(record: StoredReview): Promise<ReviewResult | null> {
+    const restarted: ReviewResult = {
+      reviewId: record.id,
+      source: "plannotator",
+      kind: record.kind,
+      decision: "cancelled",
+      error: "The review ended when the Plannotator plugin restarted.",
+    };
+    if (!record.hostId) return restarted;
+    let state: HostReviewState;
+    try {
+      state = await hostClient.call("getReview", { sessionId: record.id }, { hostId: record.hostId, timeoutMs: 15_000 });
+    } catch {
+      const since = unansweredSince.get(record.id) ?? Date.now();
+      unansweredSince.set(record.id, since);
+      if (Date.now() - since < HOST_DISCONNECT_GRACE_MS) return null;
+      unansweredSince.delete(record.id);
+      return restarted;
+    }
+    unansweredSince.delete(record.id);
+    // A review still open on the host cannot be reattached to its panel.
+    if (state.status !== "decided") return restarted;
+    return isSessionResult(state.decision)
+      ? sessionReviewResult(record.id, record.kind, state.decision)
+      : reviewResult(record.id, state.decision);
   }
 
   async function recoverReviews(): Promise<void> {
@@ -918,24 +991,21 @@ export default async function plugin(bb: BbPluginApi) {
         }
         continue;
       }
+      if (liveSessions.has(record.id)) continue;
       if (record.status === "pending") {
-        if (activeReviews.get(record.threadId)?.sessionId === record.id) continue;
+        const result = await orphanedReviewResult(record);
+        // The review's host has not answered yet: ask again on the next pass.
+        if (!result) continue;
         if (record.hostId) queueHostCleanup(record.hostId, record.id);
         await closePanel(record.threadId, record.id);
         record = {
           ...record,
-          // The user closed nothing and asked nothing: no message for them.
-          status: record.initiator === "user" ? "closed" : "ready",
-          result: {
-            reviewId: record.id,
-            source: "plannotator",
-            kind: record.kind,
-            decision: "cancelled",
-            error: "The review ended when the Plannotator plugin restarted.",
-          },
+          // A user-started session that ended without feedback sends no message.
+          status: shouldDeliver(record.initiator, result) ? "ready" : "closed",
+          result,
           updatedAt: Date.now(),
         };
-        await bb.storage.kv.set(key, record);
+        await saveReview(record);
       }
       await deliverReview(record);
     }
@@ -966,9 +1036,20 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   async function settleReview(threadId: string, active: ActiveReview): Promise<void> {
+    try {
+      await settleLiveReview(threadId, active);
+    } finally {
+      liveSessions.delete(active.sessionId);
+    }
+  }
+
+  async function settleLiveReview(threadId: string, active: ActiveReview): Promise<void> {
     let result: ReviewResult;
+    /** Plannotator produced the result; otherwise the session failed or was stopped. */
+    let decided = false;
     try {
       const decision = await active.review.result;
+      decided = true;
       result = isSessionResult(decision)
         ? sessionReviewResult(active.sessionId, active.kind, decision)
         : reviewResult(active.sessionId, decision);
@@ -1019,28 +1100,36 @@ export default async function plugin(bb: BbPluginApi) {
       threadId,
       sessionId: active.sessionId,
     });
+    // Save the result before cleanup, so a dispose or crash while the session
+    // stops cannot turn the decision into "plugin restarted". During a
+    // dispose, only a decision counts: other endings are the dispose stopping
+    // the session, which the next instance reports.
+    const record: StoredReview | null =
+      active.discarded || (disposing && !decided)
+        ? null
+        : {
+            id: active.sessionId,
+            threadId,
+            kind: active.kind,
+            initiator: active.initiator,
+            status: shouldDeliver(active.initiator, result) ? "ready" : "closed",
+            result,
+            updatedAt: Date.now(),
+          };
+    if (record) {
+      try {
+        await saveReview(record);
+      } catch (error) {
+        bb.log.warn(`Could not save Plannotator decision ${record.id}: ${String(error)}`);
+      }
+    }
     await closePanel(threadId, active.sessionId);
     try {
       await active.review.stop();
     } catch (error) {
       bb.log.warn(`Could not stop Plannotator review ${active.sessionId}: ${String(error)}`);
     }
-    if (disposing || active.discarded) return;
-    const record: StoredReview = {
-      id: active.sessionId,
-      threadId,
-      kind: active.kind,
-      initiator: active.initiator,
-      status: shouldDeliver(active.initiator, result) ? "ready" : "closed",
-      result,
-      updatedAt: Date.now(),
-    };
-    try {
-      await bb.storage.kv.set(reviewKey(record.id), record);
-    } catch (error) {
-      bb.log.warn(`Could not save Plannotator decision ${record.id}: ${String(error)}`);
-    }
-    await deliverReview(record);
+    if (record && !active.discarded) await deliverReview(record);
   }
 
   registerPlannotatorRelayRoutes(bb, relaySessions, () =>
@@ -1174,11 +1263,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (activeReviews.has(threadId) || startingReviews.has(threadId)) {
       return { status: "already_active", reviewId: activeReviews.get(threadId)?.sessionId };
     }
-    startingReviews.add(threadId);
+    const controller = new AbortController();
+    startingReviews.set(threadId, controller);
 
     const kind = SESSION_KINDS[input.mode];
     const sessionId = randomUUID();
-    const controller = new AbortController();
     const abortStartup = () => controller.abort();
     options.signal?.addEventListener("abort", abortStartup, { once: true });
     const dismissUpdateVersion = latestUpstreamVersion();
@@ -1191,6 +1280,7 @@ export default async function plugin(bb: BbPluginApi) {
     let sourceSeqEnd: number | undefined;
     let placement: ReviewPlacement | undefined;
     let askAi: AskAiPlacement | undefined;
+    let emptyCwd: string | undefined;
     try {
       const context = await resolveReviewContext(bb, threadId, controller.signal);
       const { origin, providerId } = context;
@@ -1245,6 +1335,10 @@ export default async function plugin(bb: BbPluginApi) {
         const token = bridgeHost ? randomBytes(32).toString("base64url") : undefined;
         // Loopback only, as on a Mac: upstream turns the bridge off in remote
         // mode, and the relay is the only way in. Remote BB keeps its port range.
+        // Without the thread's worktree, an empty directory: the BB server's
+        // own working directory (/ on the pod) would be readable through the session.
+        if (!target.cwd) emptyCwd = await mkdtemp(join(tmpdir(), "bb-plannotator-no-worktree-"));
+        const cwd = target.cwd ?? emptyCwd!;
         upstream = await startUpstreamSession({
           binaryPath,
           session,
@@ -1258,9 +1352,8 @@ export default async function plugin(bb: BbPluginApi) {
           disableSharing: runtimeConfig.remote,
           ...(token && bridgeHost ? { bridge: { token, host: bridgeHost } } : {}),
           embedHost: resolveEmbedHost(bb),
-          cwd: target.cwd,
+          cwd,
         });
-        const cwd = target.cwd ?? process.cwd();
         relaySession = {
           url: upstream.url,
           filter: await createRequestFilter({
@@ -1289,11 +1382,19 @@ export default async function plugin(bb: BbPluginApi) {
       // An aborted or timed-out call may still have started and published
       // the review on the host.
       if (hostId) queueHostCleanup(hostId, sessionId);
+      if (emptyCwd) void rm(emptyCwd, { recursive: true, force: true }).catch(() => undefined);
       return { status: "error", error: error instanceof Error ? error.message : String(error) };
     }
     // The process can exit while the panel and stored review are opening.
     // Attach a rejection handler before any further awaits.
     void upstream.result.catch(() => undefined);
+    if (emptyCwd) {
+      const directory = emptyCwd;
+      void upstream.result
+        .catch(() => undefined)
+        .then(() => rm(directory, { recursive: true, force: true }))
+        .catch(() => undefined);
+    }
 
     const title =
       options.title?.trim() ||
@@ -1319,6 +1420,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(annotatedReply ? { annotatedReply } : {}),
     };
     activeReviews.set(threadId, active);
+    liveSessions.add(sessionId);
     startingReviews.delete(threadId);
     if (transport) startAskAi(active, threadId, transport, sourceSeqEnd, hostId !== undefined);
 
@@ -1347,6 +1449,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       options.signal?.removeEventListener("abort", abortStartup);
       activeReviews.delete(threadId);
+      liveSessions.delete(sessionId);
       relaySessions.delete(sessionId);
       void stopAskAi(active);
       await Promise.allSettled([
@@ -1474,6 +1577,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Stop a thread's pending review without delivering a decision. */
   async function discardActiveReview(threadId: string): Promise<ActiveReview | null> {
+    // A session still starting stops when its start notices the abort.
+    startingReviews.get(threadId)?.abort();
     const active = activeReviews.get(threadId);
     if (!active) return null;
     // Remove the lookup before asynchronous cleanup starts. A discarded
@@ -1536,6 +1641,8 @@ export default async function plugin(bb: BbPluginApi) {
     await Promise.allSettled(
       [...activeReviews.entries()].map(async ([threadId, active]) => {
         const { sessionId, review, controller, settled } = active;
+        // A host decision whose signal was lost: read it before stopping the review.
+        if (isHostReview(review)) await review.refresh();
         controller.abort();
         await Promise.allSettled([
           closeReviewPanel(bb, threadId, sessionId),

@@ -20,7 +20,7 @@ afterEach(async () => {
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
-async function setup(extra: { frameAncestor?: string; upstreamCsp?: string } = {}) {
+async function setup(extra: { frameAncestor?: string; upstreamCsp?: string; upstreamContentType?: string } = {}) {
   const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-proxy-worktree-"));
   const uploads = await mkdtemp(join(tmpdir(), "bb-plannotator-proxy-uploads-"));
   cleanups.push(() => rm(worktree, { recursive: true, force: true }));
@@ -42,7 +42,7 @@ async function setup(extra: { frameAncestor?: string; upstreamCsp?: string } = {
         return;
       }
       res.writeHead(200, {
-        "content-type": "application/json",
+        "content-type": extra.upstreamContentType ?? "application/json",
         "access-control-allow-origin": "*",
         "access-control-allow-credentials": "true",
         ...(extra.upstreamCsp ? { "content-security-policy": extra.upstreamCsp } : {}),
@@ -238,6 +238,28 @@ describe("review proxy", () => {
     );
   });
 
+  it("sandboxes an SVG so its script cannot run on the review's origin", async () => {
+    const { send, worktree } = await setup({
+      frameAncestor: "https://bb-server.tail1b968e.ts.net",
+      upstreamContentType: "image/svg+xml",
+    });
+    await writeFile(join(worktree, "x.svg"), "<svg><script>alert(1)</script></svg>");
+
+    const response = await send("GET", `/api/image?path=${encodeURIComponent("x.svg")}`);
+
+    expect(response.headers["content-security-policy"]).toBe(
+      "frame-ancestors 'self' https://bb-server.tail1b968e.ts.net, sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+    );
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("leaves other responses without the image sandbox", async () => {
+    const { send } = await setup({ upstreamContentType: "image/png" });
+    const response = await send("GET", "/api/plan");
+    expect(response.headers["content-security-policy"]).toBeUndefined();
+    expect(response.headers["x-content-type-options"]).toBeUndefined();
+  });
+
   it("adds no frame policy without a bb origin", async () => {
     const { send } = await setup();
     expect((await send("GET", "/api/plan")).headers["content-security-policy"]).toBeUndefined();
@@ -258,6 +280,7 @@ describe("review proxy", () => {
 
   it("strips file-writing and app-opening fields from decision bodies", async () => {
     const { send, seen, origin } = await setup();
+    expect((await send("POST", "/api/deny", { headers: { origin }, body: "[1]" })).status).toBe(400);
 
     const response = await send("POST", "/api/approve", {
       headers: { origin, "content-type": "text/plain" },
@@ -273,7 +296,6 @@ describe("review proxy", () => {
     expect(response.status).toBe(200);
     expect(JSON.parse(seen[0]!.body)).toEqual({ feedback: "ok", planSave: { enabled: true } });
     expect(seen[0]!.headers["content-type"]).toBe("application/json");
-    expect((await send("POST", "/api/deny", { headers: { origin }, body: "[1]" })).status).toBe(400);
     expect(stripDecisionBody({ planSave: "x" })).toEqual({ planSave: "x" });
   });
 

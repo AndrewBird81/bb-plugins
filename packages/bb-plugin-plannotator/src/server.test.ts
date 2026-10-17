@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -680,6 +680,37 @@ describe("BB upstream Plannotator bridge", () => {
     expect(hostCalls(host)).toHaveLength(0);
   });
 
+  it("runs a review without a worktree in an empty directory, never the server's own", async () => {
+    const binary = await fakePlannotatorBinary({ approveAfterMs: null });
+    const scratch = await mkdtemp(join(tmpdir(), "bb-plannotator-scratch-"));
+    temporaryDirectories.push(scratch);
+    const cwdFile = join(scratch, "cwd.txt");
+    vi.stubEnv("FAKE_PLANNOTATOR_CWD_FILE", cwdFile);
+    const host = createFakePluginHost({ pluginId: "plannotator", settings: { binaryPath: binary } });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_server", path: "/does/not/exist/on/the/server" });
+
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as { reviewId: string };
+
+    const cwd = await readFile(cwdFile, "utf8");
+    expect(cwd).not.toBe(await realpath(process.cwd()));
+    expect(await readdir(cwd)).toEqual([]);
+    // The relay lets the browser read nothing outside it.
+    const doc = await host.harness.behavior.fetchHttp(
+      "GET",
+      `/review?sessionId=${reviewId}&path=${encodeURIComponent(`/api/image?path=${join(process.cwd(), "x.png")}`)}`,
+    );
+    expect(doc.status).toBe(403);
+
+    await host.harness.callRpc("cancelReview", { threadId: "thread-1", sessionId: reviewId });
+    await vi.waitFor(async () => expect(await stat(cwd).catch(() => null)).toBeNull());
+  });
+
   it("runs a remote BB's own sessions on loopback with the session bridge and sharing off", async () => {
     vi.stubEnv("BB_APP_URL", "https://bb-server.example.ts.net");
     const binary = await fakePlannotatorBinary({ approveAfterMs: null });
@@ -1046,6 +1077,38 @@ describe("BB upstream Plannotator bridge", () => {
     );
     service.controller.abort();
     await service.done;
+  });
+
+  it("gives up a result whose thread has refused it for a day", async () => {
+    const { host } = await hostPlugin();
+    host.harness.sdk.stub("threads.send", () => {
+      throw new Error("HTTP 500: provider unavailable");
+    });
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thread-1" }));
+    const record = (id: string, updatedAt: number) => ({
+      id,
+      threadId: "thread-1",
+      kind: "plan",
+      initiator: "agent",
+      status: "ready",
+      result: { reviewId: id, source: "plannotator", decision: "approved" },
+      updatedAt,
+    });
+    const stale = "bb883ad4-4ff7-4183-96eb-6250ae380c3a";
+    const fresh = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
+    await host.bb.storage.kv.set(`review:${stale}`, record(stale, Date.now() - 25 * 60 * 60 * 1000));
+    await host.bb.storage.kv.set(`review:${fresh}`, record(fresh, Date.now()));
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await vi.waitFor(async () =>
+      expect(await host.bb.storage.kv.get(`review:${stale}`)).toMatchObject({
+        status: "closed",
+        result: { decision: "approved" },
+      }),
+    );
+    service.controller.abort();
+    await service.done;
+    expect(await host.bb.storage.kv.get(`review:${fresh}`)).toMatchObject({ status: "ready" });
   });
 
   it("forgets closed records after the delivered-record retention", async () => {
@@ -1658,6 +1721,247 @@ describe("BB upstream Plannotator bridge", () => {
     expect((await review("thread-c")).dismissUpdateVersion).toBe("0.29.0");
     expect(releases).toBe(2);
     vi.restoreAllMocks();
+  });
+
+  /** A host whose stopReview waits until the test releases it. */
+  function hostWithBlockedStop() {
+    const remote = fakeRemoteHost();
+    let releaseStop!: () => void;
+    const stopReleased = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    let stopCalled = false;
+    const call = async (request: { method: string }) => {
+      if (request.method === "stopReview") {
+        stopCalled = true;
+        await stopReleased;
+      }
+      return remote.call(request);
+    };
+    return { remote, call, releaseStop, stopCalled: () => stopCalled };
+  }
+
+  it("delivers only the user's decision when the delivery loop runs while the review is stopping", async () => {
+    const blocked = hostWithBlockedStop();
+    const host = createFakePluginHost({ pluginId: "plannotator", experimental_callHostRpc: blocked.call });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as { reviewId: string };
+
+    blocked.remote.state = { status: "decided", decision: { approved: true } };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+    await vi.waitFor(() => expect(blocked.stopCalled()).toBe(true));
+    const service = host.harness.behavior.runService("review-delivery");
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    blocked.releaseStop();
+    await sentReview(host);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    service.controller.abort();
+    await service.done;
+
+    const sent = host.harness.sdk.callsTo("threads.send");
+    expect(sent).toHaveLength(1);
+    expect(messageText(sent[0]!)).toContain('"decision":"approved"');
+    expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({
+      status: "delivered",
+      result: { decision: "approved" },
+    });
+  });
+
+  it("keeps a decision made just before the plugin is disposed", async () => {
+    const blocked = hostWithBlockedStop();
+    const host = createFakePluginHost({ pluginId: "plannotator", experimental_callHostRpc: blocked.call });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as { reviewId: string };
+
+    blocked.remote.state = { status: "decided", decision: { approved: false, feedback: "Split step 2" } };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+    await vi.waitFor(() => expect(blocked.stopCalled()).toBe(true));
+    const reloaded = host.harness.lifecycle.reload(plugin);
+    blocked.releaseStop();
+    const next = await reloaded;
+    hosts.push(next);
+
+    // The next plugin instance delivers it.
+    expect(await next.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({
+      status: "ready",
+      result: { decision: "changes_requested", feedback: "Split step 2" },
+    });
+  });
+
+  it("reads a host decision the server had not polled yet before the plugin is disposed", async () => {
+    const { host, remote } = await hostPlugin();
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as { reviewId: string };
+
+    // Decided on the host; the signal was lost.
+    remote.state = { status: "decided", decision: { approved: true } };
+    const next = await host.harness.lifecycle.reload(plugin);
+    hosts.push(next);
+
+    expect(await next.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({
+      status: "ready",
+      result: { decision: "approved" },
+    });
+  });
+
+  it("leaves a review the dispose itself stopped for the next instance to report", async () => {
+    const { host } = await hostPlugin();
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as { reviewId: string };
+
+    const next = await host.harness.lifecycle.reload(plugin);
+    hosts.push(next);
+
+    expect(await next.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({ status: "pending" });
+  });
+
+  it("delivers a decision the host kept while the server restarted", async () => {
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({ pluginId: "plannotator", experimental_callHostRpc: remote.call });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireInteractionSdk(host);
+    const reviewId = "bb883ad4-4ff7-4183-96eb-6250ae380c3a";
+    await host.bb.storage.kv.set(`review:${reviewId}`, {
+      id: reviewId,
+      threadId: "thread-1",
+      kind: "plan",
+      initiator: "agent",
+      hostId: "host_mac",
+      status: "pending",
+      updatedAt: Date.now(),
+    });
+    remote.state = { status: "decided", decision: { approved: true } };
+
+    const service = host.harness.behavior.runService("review-delivery");
+    const sent = await sentReview(host);
+    service.controller.abort();
+    await service.done;
+
+    expect(messageText(sent)).toContain('"decision":"approved"');
+    expect(messageText(sent)).not.toContain("restarted");
+    expect(hostCalls(host)).toContainEqual(
+      expect.objectContaining({ method: "stopReview", hostId: "host_mac", input: { sessionId: reviewId } }),
+    );
+  });
+
+  it("waits for an unreachable host before cancelling its orphaned review", async () => {
+    let reachable = false;
+    const remote = fakeRemoteHost();
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: async (request) => {
+        if (!reachable) throw new Error("host not connected");
+        return remote.call(request);
+      },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireInteractionSdk(host);
+    const reviewId = "bb883ad4-4ff7-4183-96eb-6250ae380c3a";
+    const key = `review:${reviewId}`;
+    await host.bb.storage.kv.set(key, {
+      id: reviewId,
+      threadId: "thread-1",
+      hostId: "host_mac",
+      status: "pending",
+      updatedAt: Date.now(),
+    });
+
+    const first = host.harness.behavior.runService("review-delivery");
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    first.controller.abort();
+    await first.done;
+    expect(await host.bb.storage.kv.get(key)).toMatchObject({ status: "pending" });
+    expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+
+    reachable = true;
+    remote.state = { status: "decided", decision: { approved: false, feedback: "Rename it" } };
+    const second = host.harness.behavior.runService("review-delivery");
+    const sent = await sentReview(host);
+    second.controller.abort();
+    await second.done;
+    expect(messageText(sent)).toContain('"decision":"changes_requested"');
+  });
+
+  it("sends feedback too large for bb's storage whole, and stores a shortened copy", async () => {
+    const { host, remote } = await hostPlugin();
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as { reviewId: string };
+    const feedback = `start ${"x".repeat(400 * 1024)} end`;
+
+    remote.state = { status: "decided", decision: { approved: false, feedback } };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+    const sent = await sentReview(host);
+    expect(messageText(sent)).toContain(feedback);
+    await vi.waitFor(async () =>
+      expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({ status: "delivered" }),
+    );
+    const stored = await host.bb.storage.kv.get<{ result: { decision: string; feedback: string } }>(`review:${reviewId}`);
+    expect(stored?.result.decision).toBe("changes_requested");
+    expect(stored?.result.feedback).toMatch(/^start x+\n\n\[Shortened/u);
+
+    // No later "plugin restarted" message for it.
+    const service = host.harness.behavior.runService("review-delivery");
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    service.controller.abort();
+    await service.done;
+    expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+  });
+
+  it("stops a session whose thread is archived while it is still starting", async () => {
+    const remote = fakeRemoteHost();
+    let releaseStart!: () => void;
+    const startReleased = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    let startCalled = false;
+    const host = createFakePluginHost({
+      pluginId: "plannotator",
+      experimental_callHostRpc: async (request) => {
+        if (request.method === "startReview") {
+          startCalled = true;
+          await startReleased;
+        }
+        return remote.call(request);
+      },
+    });
+    hosts.push(host);
+    await plugin(host.bb);
+    wireThreadOnHost(host, { hostId: "host_mac", path: "/Users/me/repo" });
+
+    const toolCall = host.harness.behavior.callAgentTool("plannotator_review_plan", { planMarkdown: "# Plan" }, threadContext);
+    await vi.waitFor(() => expect(startCalled).toBe(true));
+    await host.harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({ id: "thread-1", archivedAt: Date.now() }),
+    });
+    releaseStart();
+
+    expect(await toolCall).toMatchObject({ isError: true });
+    expect(await host.harness.callRpc("getActiveReview", { threadId: "thread-1" })).toBeNull();
+    await vi.waitFor(() => expect(hostCalls(host).map(({ method }) => method)).toContain("stopReview"));
+    expect(await host.bb.storage.kv.list("review:")).toEqual([]);
   });
 
   it("stops a host review left pending by a plugin restart", async () => {

@@ -6,6 +6,7 @@ import {
   type ExperimentalHostSignals,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { MAX_ANNOTATE_MARKDOWN } from "./constants";
 
 /**
  * Loopback ports the review proxy may bind on a non-server host.
@@ -46,8 +47,7 @@ export const diffTypeSchema = z.enum([
 ]);
 /** A git ref passed as one argv entry; never an option. */
 export const gitRefSchema = z.string().regex(/^[^-\s][^\s]{0,199}$/u);
-/** Upstream's per-message cap for annotate-last. */
-export const MAX_ANNOTATE_MARKDOWN = 2 * 1024 * 1024;
+export { MAX_ANNOTATE_MARKDOWN } from "./constants";
 
 /**
  * One Plannotator session. `annotate.path` is absolute here; the server

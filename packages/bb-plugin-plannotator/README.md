@@ -64,7 +64,9 @@ applies the same request filter as the proxy on other hosts (below): writes
 only from the bb page's origin, the same endpoint denylist and worktree path
 checks, no WebSocket upgrades, and it never forwards a browser's
 `Authorization` header or cookies. Sessions on the BB server also run with
-Plannotator's sharing (paste service uploads) disabled. Known limitation: an
+Plannotator's sharing (paste service uploads) disabled. A session for a thread
+without a worktree on the server machine runs in an empty temporary
+directory, never the BB server's own working directory. Known limitation: an
 annotated HTML file's relative assets (images, stylesheets) do not load
 through the relay, because its `<base>` points at BB's own origin and BB's
 plugin routes are exact-match. The plugin changes
@@ -109,8 +111,19 @@ proxy to `http://127.0.0.1:<same port>`, and never touches other serve
 mappings. If a review moves to the next free port, a foreign mapping is left
 alone. It never uses `tailscale funnel`. Decisions arrive by host signal,
 backed by status polling; if the host disconnects or its worker dies, the
-thread receives a cancellation message. Plan history on each host lives in the
-plugin's host data directory.
+thread receives a cancellation message. If the BB server restarts during a
+review, a decision the host kept is still delivered once the host answers,
+but a review that is still open is cancelled: its panel cannot be reattached.
+Plan history on each host lives in the plugin's host data directory.
+
+Known limitations, from how Plannotator stores its data: plan versions,
+history and annotation drafts are shared by every thread whose sessions run on
+the same host (the BB server counts as one). Plannotator finds a plan's
+earlier version by repository name and plan heading, so a thread's first plan
+can show up as version 2 of another thread's plan with the same heading, and
+it keys drafts by content, so two sessions of the same file offer each
+other's draft. A plain link to a repository file that is not a document (such
+as `pic.svg`) does not open the file on any host.
 
 The tailnet is the trust boundary, as for BB itself: anyone who can reach the
 host's tailnet name can use the review while it is open. The proxy answers
@@ -119,7 +132,11 @@ and accepts writes only from that origin (blocking cross-site requests from
 other web pages), and lets only the bb page frame the review. It also denies
 upstream endpoints a review never needs from another device (host control,
 editor and note-app integrations, open-in-app, PR actions, the call-flow
-runtime installer, file reads outside the worktree, custom save paths). It
+runtime installer, Plannotator's self-update, file reads outside the worktree,
+custom save paths). It refuses a second approve or deny of a plan review,
+which Plannotator would answer as sent and then drop, and serves SVG and other
+XML with an empty sandbox policy, so an image opened in its own tab cannot run
+script on the review's origin (the relay does the same on BB's origin). It
 answers the open-in-app list itself, as Plannotator does for a remote
 session (none available), so that control stays hidden.
 Plannotator's own random loopback port is not published, but, as with stock

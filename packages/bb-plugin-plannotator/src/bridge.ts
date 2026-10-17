@@ -430,6 +430,13 @@ function isHttpUrl(value: unknown): value is string {
   }
 }
 
+/**
+ * How much of Plannotator's stdout is kept. A plan decision is one JSON line
+ * holding the user's feedback, which can quote a whole 1 MB plan; the tail
+ * must hold that line whole. Host RPC output is capped at 8 MiB.
+ */
+const MAX_STDOUT_CHARS = 4 * 1024 * 1024;
+
 export function parseReadyMetadata(value: string): UpstreamReadyMetadata | null {
   const records = parseJsonLines(value).reverse();
   for (const record of records) {
@@ -530,18 +537,28 @@ async function terminateChild(
   await exited.catch(() => undefined);
 }
 
+/** The last lines Plannotator wrote to stderr, for an error message. */
+function stderrTail(stderr: string): string {
+  return stderr.trim().split(/\r?\n/u).slice(-4).join(" ");
+}
+
 async function waitForReady(
   readyFile: string,
   child: ChildProcess,
   timeoutMs: number,
   signal: AbortSignal,
+  stderr: () => string,
 ): Promise<UpstreamReadyMetadata> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (signal.aborted) throw new Error("Plannotator review was cancelled");
     const metadata = await readReadyFile(readyFile);
     if (metadata) return metadata;
-    if (childExited(child)) throw new Error("Plannotator exited before its review UI was ready");
+    if (childExited(child)) {
+      // Plannotator says why, such as a code review outside a git repo.
+      const detail = stderrTail(stderr());
+      throw new Error(`Plannotator exited before its review UI was ready${detail ? `: ${detail}` : ""}`);
+    }
     await wait(25);
   }
   throw new Error(`Plannotator did not start its review UI within ${timeoutMs}ms`);
@@ -619,7 +636,7 @@ export async function startUpstreamSession(
   child.stdout?.setEncoding("utf8");
   child.stderr?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
-    stdout = `${stdout}${chunk}`.slice(-256 * 1024);
+    stdout = `${stdout}${chunk}`.slice(-MAX_STDOUT_CHARS);
   });
   child.stderr?.on("data", (chunk: string) => {
     stderr = `${stderr}${chunk}`.slice(-256 * 1024);
@@ -645,15 +662,16 @@ export async function startUpstreamSession(
       child,
       options.readyTimeoutMs ?? READY_TIMEOUT_MS,
       options.signal,
+      () => stderr,
     );
     await assertAgentTerminalOff(ready.port, options.session.mode);
 
     const decision: Promise<SessionDecision> = exited.then(async () => {
       if (spawnError) throw spawnError;
       if (child.exitCode !== 0) {
-        throw new Error(
-          `Plannotator exited with code ${child.exitCode ?? "unknown"}${stderr.trim() ? `: ${stderr.trim().split(/\r?\n/u).slice(-4).join(" ")}` : ""}`,
-        );
+        const detail = stderrTail(stderr);
+        const how = child.exitCode === null && child.signalCode ? `on signal ${child.signalCode}` : `with code ${child.exitCode ?? "unknown"}`;
+        throw new Error(`Plannotator exited ${how}${detail ? `: ${detail}` : ""}`);
       }
       if (!launch.resultFile) return parseUpstreamDecision(stdout, stderr);
       try {

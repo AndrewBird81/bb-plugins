@@ -453,7 +453,8 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
     context.signal.addEventListener("abort", abort, { once: true });
     let review: RunningUpstreamReview | undefined;
     let proxy: RunningReviewProxy | undefined;
-    let published = false;
+    /** serve ran: it may have published the mapping even when it failed or timed out. */
+    let serveRan = false;
     // Generated here so it never leaves this machine; the server reaches the
     // bridge only through bridgeFetch.
     const bridgeToken = input.bridgeHost ? randomBytes(32).toString("base64url") : undefined;
@@ -501,11 +502,11 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
         ...current,
         mappings: [...current.mappings.filter((owned) => owned !== port), port],
       }));
+      serveRan = true;
       const served = await deps.runCommand(tailscalePath, serveArgs(port), TAILSCALE_TIMEOUT_MS);
       if (served.exitCode !== 0) {
         throw new Error(`tailscale serve failed for port ${port}: ${commandDetail(served)}`);
       }
-      published = true;
       // The server may have given up while serve ran.
       throwIfAborted(controller.signal);
     } catch (error) {
@@ -514,7 +515,8 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       await proxy?.close().catch(() => undefined);
       if (proxy) {
         const port = proxy.port;
-        if (!published || (await removeMapping(tailscalePath, port))) await forgetMapping(port);
+        // A mapping whose removal failed stays recorded for the next reconcile.
+        if (!serveRan || (await removeMapping(tailscalePath, port))) await forgetMapping(port);
       }
       if (review) {
         const { pid } = review;

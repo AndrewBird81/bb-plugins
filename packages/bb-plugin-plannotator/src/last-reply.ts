@@ -7,6 +7,7 @@ type Threads = BbPluginApi["sdk"]["threads"];
 export type LastReplyThreads = Pick<Threads, "output"> & { events: Pick<Threads["events"], "list"> };
 
 type Row = { seq: number; type: string; scope?: unknown; data?: unknown };
+const TURN_PAGE_SIZE = 100;
 
 function turnIdOf(row: Row): string | null {
   const scope = row.scope as { kind?: unknown; turnId?: unknown } | undefined;
@@ -27,17 +28,22 @@ export async function lastFinishedReply(
   threadId: string,
   signal?: AbortSignal,
 ): Promise<{ reply: string | null; running: boolean }> {
-  const started = (await threads.events.list({
-    threadId,
-    types: ["turn/started"],
-    order: "desc",
-    limit: "20",
-    ...(signal ? { signal } : {}),
-  })) as Row[];
-  // The latest top-level turn; nested (sub-agent) turns carry a parent tool call.
-  const latest = started.find(
-    (row) => !(row.data as { parentToolCallId?: unknown } | undefined)?.parentToolCallId,
-  );
+  // The latest top-level turn; nested (sub-agent) turns carry a parent tool
+  // call. A turn can start more of them than one page holds.
+  let latest: Row | undefined;
+  for (let beforeSeq: number | undefined; ; ) {
+    const started = (await threads.events.list({
+      threadId,
+      types: ["turn/started"],
+      order: "desc",
+      limit: String(TURN_PAGE_SIZE),
+      ...(beforeSeq !== undefined ? { beforeSeq: String(beforeSeq) } : {}),
+      ...(signal ? { signal } : {}),
+    })) as Row[];
+    latest = started.find((row) => !(row.data as { parentToolCallId?: unknown } | undefined)?.parentToolCallId);
+    if (latest || started.length < TURN_PAGE_SIZE) break;
+    beforeSeq = started.at(-1)!.seq;
+  }
   const latestTurnId = latest ? turnIdOf(latest) : null;
   const output = async () => ({
     reply: (await threads.output({ threadId, ...(signal ? { signal } : {}) })).output,

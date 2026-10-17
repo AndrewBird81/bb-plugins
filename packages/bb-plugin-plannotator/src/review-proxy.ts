@@ -9,8 +9,10 @@ import { pipeline } from "node:stream";
 import {
   MAX_CAPABILITIES_BODY_BYTES,
   MAX_DECISION_BODY_BYTES,
+  SCRIPTABLE_IMAGE_POLICY,
   createRequestFilter,
   isRelabelableCapabilities,
+  isScriptableImage,
   relabelCapabilitiesBody,
   rewriteDecisionBody,
 } from "./request-filter";
@@ -196,6 +198,11 @@ export async function startReviewProxy(
       return;
     }
     const { url } = decision;
+    let succeeded = false;
+    // A decision that did not reach Plannotator, or that it refused, leaves the session's decision open.
+    res.on("close", () => {
+      if (!succeeded) decision.releaseDecision?.();
+    });
 
     const headers = forwardedRequestHeaders(req);
     if (decision.loopbackHost) {
@@ -230,14 +237,21 @@ export async function startReviewProxy(
     });
     upstream.on("response", (upstreamRes) => {
       const headers = forwardedResponseHeaders(upstreamRes);
-      if (framePolicy) {
+      const scriptableImage = isScriptableImage(headerValue(upstreamRes.headers["content-type"]));
+      if (scriptableImage) headers["x-content-type-options"] = "nosniff";
+      const addedPolicies = [
+        ...(framePolicy ? [framePolicy] : []),
+        ...(scriptableImage ? [SCRIPTABLE_IMAGE_POLICY] : []),
+      ];
+      if (addedPolicies.length > 0) {
         const existing = headers["content-security-policy"];
         headers["content-security-policy"] = [
           ...(existing === undefined ? [] : Array.isArray(existing) ? existing : [existing]),
-          framePolicy,
+          ...addedPolicies,
         ];
       }
       const status = upstreamRes.statusCode ?? 502;
+      succeeded = status >= 200 && status < 300;
       if (
         decision.sessionBridgeLabel &&
         isRelabelableCapabilities(

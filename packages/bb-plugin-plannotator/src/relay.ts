@@ -3,7 +3,9 @@ import { PLANNOTATOR_RELAY_PATH } from "./constants";
 import {
   MAX_CAPABILITIES_BODY_BYTES,
   MAX_DECISION_BODY_BYTES,
+  SCRIPTABLE_IMAGE_POLICY,
   isRelabelableCapabilities,
+  isScriptableImage,
   relabelCapabilitiesBody,
   rewriteDecisionBody,
   type RequestFilter,
@@ -97,10 +99,17 @@ function copyResponseHeaders(
   if (options.html) {
     // The embedded document is served by BB's origin and receives our inline
     // transport bootstrap. Upstream CSP/frame headers would otherwise block
-    // the intentionally thin embedding adapter.
-    headers.delete("content-security-policy");
+    // the intentionally thin embedding adapter. Upstream's sandbox on author
+    // HTML stays: opened in its own tab, it must not run on BB's origin.
+    if (!headers.get("content-security-policy")?.toLowerCase().includes("sandbox")) {
+      headers.delete("content-security-policy");
+    }
     headers.delete("content-security-policy-report-only");
     headers.delete("x-frame-options");
+  } else if (isScriptableImage(headers.get("content-type") ?? undefined)) {
+    // Here the image's script would run on BB's own origin.
+    headers.append("content-security-policy", SCRIPTABLE_IMAGE_POLICY);
+    headers.set("x-content-type-options", "nosniff");
   }
   const location = headers.get("location");
   if (location) {
@@ -115,6 +124,27 @@ function copyResponseHeaders(
     );
   }
   return headers;
+}
+
+/** The request body, or null once it is over `limit` bytes. */
+async function readCappedBody(request: Request, limit: number): Promise<Uint8Array | null> {
+  const declared = Number(request.headers.get("content-length") ?? "");
+  if (declared > limit) return null;
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      void reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
 }
 
 function errorResponse(message: string, status: number): Response {
@@ -212,22 +242,34 @@ export function injectRelayBootstrap(
       }
     }
   };
-  const scan = () => {
-    document.querySelectorAll("[src], [href], [action]").forEach(rewriteElement);
+  const scan = (root = document) => {
+    root.querySelectorAll?.("[src], [href], [action]").forEach(rewriteElement);
   };
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", scan, { once: true });
+    document.addEventListener("DOMContentLoaded", () => scan(), { once: true });
   } else {
     scan();
   }
   try {
+    // React inserts whole subtrees and later changes attributes in place.
     new MutationObserver((records) => {
       for (const record of records) {
+        if (record.type === "attributes") {
+          rewriteElement(record.target);
+          continue;
+        }
         for (const node of record.addedNodes) {
-          if (node.nodeType === Node.ELEMENT_NODE) rewriteElement(node);
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          rewriteElement(node);
+          scan(node);
         }
       }
-    }).observe(document.documentElement, { childList: true, subtree: true });
+    }).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["src", "href", "action"],
+    });
   } catch {}
 })();
 </script>`;
@@ -273,9 +315,9 @@ export function createPlannotatorRelayHandler(
     const request = context.req.raw;
     // The same filter as the review proxy on a Mac. The relay always reaches
     // Plannotator with a loopback Host (fetch derives it from the URL), so the
-    // filter's loopback-Host rewrite needs no action here: the bridge and
-    // host-control endpoints that check Host are denied, and the relay never
-    // forwards an Authorization header.
+    // filter's loopback-Host rewrite needs no action here: the bridge,
+    // host-control and update endpoints that check Host are denied, and the
+    // relay never forwards an Authorization header.
     const decision = await session.filter({
       method: request.method,
       url: new URL(requestedUrl),
@@ -294,6 +336,11 @@ export function createPlannotatorRelayHandler(
       return errorResponse(decision.message, decision.status);
     }
     const targetUrl = decision.url.toString();
+    // A decision that did not reach Plannotator, or that it refused, leaves the session's decision open.
+    const refused = (response: Response) => {
+      decision.releaseDecision?.();
+      return response;
+    };
 
     const requestHeaders = new Headers(request.headers);
     for (const header of [
@@ -313,17 +360,19 @@ export function createPlannotatorRelayHandler(
     }
     requestHeaders.set("accept-encoding", "identity");
 
-    let body: ArrayBuffer | undefined;
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      body = await request.arrayBuffer();
+    // The relay runs in the bb server: it never buffers a body it does not
+    // need to read, and stops reading a decision at its limit.
+    let body: Uint8Array | ReadableStream<Uint8Array> | undefined;
+    if (request.method !== "GET" && request.method !== "HEAD" && request.body) {
       if (decision.decisionBody) {
-        if (body.byteLength > MAX_DECISION_BODY_BYTES) {
-          return errorResponse("Request body too large.", 413);
-        }
-        const rewritten = rewriteDecisionBody(new Uint8Array(body));
-        if (!rewritten) return errorResponse("Decision body must be a JSON object.", 400);
-        body = new Uint8Array(rewritten).buffer;
+        const raw = await readCappedBody(request, MAX_DECISION_BODY_BYTES);
+        if (!raw) return refused(errorResponse("Request body too large.", 413));
+        const rewritten = rewriteDecisionBody(raw);
+        if (!rewritten) return refused(errorResponse("Decision body must be a JSON object.", 400));
+        body = rewritten;
         requestHeaders.set("content-type", "application/json");
+      } else {
+        body = request.body;
       }
     }
 
@@ -332,17 +381,19 @@ export function createPlannotatorRelayHandler(
       upstreamResponse = await fetchImpl(targetUrl, {
         method: request.method,
         headers: requestHeaders,
-        body: body && body.byteLength > 0 ? body : undefined,
+        ...(body instanceof ReadableStream
+          ? { body, duplex: "half" }
+          : body && body.byteLength > 0
+            ? { body: new Uint8Array(body) }
+            : {}),
         redirect: "manual",
-      });
+      } as RequestInit);
     } catch (error) {
-      return errorResponse(
-        `Plannotator upstream unavailable: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-        502,
+      return refused(
+        errorResponse(`Plannotator upstream unavailable: ${error instanceof Error ? error.message : String(error)}`, 502),
       );
     }
+    if (upstreamResponse.status < 200 || upstreamResponse.status >= 300) decision.releaseDecision?.();
 
     const html = isHtmlResponse(upstreamResponse);
     const headers = copyResponseHeaders(upstreamResponse, {

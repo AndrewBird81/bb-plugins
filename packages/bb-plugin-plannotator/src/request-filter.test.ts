@@ -133,6 +133,8 @@ describe("request filter", () => {
       ["GET", "/api/image?path=%2Fetc%2Fhosts.png", "none"],
       ["GET", "/api/archive/plans?customPath=%2Fetc", "none"],
       ["GET", "/api/x", "none", { upgrade: "websocket" }],
+      // Runs the install script for a loopback Host, which the relay always sends.
+      ["POST", "/api/update", "own"],
     ];
     for (const [method, path, origin, extra = {}] of table) {
       const body = method === "POST" ? JSON.stringify({ planSave: { customPath: "/etc" }, obsidian: {} }) : undefined;
@@ -147,6 +149,7 @@ describe("request filter", () => {
       expect(relayed.headers["access-control-allow-origin"], path).toBeUndefined();
     }
 
+    expect(seen.filter(({ url }) => url === "/api/update")).toEqual([]);
     const proxiedRequests = seen.filter(({ headers }) => headers.host?.startsWith(DNS_NAME) || headers.host === `127.0.0.1:${port}`);
     const hostFor = (path: string) =>
       proxiedRequests
@@ -159,6 +162,70 @@ describe("request filter", () => {
     // Both strip custom save paths and note-app fields from decisions.
     const approvals = seen.filter(({ url }) => url === "/api/approve");
     expect(approvals.map(({ body }) => JSON.parse(body))).toEqual([{ planSave: {} }, { planSave: {} }]);
+  });
+
+  it("passes one plan decision per session through the Mac proxy and the bb relay, unless it fails", async () => {
+    // Plannotator's plan server answers ok to every decision after the first and drops it.
+    const statuses = [409, 200, 200, 200, 200];
+    const decisions: string[] = [];
+    const server: Server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        decisions.push(req.url!);
+        res.writeHead(statuses.shift() ?? 200, { "content-type": "application/json" });
+        res.end("{}");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise((resolve) => server.close(resolve)));
+    const port = (server.address() as { port: number }).port;
+    const worktree = await mkdtemp(join(tmpdir(), "bb-plannotator-filter-"));
+    cleanups.push(() => rm(worktree, { recursive: true, force: true }));
+    const options = { cwd: worktree, allowedRoots: [worktree] };
+
+    const proxy = await startReviewProxy(0, { ...options, publicHostname: DNS_NAME, upstreamPort: port });
+    cleanups.push(() => proxy.close());
+    const proxyHost = `${DNS_NAME}:${proxy.port}`;
+    const viaProxy = (path: string, body = "{}") =>
+      new Promise<number>((resolve, reject) => {
+        const req = request(
+          {
+            host: "127.0.0.1",
+            port: proxy.port,
+            method: "POST",
+            path,
+            headers: { host: proxyHost, origin: `https://${proxyHost}`, "content-type": "application/json" },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode!));
+          },
+        );
+        req.on("error", reject);
+        req.end(body);
+      });
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    registerPlannotatorRelayRoutes(
+      host.bb,
+      new Map([["s-1", { url: `http://127.0.0.1:${port}`, filter: await createRequestFilter(options) }]]),
+      () => BB_ORIGIN,
+    );
+    const viaRelay = async (path: string, body = "{}") =>
+      (
+        await host.harness.behavior.fetchHttp("POST", `${PLANNOTATOR_RELAY_ROUTE}?sessionId=s-1&path=${encodeURIComponent(path)}`, {
+          headers: { origin: BB_ORIGIN, "content-type": "application/json" },
+          body,
+        })
+      ).status;
+
+    // A refused body and an upstream refusal (a stale revision) leave the decision open.
+    expect(await viaProxy("/api/approve", "not json")).toBe(400);
+    expect(await viaProxy("/api/approve")).toBe(409);
+    expect((await Promise.all([viaProxy("/api/approve"), viaProxy("/api/deny")])).sort()).toEqual([200, 409]);
+    expect(await viaProxy("/api/approve")).toBe(409);
+    expect((await Promise.all([viaRelay("/api/approve"), viaRelay("/api/deny")])).sort()).toEqual([200, 409]);
+    expect(decisions).toHaveLength(3);
   });
 
   it("answers the open-in app list as upstream does for a remote session, and still refuses opening files", async () => {

@@ -50,6 +50,21 @@ async function startUpstreamServer(): Promise<string> {
       });
       return;
     }
+    if (request.url?.startsWith("/api/html-assets/")) {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "sandbox allow-scripts" });
+      response.end("<html><head></head><body>author html</body></html>");
+      return;
+    }
+    if (request.url === "/csp") {
+      response.writeHead(200, { "content-type": "text/html", "content-security-policy": "default-src 'self'" });
+      response.end("<html><head></head><body>app</body></html>");
+      return;
+    }
+    if (request.url?.startsWith("/api/image")) {
+      response.writeHead(200, { "content-type": "image/svg+xml" });
+      response.end("<svg><script>alert(1)</script></svg>");
+      return;
+    }
     if (request.url === "/stream") {
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.end("data: ready\n\n");
@@ -134,6 +149,75 @@ describe("Plannotator same-origin relay", () => {
     );
     expect(stream.headers.get("content-type")).toContain("text/event-stream");
     expect(await stream.text()).toBe("data: ready\n\n");
+  });
+
+  it("sandboxes an SVG so its script cannot run on BB's origin", async () => {
+    const upstreamBaseUrl = await startUpstreamServer();
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    registerPlannotatorRelayRoutes(host.bb, await relaySessions(upstreamBaseUrl));
+
+    const image = await host.harness.fetchHttp(
+      "GET",
+      `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=${encodeURIComponent("/api/image?path=package.json.svg")}`,
+    );
+
+    expect(image.status).toBe(200);
+    expect(image.headers.get("content-security-policy")).toBe(
+      "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+    );
+    expect(image.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it("keeps upstream's sandbox on author HTML, and drops other policies from the documents it injects into", async () => {
+    const upstreamBaseUrl = await startUpstreamServer();
+    const host = createFakePluginHost({ pluginId: "plannotator" });
+    hosts.push(host);
+    registerPlannotatorRelayRoutes(host.bb, await relaySessions(upstreamBaseUrl));
+    const get = (path: string) =>
+      host.harness.fetchHttp("GET", `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=${encodeURIComponent(path)}`);
+
+    const asset = await get("/api/html-assets/token/page.html");
+    expect(asset.headers.get("content-security-policy")).toBe("sandbox allow-scripts");
+    expect(await asset.text()).toContain("author html");
+    expect((await get("/csp")).headers.get("content-security-policy")).toBeNull();
+  });
+
+  it("refuses an oversized decision body without buffering it, and streams other bodies", async () => {
+    const upstreamBaseUrl = await startUpstreamServer();
+    const handler = createPlannotatorRelayHandler(await relaySessions(upstreamBaseUrl));
+    const call = (path: string, body: ReadableStream<Uint8Array>, headers: Record<string, string> = {}) => {
+      const url = new URL(`https://bb.example${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=${encodeURIComponent(path)}`);
+      const raw = new Request(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "sec-fetch-site": "same-origin", ...headers },
+        body,
+        duplex: "half",
+      } as RequestInit);
+      const context = { req: { raw, query: (name: string) => url.searchParams.get(name) ?? undefined } };
+      return Promise.race([
+        handler(context as never) as Promise<Response>,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("the relay waited for the whole body")), 2_000)),
+      ]);
+    };
+    /** A body that sends `size` bytes and never ends, like a slow or hostile client. */
+    const endless = (size: number) =>
+      new ReadableStream<Uint8Array>({ start: (controller) => controller.enqueue(new Uint8Array(size).fill(32)) });
+
+    expect((await call("/api/approve", endless(16), { "content-length": String(2 * 1024 * 1024) })).status).toBe(413);
+    expect((await call("/api/deny", endless(1024 * 1024 + 1))).status).toBe(413);
+
+    const parts = ['{"plan":"', "x".repeat(2 * 1024 * 1024), '"}'];
+    const streamed = await call(
+      "/api/plan",
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const part of parts) controller.enqueue(new TextEncoder().encode(part));
+          controller.close();
+        },
+      }),
+    );
+    expect(((await streamed.json()) as { body: string }).body).toBe(parts.join(""));
   });
 
   it("rejects unknown sessions and unsafe paths before contacting upstream", async () => {

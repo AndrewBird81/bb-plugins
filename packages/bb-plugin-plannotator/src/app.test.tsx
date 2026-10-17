@@ -241,6 +241,26 @@ describe("Plannotator BB shell", () => {
     );
   });
 
+  it("keeps a session that opened while the panel was still asking for the active one", async () => {
+    let answer!: (value: null) => void;
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: {} },
+      {
+        rpc: { getActiveReview: () => new Promise<null>((resolve) => (answer = resolve)) },
+        sdk: launcherSdk().sdk,
+      },
+    );
+    await waitFor(() => expect(answer).toBeDefined());
+
+    await slot.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, { kind: "review-opened", payload });
+    await slot.findByTitle("Plannotator review");
+    // The answer from before the session opened arrives late.
+    answer(null);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(slot.queryByTitle("Plannotator review")).not.toBeNull();
+  });
+
   it("follows review open and close signals in a param-less panel", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
@@ -347,6 +367,29 @@ describe("Plannotator BB shell", () => {
         { threadId: "thread-1", request: { mode: "annotate-last", markdown: "Full reply" } },
       ]),
     );
+  });
+
+  it("explains an assistant message with no text, or too much, instead of opening the panel", () => {
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => 0 as never);
+    const action = app.messageActions.find(({ id }) => id === "plannotator-annotate-message")!;
+    const opened: unknown[] = [];
+    const run = (text: string) =>
+      void action.run({
+        threadId: "thread-1",
+        message: { id: "m-1", threadId: "thread-1", role: "assistant", text, sourceSeqEnd: 1, experimental_messageSeq: 1 },
+        openPanel: (options: unknown) => {
+          opened.push(options);
+          return true;
+        },
+      } as never);
+
+    run("");
+    run("  \n ");
+    expect(toastError).toHaveBeenCalledWith("This message has no text for Plannotator to annotate.");
+    run("x".repeat(2 * 1024 * 1024 + 1));
+    expect(toastError).toHaveBeenCalledWith("This message is longer than Plannotator's 2 MiB annotation limit.");
+    expect(opened).toEqual([]);
+    toastError.mockRestore();
   });
 
   it("drops a request whose panel did not open and says so", async () => {

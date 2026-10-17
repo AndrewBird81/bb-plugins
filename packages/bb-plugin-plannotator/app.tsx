@@ -17,6 +17,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import {
+  MAX_ANNOTATE_MARKDOWN,
   PANEL_ACTION_ID,
   PANEL_TITLE,
   PLANNOTATOR_REALTIME_CHANNEL,
@@ -124,15 +125,19 @@ function useActiveReview(threadId: string): PlannotatorPayload | null {
   const rpc = useRpc<typeof rpcContract>();
   const realtimeConnectionState = useRealtimeConnectionState();
   const [active, setActive] = useState<PlannotatorPayload | null>(null);
+  /** Counts realtime updates, so an RPC answer older than one is dropped. */
+  const realtimeUpdates = useRef(0);
 
   useRealtime(PLANNOTATOR_REALTIME_CHANNEL, (value) => {
     const opened = parseReviewOpened(value);
     if (opened && opened.threadId === threadId) {
+      realtimeUpdates.current += 1;
       setActive(opened);
       return;
     }
     const closed = parseReviewClosed(value);
     if (closed && closed.threadId === threadId) {
+      realtimeUpdates.current += 1;
       setActive((current) =>
         current?.sessionId === closed.sessionId ? null : current,
       );
@@ -142,10 +147,11 @@ function useActiveReview(threadId: string): PlannotatorPayload | null {
   useEffect(() => {
     if (realtimeConnectionState !== "connected") return;
     let cancelled = false;
+    const updatesBefore = realtimeUpdates.current;
     void rpc
       .call("getActiveReview", { threadId })
       .then((value) => {
-        if (cancelled) return;
+        if (cancelled || realtimeUpdates.current !== updatesBefore) return;
         const payload = parsePayload(value);
         setActive(payload && payload.threadId === threadId ? payload : null);
       })
@@ -408,6 +414,14 @@ export default definePluginApp((app) => {
         return;
       }
       const markdown = context.selectedText?.trim() ? context.selectedText : context.message.text;
+      if (!markdown.trim()) {
+        toast.error("This message has no text for Plannotator to annotate.");
+        return;
+      }
+      if (markdown.length > MAX_ANNOTATE_MARKDOWN) {
+        toast.error("This message is longer than Plannotator's 2 MiB annotation limit.");
+        return;
+      }
       openWith(context, { kind: "launch", request: { mode: "annotate-last", markdown } });
     },
   });

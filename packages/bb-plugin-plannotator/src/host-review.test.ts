@@ -243,6 +243,34 @@ describe("host plan review handle", () => {
     expect(polls).toBe(2);
   });
 
+  it("refresh waits for a scheduled poll in flight, so a stop after it keeps the host's decision", async () => {
+    let releaseFirst!: () => void;
+    const firstPoll = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let polls = 0;
+    const client: PlannotatorHostClient = {
+      async call(method) {
+        if (method === "startReview") return { url: "https://mac.tail1b968e.ts.net:19500", port: 19500 } as never;
+        if (method === "stopReview") return { stopped: true } as never;
+        polls += 1;
+        if (polls === 1) await firstPoll;
+        return { status: "decided", decision: { approved: true } } as never;
+      },
+    };
+    const review = await start(client, 5);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(polls).toBe(1);
+
+    // What the plugin's dispose does: read the decision, then stop.
+    const refreshed = review.refresh();
+    setTimeout(releaseFirst, 10);
+    await refreshed;
+    await review.stop();
+
+    await expect(review.result).resolves.toEqual({ approved: true });
+  });
+
   it("stops the host review and rejects the result as cancelled", async () => {
     const { client, calls } = fakeClient([{ status: "pending" }]);
     const review = await start(client, 60_000);

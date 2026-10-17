@@ -16,6 +16,7 @@ import { resolveAnnotateTarget, sessionErrorOutput } from "./session";
 import type { ReviewProxyOptions, RunningReviewProxy } from "./review-proxy";
 import {
   HOST_PORT_RANGE,
+  UNPOLLED_REVIEW_TIMEOUT_MS,
   hostContract,
   hostSignals,
   type BridgeHost,
@@ -59,8 +60,6 @@ export type HostRuntimeDeps = {
 const TAILSCALE_TIMEOUT_MS = 10_000;
 const PS_TIMEOUT_MS = 5_000;
 const KILL_GRACE_MS = 1_000;
-/** The server polls every few seconds; a review nobody polls is orphaned. */
-export const UNPOLLED_REVIEW_TIMEOUT_MS = 5 * 60_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
 const OWNED_FILE = "owned-processes.json";
 
@@ -222,6 +221,15 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       return result.exitCode === 0;
     } catch {
       return false;
+    }
+  }
+
+  /** Whether `port` has a serve mapping of this plugin's shape; null if serve status failed. */
+  async function hasOwnShape(tailscalePath: string, port: number): Promise<boolean | null> {
+    try {
+      return ownedServePorts(await readServeStatus(tailscalePath), HOST_PORT_RANGE).includes(port);
+    } catch {
+      return null;
     }
   }
 
@@ -515,8 +523,11 @@ export function createPlannotatorHostEntry(deps: HostRuntimeDeps) {
       await proxy?.close().catch(() => undefined);
       if (proxy) {
         const port = proxy.port;
-        // A mapping whose removal failed stays recorded for the next reconcile.
-        if (!serveRan || (await removeMapping(tailscalePath, port))) await forgetMapping(port);
+        // Serve may have applied the mapping, or failed because another
+        // program took the port: remove only a mapping of this plugin's shape.
+        // One whose check or removal failed stays recorded for the next reconcile.
+        const shaped = serveRan ? await hasOwnShape(tailscalePath, port) : false;
+        if (shaped === false || (shaped && (await removeMapping(tailscalePath, port)))) await forgetMapping(port);
       }
       if (review) {
         const { pid } = review;

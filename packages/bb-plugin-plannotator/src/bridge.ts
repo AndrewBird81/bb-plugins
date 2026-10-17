@@ -537,9 +537,11 @@ async function terminateChild(
   await exited.catch(() => undefined);
 }
 
+const MAX_STDERR_TAIL_CHARS = 2_000;
+
 /** The last lines Plannotator wrote to stderr, for an error message. */
 function stderrTail(stderr: string): string {
-  return stderr.trim().split(/\r?\n/u).slice(-4).join(" ");
+  return stderr.trim().split(/\r?\n/u).slice(-4).join(" ").slice(-MAX_STDERR_TAIL_CHARS);
 }
 
 async function waitForReady(

@@ -253,6 +253,15 @@ describe("review proxy", () => {
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
   });
 
+  it("lets an SVG that annotated HTML embeds keep its scripts, on an opaque origin as upstream's HTML assets", async () => {
+    const { send } = await setup({ upstreamContentType: "image/svg+xml" });
+
+    const response = await send("GET", "/api/html-assets/token/diagram.svg");
+
+    expect(response.headers["content-security-policy"]).toBe("sandbox allow-scripts");
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
   it("leaves other responses without the image sandbox", async () => {
     const { send } = await setup({ upstreamContentType: "image/png" });
     const response = await send("GET", "/api/plan");

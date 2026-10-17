@@ -16,6 +16,12 @@ import { MAX_ANNOTATE_MARKDOWN } from "./constants";
  */
 export const HOST_PORT_RANGE = { first: 19500, last: 19509 } as const;
 
+/**
+ * The server polls every few seconds; the host stops a review nobody polls
+ * for this long, and drops its decision.
+ */
+export const UNPOLLED_REVIEW_TIMEOUT_MS = 5 * 60_000;
+
 export const upstreamOriginSchema = z.enum([
   "claude-code",
   "opencode",

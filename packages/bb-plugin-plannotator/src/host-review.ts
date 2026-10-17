@@ -25,7 +25,7 @@ export const HOST_DISCONNECT_GRACE_MS = 2 * 60_000;
 export type HostSession = RunningUpstreamReview & {
   hostId: string;
   sessionId: string;
-  /** Poll now, for example after a host signal. Resolves when this poll ends. */
+  /** Poll now, for example after a host signal. Resolves when a poll started after this call ends. */
   refresh(): Promise<void>;
   /** The host worker crashed, so the review cannot finish. */
   workerExited(): void;
@@ -83,8 +83,7 @@ export async function startHostSession(options: {
     rejectResult = reject;
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let polling = false;
-  let pollAgain = false;
+  let inFlight: Promise<void> | undefined;
   let failingSince: number | null = null;
   let stopping: Promise<void> | undefined;
 
@@ -112,36 +111,30 @@ export async function startHostSession(options: {
     if (!settled) timer = setTimeout(() => void poll(), pollIntervalMs);
   };
 
-  async function poll(): Promise<void> {
-    if (settled) return;
-    if (polling) {
-      pollAgain = true;
-      return;
-    }
-    polling = true;
-    clearTimeout(timer);
-    try {
-      apply(
-        await client.call("getReview", { sessionId }, { hostId, timeoutMs: HOST_CALL_TIMEOUT_MS }),
-      );
-      failingSince = null;
-    } catch (error) {
-      // Not connected or a transport error. An answer of `unknown` or a
-      // worker-exit event still ends the review at once.
-      failingSince ??= now();
-      if (now() - failingSince >= disconnectGraceMs) {
-        fail(`Lost contact with the thread's machine during the review: ${errorMessage(error)}`);
-      }
-    } finally {
-      polling = false;
-      if (pollAgain) {
-        pollAgain = false;
-        void poll();
-      } else {
+  /** One getReview at a time; a call while one runs joins it. */
+  const poll = (): Promise<void> => {
+    if (settled) return Promise.resolve();
+    inFlight ??= (async () => {
+      clearTimeout(timer);
+      try {
+        apply(
+          await client.call("getReview", { sessionId }, { hostId, timeoutMs: HOST_CALL_TIMEOUT_MS }),
+        );
+        failingSince = null;
+      } catch (error) {
+        // Not connected or a transport error. An answer of `unknown` or a
+        // worker-exit event still ends the review at once.
+        failingSince ??= now();
+        if (now() - failingSince >= disconnectGraceMs) {
+          fail(`Lost contact with the thread's machine during the review: ${errorMessage(error)}`);
+        }
+      } finally {
+        inFlight = undefined;
         schedule();
       }
-    }
-  }
+    })();
+    return inFlight;
+  };
 
   schedule();
   return {
@@ -151,7 +144,11 @@ export async function startHostSession(options: {
     hostId,
     sessionId,
     result,
-    refresh: () => poll(),
+    async refresh() {
+      // A poll already running may have asked before the news arrived.
+      while (inFlight) await inFlight;
+      await poll();
+    },
     workerExited: () => fail("The Plannotator worker on the thread's machine exited."),
     stop() {
       stopping ??= (async () => {

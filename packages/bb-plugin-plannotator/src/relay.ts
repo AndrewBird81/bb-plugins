@@ -3,11 +3,11 @@ import { PLANNOTATOR_RELAY_PATH } from "./constants";
 import {
   MAX_CAPABILITIES_BODY_BYTES,
   MAX_DECISION_BODY_BYTES,
-  SCRIPTABLE_IMAGE_POLICY,
   isRelabelableCapabilities,
   isScriptableImage,
   relabelCapabilitiesBody,
   rewriteDecisionBody,
+  scriptableImagePolicy,
   type RequestFilter,
 } from "./request-filter";
 
@@ -83,6 +83,7 @@ function copyResponseHeaders(
   response: Response,
   options: {
     upstreamBaseUrl: string;
+    upstreamPathname: string;
     relayPath: string;
     sessionId: string;
     html: boolean;
@@ -108,7 +109,7 @@ function copyResponseHeaders(
     headers.delete("x-frame-options");
   } else if (isScriptableImage(headers.get("content-type") ?? undefined)) {
     // Here the image's script would run on BB's own origin.
-    headers.append("content-security-policy", SCRIPTABLE_IMAGE_POLICY);
+    headers.append("content-security-policy", scriptableImagePolicy(options.upstreamPathname));
     headers.set("x-content-type-options", "nosniff");
   }
   const location = headers.get("location");
@@ -365,7 +366,13 @@ export function createPlannotatorRelayHandler(
     let body: Uint8Array | ReadableStream<Uint8Array> | undefined;
     if (request.method !== "GET" && request.method !== "HEAD" && request.body) {
       if (decision.decisionBody) {
-        const raw = await readCappedBody(request, MAX_DECISION_BODY_BYTES);
+        let raw: Uint8Array | null;
+        try {
+          raw = await readCappedBody(request, MAX_DECISION_BODY_BYTES);
+        } catch {
+          // The browser dropped the connection mid-upload.
+          return refused(errorResponse("Could not read the request body.", 400));
+        }
         if (!raw) return refused(errorResponse("Request body too large.", 413));
         const rewritten = rewriteDecisionBody(raw);
         if (!rewritten) return refused(errorResponse("Decision body must be a JSON object.", 400));
@@ -398,6 +405,7 @@ export function createPlannotatorRelayHandler(
     const html = isHtmlResponse(upstreamResponse);
     const headers = copyResponseHeaders(upstreamResponse, {
       upstreamBaseUrl,
+      upstreamPathname: decision.url.pathname,
       relayPath,
       sessionId,
       html,

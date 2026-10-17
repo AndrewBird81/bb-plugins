@@ -5,11 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import type { RunningUpstreamReview, SessionDecision, SessionOptions, UpstreamDecision } from "./bridge";
 import type { ReviewProxyOptions } from "./review-proxy";
-import {
-  UNPOLLED_REVIEW_TIMEOUT_MS,
-  createPlannotatorHostEntry,
-  type CommandResult,
-} from "./host-runtime";
+import { UNPOLLED_REVIEW_TIMEOUT_MS } from "./host-contract";
+import { createPlannotatorHostEntry, type CommandResult } from "./host-runtime";
 
 const TAILSCALE = "/fake/bin/tailscale";
 const DNS_NAME = "mac.tail1b968e.ts.net";
@@ -594,6 +591,21 @@ describe("Plannotator host entry", () => {
 
     await expect(start()).rejects.toThrow("tailscale serve failed for port 19500");
     expect(fake.serve.has(19500)).toBe(false);
+    expect(await owned()).toEqual({ processes: [], mappings: [] });
+    await harness.experimental_dispose();
+  });
+
+  it("leaves a mapping another program made while tailscale serve failed", async () => {
+    // The program takes the port after the free-port check.
+    const fake: ReturnType<typeof fakeHost> = fakeHost({
+      serveFails: true,
+      onServe: () => fake.serve.set(19500, { proxy: "http://127.0.0.1:3000" }),
+    });
+    const { harness, start, owned } = await harnessFor(fake);
+
+    await expect(start()).rejects.toThrow("tailscale serve failed for port 19500");
+    expect(fake.serve.get(19500)).toEqual({ proxy: "http://127.0.0.1:3000" });
+    expect(fake.commands.map(({ args }) => args.join(" "))).not.toContain("serve --https=19500 off");
     expect(await owned()).toEqual({ processes: [], mappings: [] });
     await harness.experimental_dispose();
   });

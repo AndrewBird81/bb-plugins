@@ -9,12 +9,12 @@ import { pipeline } from "node:stream";
 import {
   MAX_CAPABILITIES_BODY_BYTES,
   MAX_DECISION_BODY_BYTES,
-  SCRIPTABLE_IMAGE_POLICY,
   createRequestFilter,
   isRelabelableCapabilities,
   isScriptableImage,
   relabelCapabilitiesBody,
   rewriteDecisionBody,
+  scriptableImagePolicy,
 } from "./request-filter";
 
 export { stripDecisionBody } from "./request-filter";
@@ -241,7 +241,7 @@ export async function startReviewProxy(
       if (scriptableImage) headers["x-content-type-options"] = "nosniff";
       const addedPolicies = [
         ...(framePolicy ? [framePolicy] : []),
-        ...(scriptableImage ? [SCRIPTABLE_IMAGE_POLICY] : []),
+        ...(scriptableImage ? [scriptableImagePolicy(url.pathname)] : []),
       ];
       if (addedPolicies.length > 0) {
         const existing = headers["content-security-policy"];

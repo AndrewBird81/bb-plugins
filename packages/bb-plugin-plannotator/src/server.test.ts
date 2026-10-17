@@ -21,6 +21,7 @@ import plugin, {
   feedbackForBbAgent,
   reviewTargetFor,
   shouldUseRemotePlannotatorMode,
+  storableReview,
   upstreamOriginForProvider,
 } from "../server";
 
@@ -1893,6 +1894,20 @@ describe("BB upstream Plannotator bridge", () => {
     expect(await host.bb.storage.kv.get(key)).toMatchObject({ status: "pending" });
     expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
 
+    // The host keeps an unpolled decision for 5 minutes, so 3 minutes later it may still have it.
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + 3 * 60_000);
+    try {
+      const later = host.harness.behavior.runService("review-delivery");
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+      later.controller.abort();
+      await later.done;
+      expect(await host.bb.storage.kv.get(key)).toMatchObject({ status: "pending" });
+      expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      vi.restoreAllMocks();
+    }
+
     reachable = true;
     remote.state = { status: "decided", decision: { approved: false, feedback: "Rename it" } };
     const second = host.harness.behavior.runService("review-delivery");
@@ -1928,6 +1943,73 @@ describe("BB upstream Plannotator bridge", () => {
     service.controller.abort();
     await service.done;
     expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+  });
+
+  it("stores a failure whose error is too large for bb's storage, so it is not reported again as a restart", async () => {
+    const { host, remote } = await hostPlugin();
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan" },
+      threadContext,
+    ))) as { reviewId: string };
+
+    remote.state = { status: "failed", error: `Plannotator exited with code 1: ${"e".repeat(400 * 1024)}` };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+    const sent = await sentReview(host);
+    expect(messageText(sent)).toContain('"decision":"cancelled"');
+    await vi.waitFor(async () =>
+      expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({ status: "delivered" }),
+    );
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    service.controller.abort();
+    await service.done;
+    expect(host.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+  });
+
+  it("points a shortened stored copy at the file where Plannotator saved the whole feedback", () => {
+    const record = (savedPath?: string) =>
+      storableReview({
+        id: "bb883ad4-4ff7-4183-96eb-6250ae380c3a",
+        threadId: "thread-1",
+        kind: "plan",
+        initiator: "agent",
+        status: "ready",
+        updatedAt: 0,
+        result: {
+          reviewId: "bb883ad4-4ff7-4183-96eb-6250ae380c3a",
+          source: "plannotator",
+          decision: "changes_requested",
+          feedback: "x".repeat(400 * 1024),
+          ...(savedPath ? { savedPath } : {}),
+        },
+      });
+    const saved = record("/Users/me/.plannotator/plans/plan-denied.md");
+    expect(Buffer.byteLength(JSON.stringify(saved))).toBeLessThanOrEqual(240 * 1024);
+    expect(saved.result?.feedback).toMatch(
+      /x\n\n\[Shortened by the Plannotator plugin to fit bb's storage limit\. The whole text is in \/Users\/me\/\.plannotator\/plans\/plan-denied\.md on the machine that ran the review\.\]$/u,
+    );
+    expect(record().result?.feedback).toMatch(/x\n\n\[Shortened by the Plannotator plugin to fit bb's storage limit\.\]$/u);
+
+    // Other oversized text is cut first, so it does not crowd out the feedback.
+    const withError = storableReview({
+      id: "bb883ad4-4ff7-4183-96eb-6250ae380c3a",
+      threadId: "thread-1",
+      kind: "plan",
+      initiator: "agent",
+      status: "ready",
+      updatedAt: 0,
+      result: {
+        reviewId: "bb883ad4-4ff7-4183-96eb-6250ae380c3a",
+        source: "plannotator",
+        decision: "cancelled",
+        feedback: "f".repeat(100 * 1024),
+        error: "e".repeat(300 * 1024),
+      },
+    });
+    expect(withError.result?.feedback).toBe("f".repeat(100 * 1024));
+    expect(withError.result?.error).toMatch(/^e{4000}\n\n\[Shortened/u);
   });
 
   it("stops a session whose thread is archived while it is still starting", async () => {

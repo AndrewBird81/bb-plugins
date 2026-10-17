@@ -22,7 +22,7 @@ Start a new agent session after installing or reloading. When the agent explicit
 
 Only one review can be pending per thread. If you close its tab, open the **Plannotator** thread panel action to bring the pending review back. A second `plannotator_review_plan` call while a review is pending returns `status: "already_active"` with the pending review ID; it does not start a new review and is not a cancellation.
 
-BB stores the review state until it delivers the decision. If the plugin restarts during a review, it sends a cancellation message after restarting. If delivery fails temporarily, it retries. The agent can call `plannotator_review_status` with the review ID to recover a missing result; it does not need to poll during a normal review.
+BB stores the review state until it delivers the decision. If the plugin restarts during a review, it sends a cancellation message after restarting. If delivery fails temporarily, it retries. The agent can call `plannotator_review_status` with the review ID to recover a missing result; it does not need to poll during a normal review. BB stores at most 256 KiB per review, so very long feedback is stored shortened: the first message carries it whole, but a retried delivery and `plannotator_review_status` get the shortened copy, which names the file where Plannotator saved the plan with the whole feedback, if it saved one.
 
 Plannotator's plan history and configuration are stored under the plugin's BB data directory. Local child sessions use BB's session-scoped same-origin relay, and BB acknowledges the current upstream look-and-feel announcement before mounting the iframe, so the standalone setup wizard does not interrupt each review. The upstream plan UI remains otherwise unmodified. **Open externally** is available as a fallback, but external browser tabs may have a separate cookie jar from the BB panel.
 
@@ -112,8 +112,9 @@ mappings. If a review moves to the next free port, a foreign mapping is left
 alone. It never uses `tailscale funnel`. Decisions arrive by host signal,
 backed by status polling; if the host disconnects or its worker dies, the
 thread receives a cancellation message. If the BB server restarts during a
-review, a decision the host kept is still delivered once the host answers,
-but a review that is still open is cancelled: its panel cannot be reattached.
+review, a decision the host kept is still delivered if the host answers
+within five minutes (as long as it keeps an unpolled decision), but a review
+that is still open is cancelled: its panel cannot be reattached.
 Plan history on each host lives in the plugin's host data directory.
 
 Known limitations, from how Plannotator stores its data: plan versions,

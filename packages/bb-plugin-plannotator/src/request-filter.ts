@@ -72,7 +72,17 @@ export const MAX_CAPABILITIES_BODY_BYTES = 1024 * 1024;
  * origin, where it could approve the review or prompt the thread's agent. An
  * empty sandbox stops that; `<img>` rendering ignores the policy.
  */
-export const SCRIPTABLE_IMAGE_POLICY = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+const SCRIPTABLE_IMAGE_POLICY = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+/**
+ * Annotated HTML may embed an SVG as a document that runs script. Upstream
+ * gives its HTML assets an opaque origin with script, and so does this.
+ */
+const HTML_ASSET_DOCUMENT_POLICY = "sandbox allow-scripts";
+
+/** The CSP for a scriptable image at `pathname` (see isScriptableImage). */
+export function scriptableImagePolicy(pathname: string): string {
+  return pathname.startsWith("/api/html-assets/") ? HTML_ASSET_DOCUMENT_POLICY : SCRIPTABLE_IMAGE_POLICY;
+}
 
 /** Whether a non-HTML response can run script when opened as a document. */
 export function isScriptableImage(contentType: string | undefined): boolean {

@@ -50,6 +50,11 @@ async function startUpstreamServer(): Promise<string> {
       });
       return;
     }
+    if (request.url?.startsWith("/api/html-assets/") && request.url.endsWith(".svg")) {
+      response.writeHead(200, { "content-type": "image/svg+xml" });
+      response.end("<svg><script>draw()</script></svg>");
+      return;
+    }
     if (request.url?.startsWith("/api/html-assets/")) {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "sandbox allow-scripts" });
       response.end("<html><head></head><body>author html</body></html>");
@@ -167,6 +172,14 @@ describe("Plannotator same-origin relay", () => {
       "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
     );
     expect(image.headers.get("x-content-type-options")).toBe("nosniff");
+
+    // An SVG that annotated HTML embeds keeps its scripts, on an opaque origin as upstream's HTML assets.
+    const asset = await host.harness.fetchHttp(
+      "GET",
+      `${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=${encodeURIComponent("/api/html-assets/token/diagram.svg")}`,
+    );
+    expect(asset.headers.get("content-security-policy")).toBe("sandbox allow-scripts");
+    expect(asset.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
   it("keeps upstream's sandbox on author HTML, and drops other policies from the documents it injects into", async () => {
@@ -218,6 +231,46 @@ describe("Plannotator same-origin relay", () => {
       }),
     );
     expect(((await streamed.json()) as { body: string }).body).toBe(parts.join(""));
+  });
+
+  it("leaves the decision open when the browser drops the connection mid-upload", async () => {
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end("{}");
+      });
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as { port: number };
+    const handler = createPlannotatorRelayHandler(await relaySessions(`http://127.0.0.1:${port}`));
+    const approve = (body: ReadableStream<Uint8Array>) => {
+      const url = new URL(`https://bb.example${PLANNOTATOR_RELAY_ROUTE}?sessionId=session-1&path=%2Fapi%2Fapprove`);
+      const raw = new Request(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" },
+        body,
+        duplex: "half",
+      } as RequestInit);
+      const context = { req: { raw, query: (name: string) => url.searchParams.get(name) ?? undefined } };
+      return handler(context as never) as Promise<Response>;
+    };
+
+    const cutOff = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"feedback":"'));
+        controller.error(new Error("connection reset"));
+      },
+    });
+    expect((await approve(cutOff)).status).toBe(400);
+    const whole = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{}"));
+        controller.close();
+      },
+    });
+    expect((await approve(whole)).status).toBe(200);
   });
 
   it("rejects unknown sessions and unsafe paths before contacting upstream", async () => {

@@ -38,6 +38,7 @@ import { createForkAsker, summarizeExchanges, sweepForks, type ForkAsker, type F
 import { createRequestFilter, sessionBridgeLabel } from "./src/request-filter";
 import {
   MAX_ANNOTATE_MARKDOWN,
+  UNPOLLED_REVIEW_TIMEOUT_MS,
   diffTypeSchema,
   gitRefSchema,
   hostContract,
@@ -206,7 +207,13 @@ type StoredReview = z.infer<typeof storedReviewSchema>;
 const REVIEW_KEY_PREFIX = "review:";
 /** bb refuses a kv value over 256 KiB. */
 const MAX_STORED_REVIEW_BYTES = 240 * 1024;
-const SHORTENED_NOTE = "\n\n[Shortened by the Plannotator plugin to fit bb's storage limit.]";
+/** The cut for text fields other than feedback and message in an oversized record. */
+const MAX_STORED_FIELD_CHARS = 4_000;
+/** Plannotator saves the plan with the whole feedback at `savedPath`. */
+const shortenedNote = (savedPath?: string) =>
+  `\n\n[Shortened by the Plannotator plugin to fit bb's storage limit.${
+    savedPath ? ` The whole text is in ${savedPath} on the machine that ran the review.` : ""
+  }]`;
 
 /**
  * The record as bb can store it. Plan feedback can quote a whole plan, far
@@ -216,16 +223,34 @@ const SHORTENED_NOTE = "\n\n[Shortened by the Plannotator plugin to fit bb's sto
 export function storableReview(record: StoredReview): StoredReview {
   const size = (value: StoredReview) => Buffer.byteLength(JSON.stringify(value));
   if (!record.result || size(record) <= MAX_STORED_REVIEW_BYTES) return record;
-  let shortened: StoredReview = record;
+  // Other text is short, unless for example an error quotes Plannotator's stderr.
+  const clip = (text: string) =>
+    text.length > MAX_STORED_FIELD_CHARS ? `${text.slice(0, MAX_STORED_FIELD_CHARS)}${shortenedNote()}` : text;
+  let shortened: StoredReview = {
+    ...record,
+    result: Object.fromEntries(
+      Object.entries(record.result).map(([key, value]) => [
+        key,
+        key === "feedback" || key === "message"
+          ? value
+          : typeof value === "string"
+            ? clip(value)
+            : Array.isArray(value)
+              ? value.map(clip)
+              : value,
+      ]),
+    ) as ReviewResult,
+  };
   for (const field of ["feedback", "message"] as const) {
     const text = shortened.result?.[field];
     if (!text) continue;
     const over = size(shortened) - MAX_STORED_REVIEW_BYTES;
     if (over <= 0) break;
-    let keep = Math.max(0, text.length - over - SHORTENED_NOTE.length);
+    const note = shortenedNote(shortened.result?.savedPath);
+    let keep = Math.max(0, text.length - over - note.length);
     const withText = (length: number): StoredReview => ({
       ...shortened,
-      result: { ...shortened.result!, [field]: `${text.slice(0, length)}${SHORTENED_NOTE}` },
+      result: { ...shortened.result!, [field]: `${text.slice(0, length)}${note}` },
     });
     // Characters JSON escapes or encodes in several bytes need a shorter cut.
     while (keep > 0 && size(withText(keep)) > MAX_STORED_REVIEW_BYTES) keep = Math.floor(keep * 0.9);
@@ -947,7 +972,8 @@ export default async function plugin(bb: BbPluginApi) {
   /**
    * The result of a review no running session owns, left by a restart. A
    * host review may have outlived the restart and hold the user's decision.
-   * Null while its host has been unreachable for less than the disconnect grace.
+   * Null while its host has been unreachable for less than the time it keeps
+   * an unpolled decision.
    */
   async function orphanedReviewResult(record: StoredReview): Promise<ReviewResult | null> {
     const restarted: ReviewResult = {
@@ -964,7 +990,7 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       const since = unansweredSince.get(record.id) ?? Date.now();
       unansweredSince.set(record.id, since);
-      if (Date.now() - since < HOST_DISCONNECT_GRACE_MS) return null;
+      if (Date.now() - since < UNPOLLED_REVIEW_TIMEOUT_MS) return null;
       unansweredSince.delete(record.id);
       return restarted;
     }

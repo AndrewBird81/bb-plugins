@@ -6,3 +6,6 @@ export const PLANNOTATOR_RELAY_PATH =
 export const PLANNOTATOR_REALTIME_CHANNEL = "review-opened";
 /** Upstream's per-message cap for annotate-last. */
 export const MAX_ANNOTATE_MARKDOWN = 2 * 1024 * 1024;
+/** Why no session starts in an archived thread: it takes no messages. */
+export const ARCHIVED_THREAD_MESSAGE =
+  "This thread is archived, so Plannotator feedback could not reach it. Unarchive the thread to start a session.";

@@ -42,7 +42,11 @@ Plannotator writes each result to a file the plugin reads
 (`PLANNOTATOR_HOST_RESULT_FILE`), so these sessions need plannotator 0.28.6 or
 later. An agent's session always answers with a thread message. A session you
 start yourself sends a message only when you send feedback; approving with no
-notes, closing or cancelling sends nothing.
+notes, closing or cancelling sends nothing. An archived thread takes no
+messages, so no session starts there: the panel's launcher is disabled and a
+start is refused. If the thread is archived after you send feedback but
+before it arrives, the panel says it was not sent and the plugin log names
+the review.
 
 The plugin refuses to publish an annotation session whose agent terminal (a
 shell in the browser) is on, or does not report its state. Code review runs
@@ -52,6 +56,13 @@ the BB server in remote mode run with sharing disabled.
 Known limitation: an HTML file that sets no colors of its own can show black
 text on Plannotator's dark background. Plannotator leaves the styling of
 arbitrary HTML to the document, so give such a page its own background color.
+
+Plannotator follows the system's light or dark mode, as BB does by default.
+Before each session the plugin saves that choice (`"theme": {"mode": "system"}`)
+in the `config.json` of Plannotator's data directory on the session's machine,
+unless a theme is already saved there; a theme you pick in Plannotator's
+settings is kept. Known limitation: a BB theme pinned to light or dark is not
+passed on, so Plannotator still follows the system.
 
 ## Remote BB and Tailscale access
 

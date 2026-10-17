@@ -10,12 +10,12 @@ import { PLANNOTATOR_REALTIME_CHANNEL } from "./constants";
 const app = await loadPluginApp(() => import("../app"));
 
 /** SDK fakes for the session launcher's file picker. */
-function launcherSdk(paths: string[] = []) {
+function launcherSdk(paths: string[] = [], thread: { archivedAt: number | null } = { archivedAt: null }) {
   const calls: Array<Record<string, unknown>> = [];
   return {
     calls,
     sdk: {
-      threads: { get: async () => ({ environmentId: "env-1" }) },
+      threads: { get: async () => ({ environmentId: "env-1", ...thread }) },
       environments: {
         paths: async (args: Record<string, unknown>) => {
           calls.push(args);
@@ -324,6 +324,24 @@ describe("Plannotator BB shell", () => {
     // The picker lists only Markdown and HTML files from bb's workspace search.
     expect(slot.queryByRole("button", { name: "src/app.ts" })).toBeNull();
     expect(calls[0]).toMatchObject({ environmentId: "env-1", includeFiles: "true", includeDirectories: "false" });
+  });
+
+  it("disables the launcher in an archived thread and says why", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      {
+        rpc: { getActiveReview: () => null, startSession: () => ({ status: "pending", reviewId: "r-1" }) },
+        sdk: launcherSdk(["docs/guide.md"], { archivedAt: 1 }).sdk,
+      },
+    );
+
+    await slot.findByText(/This thread is archived/u);
+    expect((slot.getByRole("button", { name: "Review changes" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((slot.getByRole("button", { name: "Annotate last finished reply" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await slot.findByRole("button", { name: "docs/guide.md" })) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(slot.getByRole("button", { name: "Review changes" }));
+    expect(slot.rpcCalls.filter(({ method }) => method === "startSession")).toEqual([]);
   });
 
   it("hands a message-action launch to the thread's panel without tab params", async () => {

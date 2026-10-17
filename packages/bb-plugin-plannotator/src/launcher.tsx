@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRpc, useSdk } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
+import { ARCHIVED_THREAD_MESSAGE } from "./constants";
 
 export type LaunchRequest =
   | { mode: "review"; diffType?: DiffType }
@@ -82,39 +83,54 @@ export function usePanelRequests(threadId: string, handle: (request: PanelReques
 const buttonClass =
   "rounded border border-border px-2 py-1 text-xs text-foreground hover:bg-state-hover disabled:opacity-60";
 
-function AnnotateFilePicker({
-  threadId,
-  disabled,
-  onPick,
-  autoFocus,
-}: {
-  threadId: string;
-  disabled: boolean;
-  onPick: (path: string) => void;
-  autoFocus: boolean;
-}) {
-  const sdk = useSdk();
-  const [environmentId, setEnvironmentId] = useState<string | null>(null);
-  const [query, setQuery] = useState("");
-  const [paths, setPaths] = useState<string[]>([]);
-  /** Until the first answer for the current query, an empty list means nothing yet. */
-  const [searching, setSearching] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+type LauncherThread =
+  | { status: "loading" }
+  | { status: "failed" }
+  | { status: "loaded"; environmentId: string | null; archived: boolean };
 
+/** The thread as the launcher needs it: its workspace, and whether it is archived. */
+function useLauncherThread(threadId: string): LauncherThread {
+  const sdk = useSdk();
+  const [thread, setThread] = useState<LauncherThread>({ status: "loading" });
   useEffect(() => {
     let cancelled = false;
+    setThread({ status: "loading" });
     void sdk.threads
       .get({ threadId })
-      .then((thread) => {
-        if (!cancelled) setEnvironmentId(thread.environmentId);
+      .then((loaded) => {
+        if (!cancelled) {
+          setThread({ status: "loaded", environmentId: loaded.environmentId, archived: loaded.archivedAt !== null });
+        }
       })
       .catch(() => {
-        if (!cancelled) setError("Could not load the thread's workspace.");
+        if (!cancelled) setThread({ status: "failed" });
       });
     return () => {
       cancelled = true;
     };
   }, [sdk, threadId]);
+  return thread;
+}
+
+function AnnotateFilePicker({
+  thread,
+  disabled,
+  onPick,
+  autoFocus,
+}: {
+  thread: LauncherThread;
+  disabled: boolean;
+  onPick: (path: string) => void;
+  autoFocus: boolean;
+}) {
+  const sdk = useSdk();
+  const environmentId = thread.status === "loaded" ? thread.environmentId : null;
+  const [query, setQuery] = useState("");
+  const [paths, setPaths] = useState<string[]>([]);
+  /** Until the first answer for the current query, an empty list means nothing yet. */
+  const [searching, setSearching] = useState(true);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const error = thread.status === "failed" ? "Could not load the thread's workspace." : searchError;
 
   useEffect(() => {
     if (!environmentId) return;
@@ -136,14 +152,14 @@ function AnnotateFilePicker({
       )
         .then((results) => {
           if (cancelled) return;
-          setError(null);
+          setSearchError(null);
           const found = results.flatMap((result) => result.paths.map(({ path }) => path));
           setPaths([...new Set(found)].filter((path) => ANNOTATABLE.test(path)));
           setSearching(false);
         })
         .catch(() => {
           if (cancelled) return;
-          setError("Could not search the workspace.");
+          setSearchError("Could not search the workspace.");
           setSearching(false);
         });
     }, 150);
@@ -229,8 +245,12 @@ export function SessionLauncher({
   starter: SessionStarter;
   focusFilePicker: boolean;
 }) {
-  const { start, busy, message } = starter;
+  const { start, message } = starter;
   const [diffType, setDiffType] = useState<DiffType>("since-base");
+  const thread = useLauncherThread(threadId);
+  const archived = thread.status === "loaded" && thread.archived;
+  // An archived thread takes no message: the server refuses the start too.
+  const disabled = starter.busy || archived;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-background p-4 text-sm">
@@ -238,7 +258,8 @@ export function SessionLauncher({
         Agents open plan reviews here. You can also start one of these yourself; feedback
         you send arrives in this thread as a new message.
       </div>
-      {busy ? <div className="text-xs text-muted-foreground">Starting Plannotator…</div> : null}
+      {archived ? <div className="text-xs text-muted-foreground">{ARCHIVED_THREAD_MESSAGE}</div> : null}
+      {starter.busy ? <div className="text-xs text-muted-foreground">Starting Plannotator…</div> : null}
       {message ? <div className="text-xs text-destructive">{message}</div> : null}
       <section className="flex flex-col gap-2">
         <div className="font-medium text-foreground">Review changes</div>
@@ -258,7 +279,7 @@ export function SessionLauncher({
           <button
             type="button"
             className={buttonClass}
-            disabled={busy}
+            disabled={disabled}
             onClick={() => start({ mode: "review", ...(diffType !== "since-base" ? { diffType } : {}) })}
           >
             Review changes
@@ -274,7 +295,7 @@ export function SessionLauncher({
           <button
             type="button"
             className={buttonClass}
-            disabled={busy}
+            disabled={disabled}
             onClick={() => start({ mode: "annotate-last" })}
           >
             Annotate last finished reply
@@ -284,8 +305,8 @@ export function SessionLauncher({
       <section className="flex min-h-0 flex-col gap-2">
         <div className="font-medium text-foreground">Annotate file…</div>
         <AnnotateFilePicker
-          threadId={threadId}
-          disabled={busy}
+          thread={thread}
+          disabled={disabled}
           autoFocus={focusFilePicker}
           onPick={(path) => start({ mode: "annotate", path })}
         />

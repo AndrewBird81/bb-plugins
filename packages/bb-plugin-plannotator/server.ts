@@ -27,6 +27,7 @@ import {
   type UpstreamOrigin,
 } from "./src/bridge";
 import {
+  ARCHIVED_THREAD_MESSAGE,
   PANEL_ACTION_ID,
   PANEL_TITLE,
   PLANNOTATOR_RELAY_PATH,
@@ -397,6 +398,8 @@ async function resolveReviewContext(
     // provider identity is presentation-only.
     return { origin: "codex", providerId: null, target: { kind: "server" } };
   }
+  // An archived thread takes no message, so the session's feedback would be lost.
+  if (thread.archivedAt !== null) throw new Error(ARCHIVED_THREAD_MESSAGE);
   const origin = upstreamOriginForProvider(thread.providerId);
   if (!thread.environmentId) return { origin, providerId: thread.providerId, target: { kind: "server" } };
   const [environment, systemConfig] = await Promise.all([
@@ -955,6 +958,16 @@ export default async function plugin(bb: BbPluginApi) {
       const thread = await bb.sdk.threads.get({ threadId: record.threadId }).catch(() => null);
       if (thread && (thread.archivedAt !== null || thread.deletedAt !== null)) {
         await saveReview({ ...record, status: "closed", updatedAt: Date.now() }).catch(() => undefined);
+        // The result stays readable with plannotator_review_status.
+        bb.log.warn(`Plannotator review ${record.id} was not delivered: its thread is ${thread.deletedAt !== null ? "deleted" : "archived"}.`);
+        if (thread.deletedAt === null) {
+          bb.realtime.publish(PLANNOTATOR_REALTIME_CHANNEL, {
+            kind: "review-failed",
+            threadId: record.threadId,
+            sessionId: record.id,
+            message: "Your Plannotator feedback was not sent: this thread is archived.",
+          });
+        }
       } else if (Date.now() - record.updatedAt > DELIVERY_GIVE_UP_MS) {
         bb.log.warn(`Gave up delivering Plannotator review ${record.id} after a day: ${String(error)}`);
         await saveReview({ ...record, status: "closed", updatedAt: Date.now() }).catch(() => undefined);

@@ -1080,6 +1080,58 @@ describe("BB upstream Plannotator bridge", () => {
     await service.done;
   });
 
+  it("refuses to start a session in an archived thread", async () => {
+    const { host } = await hostPlugin();
+    host.harness.sdk.stub("threads.get", () =>
+      makeThreadResponse({ id: "thread-1", providerId: "claude-code", environmentId: "env-1", archivedAt: Date.now() }),
+    );
+
+    const started = await host.harness.callRpc("startSession", { threadId: "thread-1", request: { mode: "annotate-last" } });
+    const tool = await host.harness.behavior.callAgentTool("plannotator_review_plan", { planMarkdown: "# Plan" }, threadContext);
+
+    expect(started).toEqual({ status: "error", error: expect.stringContaining("This thread is archived") });
+    expect(JSON.stringify(tool)).toContain("This thread is archived");
+    expect(host.harness.inspection.experimental_hostRpcCalls).toEqual([]);
+    expect(await host.bb.storage.kv.list("review:")).toEqual([]);
+  });
+
+  it("tells the panel and the log when feedback cannot reach an archived thread", async () => {
+    const { host } = await hostPlugin();
+    host.harness.sdk.stub("threads.send", () => {
+      throw new Error("HTTP 409: Thread is archived");
+    });
+    host.harness.sdk.stub("threads.get", async () => makeThreadResponse({ id: "thread-1", archivedAt: Date.now() }));
+    const warn = vi.spyOn(host.bb.log, "warn");
+    const reviewId = "bb883ad4-4ff7-4183-96eb-6250ae380c3a";
+    await host.bb.storage.kv.set(`review:${reviewId}`, {
+      id: reviewId,
+      threadId: "thread-1",
+      kind: "annotate-reply",
+      initiator: "user",
+      status: "ready",
+      result: { reviewId, source: "plannotator", decision: "annotated", message: "Shorter." },
+      updatedAt: Date.now(),
+    });
+
+    const service = host.harness.behavior.runService("review-delivery");
+    await vi.waitFor(async () =>
+      expect(await host.bb.storage.kv.get(`review:${reviewId}`)).toMatchObject({ status: "closed", result: { message: "Shorter." } }),
+    );
+    service.controller.abort();
+    await service.done;
+
+    expect(host.harness.realtimeSignals).toContainEqual({
+      channel: PLANNOTATOR_REALTIME_CHANNEL,
+      payload: {
+        kind: "review-failed",
+        threadId: "thread-1",
+        sessionId: reviewId,
+        message: "Your Plannotator feedback was not sent: this thread is archived.",
+      },
+    });
+    expect(warn).toHaveBeenCalledWith(`Plannotator review ${reviewId} was not delivered: its thread is archived.`);
+  });
+
   it("gives up a result whose thread has refused it for a day", async () => {
     const { host } = await hostPlugin();
     host.harness.sdk.stub("threads.send", () => {

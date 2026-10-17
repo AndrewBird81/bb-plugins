@@ -9,6 +9,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rename,
   rm,
@@ -577,6 +578,45 @@ export async function startUpstreamPlanReview(
   })) as RunningUpstreamReview<UpstreamDecision>;
 }
 
+/**
+ * Plannotator's theme defaults to dark. Start it on the system's light or dark
+ * mode, which bb follows, unless the user picked a theme in Plannotator's
+ * settings: that choice is saved in the data dir's config.json, which wins
+ * over cookies. Skipped while Plannotator holds its config lock, or when the
+ * file is unreadable; the next session tries again.
+ */
+export async function seedSystemTheme(dataDir: string): Promise<void> {
+  const configPath = join(dataDir, "config.json");
+  const lockPath = `${configPath}.lock`;
+  await mkdir(dataDir, { recursive: true });
+  let lock;
+  try {
+    lock = await open(lockPath, "wx");
+  } catch {
+    return;
+  }
+  try {
+    let config: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(await readFile(configPath, "utf8"));
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+      config = parsed as Record<string, unknown>;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    }
+    if (config.theme !== undefined) return;
+    const temporary = `${configPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify({ ...config, theme: { mode: "system" } }, null, 2)}\n`, "utf8");
+    await rename(temporary, configPath).catch(async (error: unknown) => {
+      await rm(temporary, { force: true });
+      throw error;
+    });
+  } finally {
+    await lock.close();
+    await rm(lockPath, { force: true });
+  }
+}
+
 /** Start one upstream session in any mode and expose its real browser session. */
 export async function startUpstreamSession(
   options: SessionOptions,
@@ -589,6 +629,7 @@ export async function startUpstreamSession(
     disableSharing: options.disableSharing ?? options.remote === true,
     ...(options.bridge ? { bridge: options.bridge } : {}),
   });
+  if (options.dataDir) await seedSystemTheme(options.dataDir).catch(() => undefined);
   const resultDir = launch.resultFile ? dirname(launch.resultFile) : null;
   const cleanUp = async (tempDir: string) => {
     await rm(tempDir, { recursive: true, force: true });

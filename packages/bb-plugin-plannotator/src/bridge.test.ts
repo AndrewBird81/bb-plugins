@@ -16,6 +16,7 @@ import {
   rehostUpstreamUrl,
   REMOTE_PORT_RANGE,
   resolvePlannotatorBinary,
+  seedSystemTheme,
   startUpstreamPlanReview,
   startUpstreamSession,
 } from "./bridge";
@@ -163,6 +164,34 @@ process.stdin.resume();
       }),
     });
     await running.stop();
+    // Plannotator starts on the system's light or dark mode.
+    expect(JSON.parse(await readFile(join(directory, "state", "config.json"), "utf8"))).toEqual({ theme: { mode: "system" } });
+  });
+
+  it("seeds the system theme only when the user has not picked one", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bb-plannotator-theme-test-"));
+    temporaryDirectories.push(directory);
+    const config = join(directory, "config.json");
+    const read = async () => readFile(config, "utf8");
+
+    await writeFile(config, JSON.stringify({ reviewAnalysis: { semanticDiff: true } }), "utf8");
+    await seedSystemTheme(directory);
+    expect(JSON.parse(await read())).toEqual({ reviewAnalysis: { semanticDiff: true }, theme: { mode: "system" } });
+
+    const chosen = JSON.stringify({ theme: { mode: "dark", light: "plannotator", dark: "kanagawa" } });
+    await writeFile(config, chosen, "utf8");
+    await seedSystemTheme(directory);
+    expect(await read()).toBe(chosen);
+
+    // Unreadable config, or Plannotator holding its lock: left alone.
+    await writeFile(config, "{ not json", "utf8");
+    await seedSystemTheme(directory);
+    expect(await read()).toBe("{ not json");
+    await writeFile(config, "{}", "utf8");
+    await writeFile(`${config}.lock`, "123", "utf8");
+    await seedSystemTheme(directory);
+    expect(await read()).toBe("{}");
+    expect(await readFile(`${config}.lock`, "utf8")).toBe("123");
   });
 
   it("binds loopback on a caller's port range and never inherits the remote agent terminal", async () => {

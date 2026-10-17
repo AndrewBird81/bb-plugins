@@ -19,6 +19,7 @@ import plugin, {
   bridgeHostForProvider,
   placeAskAi,
   feedbackForBbAgent,
+  replyExcerpt,
   reviewTargetFor,
   shouldUseRemotePlannotatorMode,
   storableReview,
@@ -1009,6 +1010,17 @@ describe("BB upstream Plannotator bridge", () => {
     })) as { status: string };
     expect(second.status).toBe("pending");
     releaseStop();
+  });
+
+  it.each([
+    ["bold bullet", "- **Not a bug:** `code.txt` ends with `three\\n`; nothing to fix.", "Not a bug: code.txt ends with three\\n; nothing to fix."],
+    ["italic", "*Maybe* and _perhaps_, but snake_case stays.", "Maybe and perhaps, but snake_case stays."],
+    ["code", "Run `pnpm test` first.", "Run pnpm test first."],
+    ["link", "See [the docs](https://example.com/docs) and ![a chart](chart.png).", "See the docs and a chart."],
+    ["heading", "\n## **Plan** for the cache layer\n\nDetails.", "Plan for the cache layer"],
+    ["quote", "> __Note:__ the cache is cold.", "Note: the cache is cold."],
+  ])("quotes a reply starting with %s as plain text", (_label, markdown, excerpt) => {
+    expect(replyExcerpt(markdown)).toBe(excerpt);
   });
 
   it("says which reply an annotation is about", async () => {

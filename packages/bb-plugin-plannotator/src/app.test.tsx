@@ -547,6 +547,26 @@ describe("Plannotator BB shell", () => {
     );
   });
 
+  it("opens a session from the focus bridge and the panel with identical options, so bb writes the tab once", async () => {
+    const bridge = renderSlot(
+      app.threadHeaderActions[0]!,
+      { threadId: "thread-1", projectId: "project-1", isCompactViewport: false },
+      { openThreadPanel: () => true, rpc: { getActiveReview: () => null } },
+    );
+    await bridge.behavior.emitRealtime(PLANNOTATOR_REALTIME_CHANNEL, { kind: "review-opened", payload });
+    const panel = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      { rpc: { getActiveReview: () => payload }, sdk: launcherSdk().sdk, openThreadPanel: () => true },
+    );
+    await panel.findByTitle("Plannotator review");
+
+    // bb skips a tab write that changes nothing, so the second call is a no-op.
+    const opened = { method: "openThreadPanel", options: { actionId: "plannotator-review", title: payload.title } };
+    expect(bridge.inspection.navigateCalls).toEqual([opened]);
+    await waitFor(() => expect(panel.inspection.navigateCalls).toEqual([opened]));
+  });
+
   it("annotates assistant replies only", () => {
     const toastError = vi.spyOn(toast, "error").mockImplementation(() => 0 as never);
     const action = app.messageActions.find(({ id }) => id === "plannotator-annotate-message")!;

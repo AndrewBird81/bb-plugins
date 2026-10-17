@@ -667,9 +667,21 @@ const KIND_NOUN: Record<SessionKind, string> = {
   "annotate-reply": "annotation",
 };
 
-/** The first line of an annotated reply, short enough to quote. */
+/** One markdown line as plain text: paired inline markup and the leading heading, quote or bullet run removed. */
+function plainMarkdownLine(text: string): string {
+  return text
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/gu, "$1")
+    .replace(/`([^`]+)`/gu, "$1")
+    .replace(/(\*\*|__)(.+?)\1/gu, "$2")
+    .replace(/\*([^*\s](?:[^*]*[^*\s])?)\*/gu, "$1")
+    .replace(/(?<!\w)_([^_\s](?:[^_]*[^_\s])?)_(?!\w)/gu, "$1")
+    .replace(/^[#>*\-\s]+/u, "")
+    .trim();
+}
+
+/** The first line of an annotated reply as plain text, short enough to quote. */
 export function replyExcerpt(markdown: string): string {
-  const line = markdown.split(/\r?\n/u).map((text) => text.replace(/^[#>*\-\s]+/u, "").trim()).find(Boolean) ?? "";
+  const line = markdown.split(/\r?\n/u).map(plainMarkdownLine).find(Boolean) ?? "";
   return line.length > 80 ? `${line.slice(0, 79)}…` : line;
 }
 

@@ -135,13 +135,20 @@ earlier version by repository name and plan heading, so a thread's first plan
 can show up as version 2 of another thread's plan with the same heading, and
 it keys drafts by content, so two sessions of the same file offer each
 other's draft. A plain link to a repository file that is not a document (such
-as `pic.svg`) does not open the file on any host.
+as `pic.svg`) does not open the file on any host. At bb's default panel width
+Plannotator hides its Versions sidebar, so a plan diff shows only the change
+from the previous version: widen or maximize the pane, or use Open externally,
+to compare against older versions.
 
 The tailnet is the trust boundary, as for BB itself: anyone who can reach the
 host's tailnet name can use the review while it is open. The proxy answers
 only requests addressed to `<MagicDNS name>:<port>` (blocking DNS rebinding)
 and accepts writes only from that origin (blocking cross-site requests from
-other web pages), and lets only the bb page frame the review. It also denies
+other web pages), and lets only the bb page frame the review. An annotated
+HTML file's assets are the exception: Plannotator renders the file in a
+sandboxed frame with no origin, so the documents it embeds (`<object>`,
+`<iframe>`) are served without the frame rule and always with a sandbox
+policy instead. It also denies
 upstream endpoints a review never needs from another device (host control,
 editor and note-app integrations, open-in-app, PR actions, the call-flow
 runtime installer, Plannotator's self-update, file reads outside the worktree,

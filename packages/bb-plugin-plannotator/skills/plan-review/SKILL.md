@@ -26,8 +26,8 @@ message in the same thread. Do not poll for the decision. Use
 The decision message has one of these results:
 
 - `decision=approved`: report the approval and continue as appropriate.
-- `decision=changes_requested`: report the feedback and revise only if the
-  user wants another review.
+- `decision=changes_requested`: revise the plan to address the feedback, then
+  call `plannotator_review_plan` again with the whole revised plan.
 - `decision=cancelled`: report the cancellation, then continue normally unless
   the user specifically asked to stop.
 

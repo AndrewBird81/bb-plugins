@@ -623,8 +623,8 @@ function decisionLabel(decision: UpstreamDecision): "approved" | "changes_reques
  */
 export function feedbackForBbAgent(feedback: string): string {
   return feedback.replace(
-    /before calling \S+ again\./u,
-    "before calling plannotator_review_plan again with the revised plan.",
+    /(before calling|then call) \S+ again\./u,
+    "$1 plannotator_review_plan again with the revised plan.",
   );
 }
 
@@ -673,14 +673,25 @@ export function replyExcerpt(markdown: string): string {
   return line.length > 80 ? `${line.slice(0, 79)}…` : line;
 }
 
-function closingSentence(kind: SessionKind, initiator: SessionInitiator, annotatedReply?: string): string {
+const PLAN_NEXT_STEP: Partial<Record<ReviewResult["decision"], string>> = {
+  approved: "The plan was approved: continue the original task.",
+  changes_requested:
+    "Changes were requested: revise the plan to address the feedback above, then call plannotator_review_plan again with the whole revised plan.",
+};
+
+function closingSentence(result: ReviewResult, kind: SessionKind, initiator: SessionInitiator): string {
   if (kind === "plan") {
-    return "This answers the earlier plannotator_review_plan call. Continue the original task if approved; revise the plan if changes were requested. Cancellation is not approval. Do not repeat this review unless asked.";
+    const nextStep =
+      PLAN_NEXT_STEP[result.decision] ??
+      "The review was cancelled or dismissed, which is not approval. Do not repeat this review unless asked.";
+    return `This answers the earlier plannotator_review_plan call. ${nextStep}`;
   }
   const subject = {
     "code-review": "the worktree changes",
     annotate: "the annotated file",
-    "annotate-reply": annotatedReply ? `your earlier reply that starts "${annotatedReply}"` : "your earlier reply",
+    "annotate-reply": result.annotatedReply
+      ? `your earlier reply that starts "${result.annotatedReply}"`
+      : "your earlier reply",
   }[kind];
   const opening =
     initiator === "agent"
@@ -701,7 +712,7 @@ export function reviewMessage(
     ...(message ? [message] : []),
     ...(printedOutput ? [`What Plannotator printed:\n\n${printedOutput}`] : []),
     ...(askAiSummary ? [askAiSummary] : []),
-    closingSentence(kind, initiator, result.annotatedReply),
+    closingSentence(result, kind, initiator),
   ].join("\n\n");
 }
 
@@ -1505,7 +1516,7 @@ export default async function plugin(bb: BbPluginApi) {
     description:
       "Optionally open the upstream Plannotator plan-review UI in BB. Return a review ID; the decision arrives in a later thread message.",
     instructions:
-      "Use this optional tool only when the user explicitly asks for Plannotator or a plan review. Pass the complete Markdown plan. The tool returns a pending review ID promptly: end your turn and wait for the Plannotator decision in a new message on this thread. Do not poll or claim approval while the review is pending. On approval, continue the original task. On requested changes, revise the plan. Cancellation is not approval. Native Plan mode remains separate and provider-controlled.",
+      "Use this optional tool only when the user explicitly asks for Plannotator or a plan review. Pass the complete Markdown plan. The tool returns a pending review ID promptly: end your turn and wait for the Plannotator decision in a new message on this thread. Do not poll or claim approval while the review is pending. On approval, continue the original task. On requested changes, revise the plan and call plannotator_review_plan again with the whole revised plan. Cancellation is not approval. Native Plan mode remains separate and provider-controlled.",
     presentation: {
       label: {
         pending: "Waiting for Plannotator",

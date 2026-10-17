@@ -7,9 +7,11 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream";
 import {
+  HTML_ASSET_DOCUMENT_POLICY,
   MAX_CAPABILITIES_BODY_BYTES,
   MAX_DECISION_BODY_BYTES,
   createRequestFilter,
+  isHtmlAssetPath,
   isRelabelableCapabilities,
   isScriptableImage,
   relabelCapabilitiesBody,
@@ -53,7 +55,7 @@ export function frameAncestorsPolicy(frameAncestor: string | undefined): string 
   try {
     const { origin, protocol } = new URL(frameAncestor);
     if (protocol !== "https:" && protocol !== "http:") return null;
-    // 'self' keeps nested frames working, such as an annotated HTML document.
+    // 'self' lets the review frame its own pages.
     return `frame-ancestors 'self' ${origin}`;
   } catch {
     return null;
@@ -238,17 +240,22 @@ export async function startReviewProxy(
     upstream.on("response", (upstreamRes) => {
       const headers = forwardedResponseHeaders(upstreamRes);
       const scriptableImage = isScriptableImage(headerValue(upstreamRes.headers["content-type"]));
-      if (scriptableImage) headers["x-content-type-options"] = "nosniff";
+      // Plannotator renders annotated HTML in a sandboxed srcdoc frame with an
+      // opaque origin, so a document it embeds (`<object>`, `<iframe>`) never
+      // matches a frame-ancestors source. Its assets go without the frame
+      // policy and are always sandboxed instead.
+      const htmlAsset = isHtmlAssetPath(url.pathname);
+      if (scriptableImage || htmlAsset) headers["x-content-type-options"] = "nosniff";
+      const existing = headers["content-security-policy"];
+      const existingPolicies = existing === undefined ? [] : Array.isArray(existing) ? existing : [existing];
+      const sandboxed = existingPolicies.some((policy) => /(^|;)\s*sandbox\b/iu.test(policy));
       const addedPolicies = [
-        ...(framePolicy ? [framePolicy] : []),
+        ...(framePolicy && !htmlAsset ? [framePolicy] : []),
         ...(scriptableImage ? [scriptableImagePolicy(url.pathname)] : []),
+        ...(htmlAsset && !scriptableImage && !sandboxed ? [HTML_ASSET_DOCUMENT_POLICY] : []),
       ];
       if (addedPolicies.length > 0) {
-        const existing = headers["content-security-policy"];
-        headers["content-security-policy"] = [
-          ...(existing === undefined ? [] : Array.isArray(existing) ? existing : [existing]),
-          ...addedPolicies,
-        ];
+        headers["content-security-policy"] = [...existingPolicies, ...addedPolicies];
       }
       const status = upstreamRes.statusCode ?? 502;
       succeeded = status >= 200 && status < 300;

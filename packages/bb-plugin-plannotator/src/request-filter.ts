@@ -77,11 +77,16 @@ const SCRIPTABLE_IMAGE_POLICY = "sandbox; default-src 'none'; style-src 'unsafe-
  * Annotated HTML may embed an SVG as a document that runs script. Upstream
  * gives its HTML assets an opaque origin with script, and so does this.
  */
-const HTML_ASSET_DOCUMENT_POLICY = "sandbox allow-scripts";
+export const HTML_ASSET_DOCUMENT_POLICY = "sandbox allow-scripts";
+
+/** Whether `pathname` is one of upstream's assets for annotated HTML. */
+export function isHtmlAssetPath(pathname: string): boolean {
+  return pathname.startsWith("/api/html-assets/");
+}
 
 /** The CSP for a scriptable image at `pathname` (see isScriptableImage). */
 export function scriptableImagePolicy(pathname: string): string {
-  return pathname.startsWith("/api/html-assets/") ? HTML_ASSET_DOCUMENT_POLICY : SCRIPTABLE_IMAGE_POLICY;
+  return isHtmlAssetPath(pathname) ? HTML_ASSET_DOCUMENT_POLICY : SCRIPTABLE_IMAGE_POLICY;
 }
 
 /** Whether a non-HTML response can run script when opened as a document. */

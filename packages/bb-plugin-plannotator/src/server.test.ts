@@ -941,6 +941,39 @@ describe("BB upstream Plannotator bridge", () => {
     );
   });
 
+  it.each([
+    {
+      decision: { approved: false, feedback: "Split step 2" },
+      label: "changes_requested",
+      closing: "Changes were requested: revise the plan to address the feedback above, then call plannotator_review_plan again with the whole revised plan.",
+    },
+    {
+      decision: { approved: true },
+      label: "approved",
+      closing: "The plan was approved: continue the original task.",
+    },
+    {
+      decision: { approved: false },
+      label: "cancelled",
+      closing: "The review was cancelled or dismissed, which is not approval. Do not repeat this review unless asked.",
+    },
+  ])("ends a $label plan result with the matching next step", async ({ decision, label, closing }) => {
+    const { host, remote } = await hostPlugin();
+    const { reviewId } = JSON.parse(String(await host.harness.behavior.callAgentTool(
+      "plannotator_review_plan",
+      { planMarkdown: "# Plan\n\n- Step 1\n- Step 2" },
+      threadContext,
+    ))) as { reviewId: string };
+
+    remote.state = { status: "decided", decision };
+    await host.harness.behavior.experimental_emitHostSignal("host_mac", "reviewChanged", { sessionId: reviewId });
+
+    const text = messageText(await sentReview(host));
+    expect(text).toContain(`"decision":"${label}"`);
+    expect(text.endsWith(`This answers the earlier plannotator_review_plan call. ${closing}`)).toBe(true);
+    if (label !== "cancelled") expect(text).not.toContain("unless asked");
+  });
+
   it("frees the thread for the next session as soon as one has its decision", async () => {
     const remote = fakeRemoteHost();
     let releaseStop!: () => void;
@@ -1589,6 +1622,10 @@ describe("BB upstream Plannotator bridge", () => {
     );
     expect(feedbackForBbAgent("before calling submit_plan again.")).toBe(
       "before calling plannotator_review_plan again with the revised plan.",
+    );
+    // Upstream's prompt when the only feedback is answers to the plan's questions.
+    expect(feedbackForBbAgent("Revise the plan so each answered question becomes a decision, then call ExitPlanMode again.")).toBe(
+      "Revise the plan so each answered question becomes a decision, then call plannotator_review_plan again with the revised plan.",
     );
     expect(feedbackForBbAgent("Just a note.")).toBe("Just a note.");
   });

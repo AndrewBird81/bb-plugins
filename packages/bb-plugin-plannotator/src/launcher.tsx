@@ -251,6 +251,8 @@ export function SessionLauncher({
   const archived = thread.status === "loaded" && thread.archived;
   // An archived thread takes no message: the server refuses the start too.
   const disabled = starter.busy || archived;
+  // The note above already says what the server answers a launch from the palette.
+  const error = archived && message === ARCHIVED_THREAD_MESSAGE ? null : message;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-auto bg-background p-4 text-sm">
@@ -260,7 +262,7 @@ export function SessionLauncher({
       </div>
       {archived ? <div className="text-xs text-muted-foreground">{ARCHIVED_THREAD_MESSAGE}</div> : null}
       {starter.busy ? <div className="text-xs text-muted-foreground">Starting Plannotator…</div> : null}
-      {message ? <div className="text-xs text-destructive">{message}</div> : null}
+      {error ? <div className="text-xs text-destructive">{error}</div> : null}
       <section className="flex flex-col gap-2">
         <div className="font-medium text-foreground">Review changes</div>
         <div className="flex items-center gap-2">

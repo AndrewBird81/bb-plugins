@@ -262,6 +262,34 @@ describe("review proxy", () => {
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
   });
 
+  // Plannotator renders annotated HTML in a sandboxed srcdoc frame with an
+  // opaque origin, so a document embedded from it never matches 'self'.
+  it.each([
+    { name: "an <object> SVG", path: "/api/html-assets/token/assets/x.svg", contentType: "image/svg+xml" },
+    {
+      name: "an <iframe> page",
+      path: "/api/html-assets/token/other.html",
+      contentType: "text/html; charset=utf-8",
+      upstreamCsp: "sandbox allow-scripts",
+    },
+    { name: "an <iframe> image", path: "/api/html-assets/token/assets/pic.png", contentType: "image/png" },
+  ])("lets annotated HTML frame $name, sandboxed, without the frame policy", async ({ path, contentType, upstreamCsp }) => {
+    const { send } = await setup({
+      frameAncestor: "https://bb-server.tail1b968e.ts.net",
+      upstreamContentType: contentType,
+      ...(upstreamCsp ? { upstreamCsp } : {}),
+    });
+
+    const response = await send("GET", path);
+
+    expect(response.headers["content-security-policy"]).toBe("sandbox allow-scripts");
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    // The review page itself keeps it.
+    expect((await send("GET", "/")).headers["content-security-policy"]).toContain(
+      "frame-ancestors 'self' https://bb-server.tail1b968e.ts.net",
+    );
+  });
+
   it("leaves other responses without the image sandbox", async () => {
     const { send } = await setup({ upstreamContentType: "image/png" });
     const response = await send("GET", "/api/plan");

@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { PLANNOTATOR_RELAY_PATH } from "./embedded";
 import { LOAD_SLOW_MS } from "../app";
-import { PLANNOTATOR_REALTIME_CHANNEL } from "./constants";
+import { ARCHIVED_THREAD_MESSAGE, PLANNOTATOR_REALTIME_CHANNEL } from "./constants";
 
 const app = await loadPluginApp(() => import("../app"));
 
@@ -342,6 +342,32 @@ describe("Plannotator BB shell", () => {
     expect(((await slot.findByRole("button", { name: "docs/guide.md" })) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(slot.getByRole("button", { name: "Review changes" }));
     expect(slot.rpcCalls.filter(({ method }) => method === "startSession")).toEqual([]);
+  });
+
+  it("says once that the thread is archived when the server refuses a palette or message launch", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thread-1", params: null },
+      {
+        rpc: {
+          getActiveReview: () => null,
+          startSession: () => ({ status: "error", error: ARCHIVED_THREAD_MESSAGE }),
+        },
+        sdk: launcherSdk([], { archivedAt: 1 }).sdk,
+      },
+    );
+    await slot.findByText(ARCHIVED_THREAD_MESSAGE);
+
+    const action = app.messageActions.find(({ id }) => id === "plannotator-annotate-message")!;
+    void action.run({
+      threadId: "thread-1",
+      message: { id: "m-1", threadId: "thread-1", role: "assistant", text: "Reply", sourceSeqEnd: 1, experimental_messageSeq: 1 },
+      openPanel: () => true,
+    } as never);
+
+    await waitFor(() => expect(slot.rpcCalls.filter(({ method }) => method === "startSession")).toHaveLength(1));
+    await waitFor(() => expect(slot.queryByText("Starting Plannotator…")).toBeNull());
+    expect(slot.getAllByText(ARCHIVED_THREAD_MESSAGE)).toHaveLength(1);
   });
 
   it("hands a message-action launch to the thread's panel without tab params", async () => {
